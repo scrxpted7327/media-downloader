@@ -24,6 +24,8 @@ from .config import Settings
 from .downloader import DownloadError, download_instagram, download_media, download_tiktok_slideshow, persist_download
 from .download_server import create_download_app
 from .editor import list_tts_voices, render_edit
+from .error_handler import error_handler
+from .fix_agent import ERRORS_DIR, FIX_SCRIPTS_DIR, apply_known_fix, categorize_error, invoke_opencode_fix, load_error_log
 from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url
 from .settings_ui import settings_callback, settings_command, settings_photo_handler, settings_text_handler
 from .storage import (
@@ -55,7 +57,9 @@ HELP_TEXT = (
     "/jobs - list your recent downloads\n"
     "/editconfig - set options for the current edit job\n"
     "/delete <job_id> - delete a downloaded file\n"
-    "/voices - list available TTS voices\n\n"
+    "/voices - list available TTS voices\n"
+    "/fix - attempt auto-fix for bot errors\n"
+    "/status - bot error status and health\n\n"
     "Send a YouTube, Instagram, TikTok, or Facebook link anywhere in a message. "
     "The bot downloads the first supported link it finds and provides a secure download link."
 )
@@ -102,6 +106,9 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
 def _build_download_url(settings: Settings, token: str) -> str:
     domain = settings.download_domain or "localhost"
     return f"https://{domain}/download/{token}"
+
+
+_RENDER_QUEUE: asyncio.Queue = asyncio.Queue()
 
 
 async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,65 +159,71 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("Send one supported YouTube, Instagram, TikTok, or Facebook URL.")
         return
 
-    url = urls[0]
-    status = await message.reply_text("Searching…")
+    results = []
+    for idx, url in enumerate(urls[:8]):
+        if idx > 0:
+            await asyncio.sleep(2)
+        result = await _process_single_url(
+            update, context, url, user_id, chat_id,
+            settings, ytdlp, gallerydl, db_path, storage_dir,
+        )
+        results.append(result)
 
+    if len(urls) > 1:
+        lines = [f"Processed {len(results)}/{len(urls)} URLs:"]
+        for r in results:
+            lines.append(f"  {r}")
+        await message.reply_text("\n".join(lines))
+
+
+async def _process_single_url(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    url: str, user_id: int, chat_id: int,
+    settings: Settings, ytdlp: Path, gallerydl: Path,
+    db_path: Path, storage_dir: Path,
+) -> str:
+    status = await update.effective_message.reply_text("Searching…")
     job = await create_job(db_path, url, user_id, chat_id)
+    await update_job(db_path, job.id, status_message_id=status.message_id)
     temporary = None
     try:
         if is_tiktok_photo_url(url):
             temporary, media = await download_tiktok_slideshow(
-                gallerydl,
-                url,
-                settings.max_filesize_mb,
-                settings.timeout_seconds,
+                gallerydl, url, settings.max_filesize_mb, settings.timeout_seconds,
                 DownloadReporter(status).progress,
             )
         elif is_instagram_url(url):
             temporary, media = await download_instagram(
-                gallerydl,
-                url,
-                settings.max_filesize_mb,
-                settings.timeout_seconds,
+                gallerydl, url, settings.max_filesize_mb, settings.timeout_seconds,
                 DownloadReporter(status).progress,
             )
         else:
             temporary, media = await download_media(
-                ytdlp,
-                url,
-                settings.max_filesize_mb,
-                settings.timeout_seconds,
+                ytdlp, url, settings.max_filesize_mb, settings.timeout_seconds,
                 DownloadReporter(status).progress,
             )
-
         await status.edit_text("Saving…")
         persisted = await persist_download(media, job.id, storage_dir)
-        file_size = persisted.stat().st_size
-        await update_job(
-            db_path, job.id, file_path=str(persisted), file_size=file_size,
-        )
-
+        await update_job(db_path, job.id, file_path=str(persisted), file_size=persisted.stat().st_size)
         await _send_secure_link(status, job.id, db_path, user_id)
-        await update_job(
-            db_path, job.id, status="uploaded", local_api_used=bool(settings.local_api_url),
-        )
+        await update_job(db_path, job.id, status="uploaded", local_api_used=bool(settings.local_api_url))
+        return f"#{job.id}: OK"
     except DownloadError as exc:
-        msg = f"Download failed for {url}: {exc}"
-        LOGGER.warning(msg)
+        LOGGER.warning("Download failed for %s: %s", url, exc)
         try:
             await status.edit_text(f"Download failed: {exc}")
         except Exception:
             pass
         await update_job(db_path, job.id, status="failed", error_message=str(exc))
+        return f"#{job.id}: FAILED"
     except Exception as exc:
-        LOGGER.exception("Unexpected download/upload failure for %s", url)
+        LOGGER.exception("Unexpected failure for %s", url)
         try:
-            await status.edit_text(
-                f"Download failed: {exc.__class__.__name__}: {exc}"
-            )
+            await status.edit_text(f"Download failed: {exc.__class__.__name__}: {exc}")
         except Exception:
             pass
         await update_job(db_path, job.id, status="failed", error_message=f"unexpected error: {exc}")
+        return f"#{job.id}: ERROR"
     finally:
         if temporary is not None:
             temporary.cleanup()
@@ -336,6 +349,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
             [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
             [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
+            [InlineKeyboardButton("Remove watermark", callback_data="editcfg:watermark_removal")],
+            [InlineKeyboardButton("Channel banner", callback_data="editcfg:channel_banner")],
             [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
         ])
         await query.edit_message_text(f"Edit job #{edit_id} created.\nChoose an option:", reply_markup=keyboard)
@@ -372,7 +387,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("Rendering with preset...")
         out_path = storage_dir / f"edit-{edit.id}-final.mp4"
         try:
-            await render_edit(
+            out_path, subtitles_path = await render_edit(
                 input_path=Path(dest),
                 output_path=out_path,
                 caption_text=preset.caption_text,
@@ -388,13 +403,17 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 banner_path=Path(preset.banner_path) if preset.banner_path else None,
                 banner_position=preset.banner_position or "bottom",
                 banner_scale=preset.banner_scale or "fit",
+                watermark_removal=preset.watermark_removal,
+                watermark_position=preset.watermark_position or "auto",
+                channel_banner=preset.channel_banner,
+                source_url=job.url,
                 timeout_seconds=settings.timeout_seconds,
             )
         except DownloadError as exc:
             await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
             await query.edit_message_text(f"Render failed: {exc}")
             return
-        await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size)
+        await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
         token = await create_download_token(db_path, edit.id, job.user_id, settings.token_expiry_minutes)
         url = _build_download_url(settings, token)
         await context.bot.send_message(
@@ -403,6 +422,14 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             reply_to_message_id=query.message.message_id,
             disable_web_page_preview=True,
         )
+        if subtitles_path:
+            srt_token = await create_download_token(db_path, edit.id, job.user_id, settings.token_expiry_minutes)
+            srt_url = _build_download_url(settings, srt_token)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"Subtitles: {srt_url}",
+                reply_to_message_id=query.message.message_id,
+            )
         return
 
 
@@ -560,6 +587,30 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await message.reply_text(f"Job #{job_id} deleted.")
 
 
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        LOGGER.warning("Rejected cleanup request")
+        return
+    user = update.effective_user
+    if user is None:
+        return
+    db_path: Path = context.application.bot_data["db_path"]
+    jobs = await list_user_jobs(db_path, user.id, limit=50)
+    removed = 0
+    for job in jobs:
+        if job.status_message_id and job.chat_id:
+            try:
+                await context.bot.delete_message(chat_id=job.chat_id, message_id=job.status_message_id)
+                await update_job(db_path, job.id, status_message_id=None)
+                removed += 1
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+    await message.reply_text(f"Cleaned up {removed} bot messages.")
+
+
 async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     message = update.effective_message
@@ -595,6 +646,8 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
         [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
         [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
+        [InlineKeyboardButton("Remove watermark", callback_data="editcfg:watermark_removal")],
+        [InlineKeyboardButton("Channel banner", callback_data="editcfg:channel_banner")],
         [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
     ])
     await message.reply_text(f"Edit job #{edit_id} from source #{source_job_id}\nChoose an option:", reply_markup=keyboard)
@@ -641,7 +694,23 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await update.message.reply_text("Enter yes or no")
             return True
-    elif field == "voice_speed":
+    elif field == "watermark_removal":
+        if text.lower() in ("yes", "y", "on", "true", "1"):
+            value = True
+        elif text.lower() in ("no", "n", "off", "false", "0"):
+            value = False
+        else:
+            await update.message.reply_text("Enter yes or no")
+            return True
+    elif field == "channel_banner":
+        if text.lower() in ("yes", "y", "on", "true", "1"):
+            value = True
+        elif text.lower() in ("no", "n", "off", "false", "0"):
+            value = False
+        else:
+            await update.message.reply_text("Enter yes or no")
+            return True
+    if field == "voice_speed":
         try:
             value = float(text)
             if not (0.5 <= value <= 2.0):
@@ -649,21 +718,6 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             await update.message.reply_text("Enter a number between 0.5 and 2.0")
             return True
-    opts_map = {
-        "caption_color": {"white", "black", "yellow", "red", "blue", "green"},
-        "caption_style": {"basic", "bold", "bubble"},
-        "caption_position": {"low", "middle", "high"},
-        "voice_quality": {"basic", "premium"},
-        "tts_engine": {"edge-tts", "espeak-ng", "auto"},
-        "banner_position": {"top", "bottom", "overlay"},
-        "banner_scale": {"fit", "stretch", "fill"},
-    }
-    if field in opts_map:
-        opts = opts_map[field]
-        if text.lower() not in opts:
-            await update.message.reply_text(f"Choose: {', '.join(sorted(opts))}")
-            return True
-        value = text.lower()
 
     await update_edit_job(context.application.bot_data["db_path"], edit_id, **{field: value})
     flow.pop("field_name", None)
@@ -717,8 +771,11 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         b_path = edit.banner_path if edit.banner_path is not None else (preset.banner_path if preset else None)
         b_pos = edit.banner_position if edit.banner_position is not None else (preset.banner_position or "bottom" if preset else "bottom")
         b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fit" if preset else "fit")
+        wm_removal = edit.watermark_removal if edit.watermark_removal else (preset.watermark_removal if preset else False)
+        wm_pos = edit.watermark_position if edit.watermark_position is not None else (preset.watermark_position or "auto" if preset else "auto")
+        ch_banner = edit.channel_banner if edit.channel_banner else (preset.channel_banner if preset else False)
 
-        await render_edit(
+        out_path, subtitles_path = await render_edit(
             input_path=Path(edit.file_path),
             output_path=out_path,
             caption_text=cap_text,
@@ -734,14 +791,111 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             banner_path=Path(b_path) if b_path else None,
             banner_position=b_pos,
             banner_scale=b_scale,
+            watermark_removal=wm_removal,
+            watermark_position=wm_pos,
+            channel_banner=ch_banner,
+            source_url=source.url,
             timeout_seconds=settings.timeout_seconds,
         )
     except DownloadError as exc:
         await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
         await update.effective_message.reply_text(f"Render failed: {exc}")
         return
-    await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size)
+    await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
     await update.effective_message.reply_text(f"Render complete. Job #{edit.id} ready.", document=out_path.open("rb"))
+    if subtitles_path:
+        await update.effective_message.reply_text("Subtitles available.", document=Path(subtitles_path).open("rb"))
+
+
+async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        return
+    user = update.effective_user
+    if user is None:
+        return
+
+    await message.reply_text("🔍 Scanning for errors to fix...")
+    ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+    error_files = sorted(ERRORS_DIR.glob("*.json"))
+    pending = [ef for ef in error_files if not ef.name.startswith(("fixed_", "failed_", "unfixed_"))]
+    if not pending:
+        await message.reply_text("No pending errors found.")
+        return
+
+    report_lines = []
+    for ef in pending[:5]:
+        error_info = load_error_log(ef)
+        if error_info is None:
+            continue
+        category = categorize_error(error_info.get("message", ""))
+        error_info["category"] = category
+        fix_result = await apply_known_fix(error_info, settings.tools_dir)
+        if fix_result is None:
+            report_lines.append(f"✅ Fixed [{category}]: {error_info.get('message', '')[:80]}")
+            ef.replace(ERRORS_DIR / f"fixed_{ef.name}")
+        elif category == "unknown":
+            from .fix_agent import invoke_opencode_fix
+            workspace = Path.cwd()
+            script_path = await invoke_opencode_fix(error_info, workspace)
+            report_lines.append(f"🤖 Unknown [{category}]: fix script created at {script_path}")
+            ef.replace(ERRORS_DIR / f"unfixed_{ef.name}")
+        else:
+            report_lines.append(f"⚠️ Fix failed [{category}]: {fix_result[:200]}")
+            ef.replace(ERRORS_DIR / f"failed_{ef.name}")
+
+    await message.reply_text("\n".join(report_lines) if report_lines else "No fixable errors.")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        return
+
+    ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+    error_files = list(ERRORS_DIR.glob("*.json"))
+    pending = sum(1 for ef in error_files if not ef.name.startswith(("fixed_", "failed_", "unfixed_")))
+    fixed = sum(1 for ef in error_files if ef.name.startswith("fixed_"))
+    failed = sum(1 for ef in error_files if ef.name.startswith("failed_"))
+    unfixed = sum(1 for ef in error_files if ef.name.startswith("unfixed_"))
+
+    lines = [
+        "🤖 Bot Status",
+        f"Pending errors: {pending}",
+        f"Auto-fixed: {fixed}",
+        f"Fix failed: {failed}",
+        f"Unknown (needs review): {unfixed}",
+        "",
+        "Commands:",
+        "/fix - attempt to auto-fix pending errors",
+        "/status - this status report",
+    ]
+    await message.reply_text("\n".join(lines))
+
+
+async def _start_auto_fix(application: Application) -> None:
+    settings: Settings = application.bot_data["settings"]
+
+    async def _report_to_admin(text: str):
+        if settings.allowed_user_ids:
+            chat_id = next(iter(settings.allowed_user_ids))
+            try:
+                await application.bot.send_message(chat_id=chat_id, text=text)
+            except Exception:
+                pass
+
+    async def _watch_loop():
+        from .fix_agent import watch_and_fix
+        await watch_and_fix(
+            workspace=Path.cwd(),
+            tools_dir=settings.tools_dir,
+            report_callback=_report_to_admin,
+        )
+
+    asyncio.create_task(_watch_loop())
+    LOGGER.info("Auto-fix daemon started")
 
 
 async def cleanup_task(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -770,6 +924,8 @@ async def _post_init(application: Application) -> None:
     await site.start()
     application.bot_data["download_runner"] = runner
     LOGGER.info("Download server started on port %d", settings.download_port)
+
+    await _start_auto_fix(application)
 
 
 def main() -> None:
@@ -811,6 +967,8 @@ def main() -> None:
     application.add_handler(CommandHandler("voices", voices_command))
     application.add_handler(CommandHandler("settings", settings_command_entry))
     application.add_handler(CommandHandler("pool", pool_command_entry))
+    application.add_handler(CommandHandler("fix", fix_command))
+    application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^settings:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^preset:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^edit:"))
@@ -818,12 +976,15 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(pool_callback_entry, pattern=r"^workflow:"))
     application.add_handler(CommandHandler("jobs", jobs_command))
     application.add_handler(CommandHandler("delete", delete_command))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("editconfig", editconfig_command))
     application.add_handler(CallbackQueryHandler(editconfig_callback, pattern=r"^editcfg:"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^download:"))
     application.add_handler(CallbackQueryHandler(secure_link_callback, pattern=r"^secure_link:\d+$"))
     application.add_handler(MessageHandler(filters.PHOTO, _message_router))
     application.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.CAPTION, _message_router))
+
+    application.add_error_handler(error_handler)
 
     application.job_queue.run_repeating(cleanup_task, interval=6 * 60 * 60, first=60)
 

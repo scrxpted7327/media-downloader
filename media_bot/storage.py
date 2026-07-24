@@ -20,6 +20,7 @@ class JobRecord:
     file_path: str | None
     file_size: int | None
     local_api_used: bool
+    status_message_id: int | None
     created_at: datetime
     updated_at: datetime
     error_message: str | None
@@ -64,6 +65,9 @@ class Preset:
     banner_path: str | None
     banner_position: str | None
     banner_scale: str | None
+    watermark_removal: bool
+    watermark_position: str | None
+    channel_banner: bool
     shared: bool
     share_code: str | None
     created_at: datetime
@@ -89,6 +93,10 @@ class EditJob:
     banner_path: str | None
     banner_position: str | None
     banner_scale: str | None
+    watermark_removal: bool
+    watermark_position: str | None
+    channel_banner: bool
+    subtitles_path: str | None
     status: str
     file_path: str | None
     file_size: int | None
@@ -307,6 +315,12 @@ async def init_db(db_path: Path) -> None:
                 ("banner_path", "TEXT"),
                 ("banner_position", "TEXT"),
                 ("banner_scale", "TEXT"),
+                ("watermark_removal", "INTEGER NOT NULL DEFAULT 0"),
+                ("watermark_position", "TEXT"),
+                ("channel_banner", "INTEGER NOT NULL DEFAULT 0"),
+            ]),
+            ("jobs", [
+                ("status_message_id", "INTEGER"),
             ]),
             ("edit_jobs", [
                 ("caption_text", "TEXT"),
@@ -322,6 +336,10 @@ async def init_db(db_path: Path) -> None:
                 ("banner_path", "TEXT"),
                 ("banner_position", "TEXT"),
                 ("banner_scale", "TEXT"),
+                ("watermark_removal", "INTEGER NOT NULL DEFAULT 0"),
+                ("watermark_position", "TEXT"),
+                ("channel_banner", "INTEGER NOT NULL DEFAULT 0"),
+                ("subtitles_path", "TEXT"),
             ]),
         ]:
             for col, ctype in _cols:
@@ -455,8 +473,9 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
         cursor = await db.execute(
             "INSERT INTO presets (user_id, name, crop_preset, caption_text, voice_over_voice, "
             "caption_color, caption_style, caption_position, auto_captions, voice_quality, voice_speed, "
-            "voice_text, tts_engine, banner_path, banner_position, banner_scale) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "voice_text, tts_engine, banner_path, banner_position, banner_scale, "
+            "watermark_removal, watermark_position, channel_banner) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 name,
@@ -474,6 +493,9 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
                 kwargs.get("banner_path"),
                 kwargs.get("banner_position"),
                 kwargs.get("banner_scale"),
+                int(bool(kwargs.get("watermark_removal"))),
+                kwargs.get("watermark_position"),
+                int(bool(kwargs.get("channel_banner"))),
             ),
         )
         await db.commit()
@@ -877,6 +899,7 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         file_path=row["file_path"],
         file_size=row["file_size"],
         local_api_used=bool(row["local_api_used"]),
+        status_message_id=_safe_int(row, "status_message_id"),
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         error_message=row["error_message"],
@@ -924,6 +947,9 @@ def _row_to_preset(row: aiosqlite.Row) -> Preset:
         banner_path=row["banner_path"],
         banner_position=row["banner_position"],
         banner_scale=row["banner_scale"],
+        watermark_removal=_safe_bool(row, "watermark_removal"),
+        watermark_position=row["watermark_position"],
+        channel_banner=_safe_bool(row, "channel_banner"),
         shared=bool(row["shared"]),
         share_code=row["share_code"],
         created_at=datetime.fromisoformat(row["created_at"]),
@@ -950,6 +976,10 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         banner_path=row["banner_path"],
         banner_position=row["banner_position"],
         banner_scale=row["banner_scale"],
+        watermark_removal=_safe_bool(row, "watermark_removal"),
+        watermark_position=row["watermark_position"],
+        channel_banner=_safe_bool(row, "channel_banner"),
+        subtitles_path=row["subtitles_path"],
         status=row["status"],
         file_path=row["file_path"],
         file_size=row["file_size"],
@@ -1006,6 +1036,13 @@ def _row_to_workflow(row: aiosqlite.Row) -> Workflow:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )
+
+
+def _safe_int(row: aiosqlite.Row, key: str) -> int | None:
+    try:
+        return row[key]
+    except IndexError:
+        return None
 
 
 def _safe_bool(row: aiosqlite.Row, key: str) -> bool:

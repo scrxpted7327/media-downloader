@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
+import subprocess
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .downloader import DownloadError, _run_checked
+
+ProgressCallback = Callable[[int], Awaitable[None]]
+_FFPROGRESS = re.compile(rb"out_time_us=(\d+)")
+_FFPROGRESS_FRAME = re.compile(rb"frame=(\d+)")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -198,6 +205,73 @@ def resolve_voice(voice: str, engine: str | None = None) -> str:
     return "default"
 
 
+async def _run_ffmpeg_with_progress(
+    cmd: list[str], timeout: int, label: str, total_duration_us: int | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> bytes:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise DownloadError(f"{label}: process failed") from exc
+
+    last_pct = -1
+    stdout_lines: list[bytes] = []
+    stderr_lines: list[bytes] = []
+
+    async def _read(stream, dest):
+        while line := await stream.readline():
+            dest.append(line)
+
+    readers = (
+        asyncio.create_task(_read(process.stdout, stdout_lines)),
+        asyncio.create_task(_read(process.stderr, stderr_lines)),
+    )
+
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except (OSError, asyncio.TimeoutError) as exc:
+        process.kill()
+        await process.wait()
+        await asyncio.gather(*readers, return_exceptions=True)
+        raise DownloadError(f"{label} timed out (>{timeout}s)") from exc
+
+    await asyncio.gather(*readers)
+
+    if process.returncode != 0:
+        details = b"".join(stderr_lines).decode("utf-8", "replace").strip().splitlines()[-3:]
+        raise DownloadError(f"{label}: {'; '.join(details)[:500]}")
+
+    stderr_text = b"".join(stderr_lines)
+
+    if progress_callback and total_duration_us:
+        for match in _FFPROGRESS.finditer(stderr_text):
+            current_us = int(match.group(1))
+            if total_duration_us > 0:
+                pct = min(99, int(current_us * 100 // total_duration_us))
+                if pct > last_pct:
+                    last_pct = pct
+                    await progress_callback(pct)
+
+    return b"".join(stdout_lines)
+
+
+def _get_duration_us(path: Path) -> int | None:
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(float(result.stdout.strip()) * 1_000_000)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None
+
+
 async def transcribe_audio(
     input_path: Path,
     language: str | None = None,
@@ -265,6 +339,7 @@ async def render_captions(
     position: str = "bottom",
     auto_captions: bool = True,
     timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
     if not input_path.is_file():
         raise DownloadError(f"input file not found for caption rendering ({input_path.name})")
@@ -279,6 +354,9 @@ async def render_captions(
         tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-srt-")
         srt_path = Path(tmpdir.name) / "captions.srt"
         srt_path.write_text(srt_content, encoding="utf-8")
+
+        srt_output = output_path.with_suffix(".srt")
+        srt_output.write_text(srt_content, encoding="utf-8")
 
         ass_style = _build_ass_style(color, style, position)
         ass_header = (
@@ -309,13 +387,18 @@ async def render_captions(
         ass_path.write_text(ass_header, encoding="utf-8")
 
         try:
-            await _run_checked(
+            duration_us = _get_duration_us(input_path)
+            if progress_callback:
+                await progress_callback(50)
+            await _run_ffmpeg_with_progress(
                 ["ffmpeg", "-y", "-i", str(input_path),
                  "-vf", f"ass={str(ass_path)}",
                  "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
                  "-c:a", "copy", "-movflags", "+faststart", str(output_path)],
                 timeout_seconds,
                 f"closed caption burn failed for {input_path.name}",
+                total_duration_us=duration_us,
+                progress_callback=lambda p: progress_callback(50 + p // 2) if progress_callback else None,
             )
         finally:
             tmpdir.cleanup()
@@ -351,7 +434,12 @@ async def render_captions(
             "-c:a", "copy", "-movflags", "+faststart", str(output_path),
         ]
         try:
-            await _run_checked(cmd, timeout_seconds, f"caption render failed for {input_path.name}")
+            duration_us = _get_duration_us(input_path)
+            await _run_ffmpeg_with_progress(
+                cmd, timeout_seconds, f"caption render failed for {input_path.name}",
+                total_duration_us=duration_us,
+                progress_callback=progress_callback,
+            )
         except DownloadError as exc:
             raise DownloadError(f"Caption render failed (text={caption_text[:50]}): {exc}") from exc
 
@@ -491,6 +579,300 @@ async def render_banner(
     return output_path
 
 
+_WATERMARK_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right", "center"]
+_WATERMARK_REGION_RATIO = 0.15
+
+
+async def remove_watermark(
+    input_path: Path,
+    output_path: Path,
+    position: str = "auto",
+    timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
+) -> Path:
+    if not input_path.is_file():
+        raise DownloadError(f"input file not found for watermark removal ({input_path.name})")
+    if shutil.which("ffmpeg") is None:
+        raise DownloadError("ffmpeg is required for watermark removal")
+
+    if position == "auto":
+        detected = await _detect_watermark_position(input_path, timeout_seconds)
+        if detected is None:
+            LOGGER.warning("Could not auto-detect watermark, falling back to top-right")
+            position = "top-right"
+        else:
+            position = detected
+
+    duration_us = _get_duration_us(input_path)
+    vid_w, vid_h = _get_video_dimensions(input_path)
+
+    pw = max(1, int(vid_w * _WATERMARK_REGION_RATIO))
+    ph = max(1, int(vid_h * _WATERMARK_REGION_RATIO * 0.6))
+
+    position_map = {
+        "top-left": (0, 0),
+        "top-right": (vid_w - pw, 0),
+        "bottom-left": (0, vid_h - ph),
+        "bottom-right": (vid_w - pw, vid_h - ph),
+        "center": ((vid_w - pw) // 2, (vid_h - ph) // 2),
+    }
+    x, y = position_map.get(position, (vid_w - pw, 0))
+    delogo = f"delogo=x={x}:y={y}:w={pw}:h={ph}"
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-vf", delogo,
+        "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    try:
+        await _run_ffmpeg_with_progress(
+            cmd, timeout_seconds, f"watermark removal failed for {input_path.name}",
+            total_duration_us=duration_us,
+            progress_callback=progress_callback,
+        )
+    except DownloadError as exc:
+        raise DownloadError(f"Watermark removal failed: {exc}") from exc
+
+    if not output_path.is_file():
+        raise DownloadError(f"watermark removal produced no output file ({output_path.name})")
+    return output_path
+
+
+async def _detect_watermark_position(input_path: Path, timeout_seconds: int) -> str | None:
+    if shutil.which("ffprobe") is None:
+        return None
+    from PIL import Image
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-wm-")
+    try:
+        frame1 = Path(tmpdir.name) / "frame1.png"
+        frame2 = Path(tmpdir.name) / "frame2.png"
+
+        for f, ts in [(frame1, "00:00:01"), (frame2, "00:00:03")]:
+            await _run_checked(
+                ["ffmpeg", "-y", "-ss", ts, "-i", str(input_path),
+                 "-vframes", "1", "-q:v", "2", str(f)],
+                timeout_seconds, "frame extraction failed",
+            )
+
+        img1 = Image.open(frame1).convert("RGB")
+        img2 = Image.open(frame2).convert("RGB")
+        w, h = img1.size
+
+        pw = int(w * _WATERMARK_REGION_RATIO)
+        ph = int(h * _WATERMARK_REGION_RATIO * 0.6)
+
+        regions = {
+            "top-left": (0, 0, pw, ph),
+            "top-right": (w - pw, 0, w, ph),
+            "bottom-left": (0, h - ph, pw, h),
+            "bottom-right": (w - pw, h - ph, w, h),
+            "center": ((w - pw) // 2, (h - ph) // 2, (w + pw) // 2, (h + ph) // 2),
+        }
+
+        best_score = float("inf")
+        best_pos: str | None = None
+
+        for pos, (x1, y1, x2, y2) in regions.items():
+            crop1 = img1.crop((x1, y1, x2, y2))
+            crop2 = img2.crop((x1, y1, x2, y2))
+            diff = _image_difference(crop1, crop2)
+            if diff < best_score:
+                best_score = diff
+                best_pos = pos
+
+        if best_score < 15.0:
+            return best_pos
+        return None
+    finally:
+        tmpdir.cleanup()
+
+
+def _image_difference(img1: Image.Image, img2: Image.Image) -> float:
+    import math
+    pixels1 = [img1.getpixel((x, y)) for y in range(img1.height) for x in range(img1.width)]
+    pixels2 = [img2.getpixel((x, y)) for y in range(img2.height) for x in range(img2.width)]
+    total = 0.0
+    count = len(pixels1)
+    for p1, p2 in zip(pixels1, pixels2):
+        dr = p1[0] - p2[0]
+        dg = p1[1] - p2[1]
+        db = p1[2] - p2[2]
+        total += math.sqrt(dr * dr + dg * dg + db * db) / 441.67
+    return total / count
+
+
+def _get_video_dimensions(path: Path) -> tuple[int, int]:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return 1920, 1080
+
+
+async def render_channel_banner(
+    input_path: Path,
+    output_path: Path,
+    source_url: str,
+    caption_text: str | None = None,
+    timeout_seconds: int = 600,
+) -> Path:
+    if not input_path.is_file():
+        raise DownloadError(f"input file not found for channel banner ({input_path.name})")
+    if shutil.which("ffmpeg") is None:
+        raise DownloadError("ffmpeg is required for channel banner overlay")
+
+    vid_w, vid_h = _get_video_dimensions(input_path)
+    if vid_w <= vid_h:
+        LOGGER.info("Video is portrait/square (%dx%d), skipping channel banner", vid_w, vid_h)
+        if output_path != input_path:
+            shutil.copy2(str(input_path), str(output_path))
+        return output_path
+
+    avatar_path: Path | None = None
+    channel_title = ""
+    tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-channel-")
+    try:
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(source_url, download=False)
+                channel_title = info.get("channel", info.get("uploader", info.get("creator", ""))) or ""
+                avatar_url = (
+                    info.get("channel_url") or info.get("uploader_url") or ""
+                )
+                if avatar_url:
+                    try:
+                        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl2:
+                            chan_info = ydl2.extract_info(avatar_url, download=False)
+                            thumb = chan_info.get("thumbnails", [])
+                            if thumb:
+                                av_url = thumb[-1].get("url", "")
+                                if av_url:
+                                    import urllib.request
+                                    avatar_path = Path(tmpdir.name) / "avatar.png"
+                                    urllib.request.urlretrieve(av_url, avatar_path)
+                    except Exception:
+                        pass
+                if not avatar_path:
+                    thumbs = info.get("thumbnails", [])
+                    if thumbs:
+                        av_url = thumbs[-1].get("url", "")
+                        if av_url:
+                            import urllib.request
+                            avatar_path = Path(tmpdir.name) / "avatar.png"
+                            urllib.request.urlretrieve(av_url, avatar_path)
+        except Exception as exc:
+            LOGGER.warning("Could not fetch channel info: %s", exc)
+
+        banner_img_path = await _compose_channel_banner_image(
+            Path(tmpdir.name), vid_w, vid_h, avatar_path, channel_title, caption_text,
+        )
+
+        duration_us = _get_duration_us(input_path)
+        position_map = {
+            "bottom": f"0:{vid_h - int(vid_h * 0.18)}",
+        }
+        pos = position_map["bottom"]
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_path),
+            "-i", str(banner_img_path),
+            "-filter_complex",
+            f"[1:v]scale={vid_w}:{int(vid_h * 0.18)}[b];[0:v][b]overlay=0:{vid_h - int(vid_h * 0.18)}",
+            "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        await _run_checked(cmd, timeout_seconds, f"channel banner overlay failed for {input_path.name}")
+    finally:
+        tmpdir.cleanup()
+
+    if not output_path.is_file():
+        raise DownloadError(f"channel banner overlay produced no output file ({output_path.name})")
+    return output_path
+
+
+async def _compose_channel_banner_image(
+    tmpdir: Path,
+    vid_w: int,
+    vid_h: int,
+    avatar_path: Path | None,
+    channel_title: str,
+    caption_text: str | None,
+) -> Path:
+    from PIL import Image, ImageDraw, ImageFont
+
+    banner_h = int(vid_h * 0.18)
+    img = Image.new("RGBA", (vid_w, banner_h), (0, 0, 0, 180))
+    draw = ImageDraw.Draw(img)
+
+    font_large = None
+    font_small = None
+    for size in (32, 28, 24):
+        try:
+            font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+            break
+        except (OSError, IOError):
+            continue
+    if font_large is None:
+        font_large = ImageFont.load_default()
+
+    for size in (22, 18, 16):
+        try:
+            font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+            break
+        except (OSError, IOError):
+            continue
+    if font_small is None:
+        font_small = ImageFont.load_default()
+
+    x_offset = 20
+    if avatar_path and avatar_path.is_file():
+        try:
+            av = Image.open(avatar_path).convert("RGBA")
+            av_size = int(banner_h * 0.7)
+            av = av.resize((av_size, av_size), Image.LANCZOS)
+
+            mask = Image.new("L", (av_size, av_size), 0)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.ellipse((0, 0, av_size, av_size), fill=255)
+
+            av_x = 20
+            av_y = (banner_h - av_size) // 2
+            img.paste(av, (av_x, av_y), mask)
+            x_offset = av_x + av_size + 20
+        except Exception as exc:
+            LOGGER.warning("Could not process avatar: %s", exc)
+
+    y_pos = banner_h // 2 - 20
+    if channel_title:
+        draw.text((x_offset, y_pos), channel_title, fill="white", font=font_large)
+        y_pos += font_large.size + 4
+
+    if caption_text:
+        display_text = caption_text[:100]
+        draw.text((x_offset, y_pos), display_text, fill=(220, 220, 220), font=font_small)
+
+    out = tmpdir / "channel_banner.png"
+    img.save(out)
+    return out
+
+
 async def render_edit(
     input_path: Path,
     output_path: Path,
@@ -507,22 +889,41 @@ async def render_edit(
     banner_path: Path | None = None,
     banner_position: str = "bottom",
     banner_scale: str = "fit",
+    watermark_removal: bool = False,
+    watermark_position: str = "auto",
+    channel_banner: bool = False,
+    source_url: str | None = None,
     timeout_seconds: int = 600,
-) -> Path:
+) -> tuple[Path, str | None]:
     current = input_path
     intermediate = output_path.with_suffix(".intermediate" + output_path.suffix)
 
+    if watermark_removal:
+        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_wm{output_path.suffix}")
+        current = await remove_watermark(current, tmp, watermark_position, timeout_seconds)
+
+    subtitles_result: str | None = None
     if caption_text or auto_captions:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_cap{output_path.suffix}")
         current = await render_captions(
             current, tmp,
             caption_text, caption_color, caption_style, caption_position, auto_captions, timeout_seconds,
         )
+        if auto_captions:
+            srt_path = output_path.with_suffix(".srt")
+            if srt_path.is_file():
+                subtitles_result = str(srt_path)
 
     if voice_text:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_voice{output_path.suffix}")
         current = await render_voice_over(
             current, tmp, voice_text, tts_engine, voice, voice_quality, voice_speed, timeout_seconds,
+        )
+
+    if channel_banner and source_url:
+        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_chan{output_path.suffix}")
+        current = await render_channel_banner(
+            current, tmp, source_url, caption_text, timeout_seconds,
         )
 
     if banner_path:
@@ -535,4 +936,4 @@ async def render_edit(
         shutil.move(str(current), str(output_path))
 
     intermediate.unlink(missing_ok=True)
-    return output_path
+    return output_path, subtitles_result
