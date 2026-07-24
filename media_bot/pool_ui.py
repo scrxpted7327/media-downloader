@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -19,10 +19,13 @@ from .storage import (
     delete_pool_item,
     delete_workflow,
     get_classification,
+    get_job,
     get_pool_item,
     get_workflow,
     list_classifications,
     list_pool_items,
+    list_pool_tags,
+    list_source_jobs_for_user,
     list_workflows,
     remove_pool_tag,
     update_workflow,
@@ -36,6 +39,7 @@ _PAGE_SIZE = 6
 class _State:
     MENU = "pool_menu"
     POOL_LIST = "pool_list"
+    POOL_ADD_PICK = "pool_add_pick"
     POOL_ADD_NAME = "pool_add_name"
     CLASSIFY = "classify"
     CLASSIFY_SELECT = "classify_select"
@@ -82,14 +86,30 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if query.data == "pool:add":
-        flow.action = _State.POOL_ADD_NAME
+        flow.action = _State.POOL_ADD_PICK
+        flow.page = 0
         flow.data.clear()
+        await _show_add_pick(update, context)
+        return
+
+    if query.data.startswith("pool:addpick:"):
+        job_id = int(query.data.split(":")[-1])
+        db_path: Path = context.application.bot_data["db_path"]
+        job = await get_job(db_path, job_id)
+        if job is None or job.file_path is None:
+            await query.answer("Source not found", show_alert=True)
+            return
+        flow.action = _State.POOL_ADD_NAME
+        flow.data["source_job_id"] = job.id
+        flow.data["file_path"] = job.file_path
         await _edit_message(query, "Send the title for this pool item (or /skip for none):")
         return
 
     if query.data == "pool:classify":
-        flow.action = _State.CLASSIFY
-        await _show_classify_select(update, context)
+        flow.action = _State.POOL_LIST
+        flow.page = 0
+        await _edit_message(query, "Tap a pool item to manage its classifications.")
+        await _show_pool_list(update, context)
         return
 
     if query.data == "pool:workflows":
@@ -100,12 +120,33 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if query.data == "pool:filter":
         flow.action = _State.FILTER
+        flow.data.pop("filter_classification_id", None)
         await _show_filter(update, context)
+        return
+
+    if query.data.startswith("pool:filter:"):
+        classification_id = int(query.data.split(":")[-1])
+        flow.action = _State.POOL_LIST
+        flow.page = 0
+        flow.data["filter_classification_id"] = classification_id
+        await _show_pool_list(update, context)
+        return
+
+    if query.data == "pool:filter_clear":
+        flow.action = _State.POOL_LIST
+        flow.page = 0
+        flow.data.pop("filter_classification_id", None)
+        await _show_pool_list(update, context)
         return
 
     if query.data.startswith("pool:page:"):
         flow.page = int(query.data.split(":")[-1])
         await _show_pool_list(update, context)
+        return
+
+    if query.data.startswith("pool:addpage:"):
+        flow.page = int(query.data.split(":")[-1])
+        await _show_add_pick(update, context)
         return
 
     if query.data.startswith("pool:classify:"):
@@ -129,7 +170,9 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await query.answer("Already tagged", show_alert=True)
         else:
             await query.answer("Unauthorized", show_alert=True)
-        await _show_pool_list(update, context)
+        flow.action = _State.CLASSIFY_SELECT
+        flow.data["pool_item_id"] = pool_item_id
+        await _show_classify_select(update, context)
         return
 
     if query.data.startswith("pool:untag:"):
@@ -139,7 +182,9 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         db_path: Path = context.application.bot_data["db_path"]
         removed = await remove_pool_tag(db_path, pool_item_id, classification_id)
         await query.answer("Removed" if removed else "Not found")
-        await _show_pool_list(update, context)
+        flow.action = _State.CLASSIFY_SELECT
+        flow.data["pool_item_id"] = pool_item_id
+        await _show_classify_select(update, context)
         return
 
     if query.data.startswith("pool:delete:"):
@@ -150,6 +195,7 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await query.answer("Deleted")
         else:
             await query.answer("Failed", show_alert=True)
+        flow.action = _State.POOL_LIST
         await _show_pool_list(update, context)
         return
 
@@ -225,17 +271,43 @@ async def pool_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def _show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Pool", callback_data="pool:list")],
-        [InlineKeyboardButton("Add to Pool", callback_data="pool:add")],
-        [InlineKeyboardButton("Classifications", callback_data="pool:classify")],
-        [InlineKeyboardButton("Workflows", callback_data="pool:workflows")],
-        [InlineKeyboardButton("Filter Pool", callback_data="pool:filter")],
+        [InlineKeyboardButton("🏊 Pool", callback_data="pool:list")],
+        [InlineKeyboardButton("➕ Add to Pool", callback_data="pool:add")],
+        [InlineKeyboardButton("🏷️ Classifications", callback_data="pool:classify")],
+        [InlineKeyboardButton("⚙️ Workflows", callback_data="pool:workflows")],
+        [InlineKeyboardButton("🔎 Filter Pool", callback_data="pool:filter")],
     ])
-    msg = "Pool menu:\nManage your video pool, classifications, and workflows."
+    msg = "🏊 Pool menu:\nManage your video pool, classifications, and workflows."
     if update.message:
         await update.message.reply_text(msg, reply_markup=keyboard)
     elif update.callback_query:
         await _edit_message(update.callback_query, msg, keyboard)
+
+
+async def _show_add_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    flow: FlowState = context.user_data["pool_flow"]
+    db_path: Path = context.application.bot_data["db_path"]
+    user = update.effective_user
+    if user is None:
+        return
+    jobs = await list_source_jobs_for_user(db_path, user.id, limit=50)
+    total = len(jobs)
+    start = flow.page * _PAGE_SIZE
+    page = jobs[start:start + _PAGE_SIZE]
+    rows = []
+    for j in page:
+        label = f"#{j.id} {j.url[:40]}..."
+        rows.append([InlineKeyboardButton(label, callback_data=f"pool:addpick:{j.id}")])
+    nav = []
+    if flow.page > 0:
+        nav.append(InlineKeyboardButton("← Back", callback_data=f"pool:addpage:{flow.page - 1}"))
+    if start + _PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("Forward →", callback_data=f"pool:addpage:{flow.page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="pool:menu")])
+    text = "Select a downloaded video to add to the pool:" if total else "No downloaded videos available."
+    await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
 
 async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -244,7 +316,8 @@ async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     if user is None:
         return
-    items = await list_pool_items(db_path, user.id, limit=50)
+    filter_id = flow.data.get("filter_classification_id")
+    items = await list_pool_items(db_path, user.id, classification_id=filter_id, limit=50)
     total = len(items)
     start = flow.page * _PAGE_SIZE
     page = items[start:start + _PAGE_SIZE]
@@ -252,7 +325,10 @@ async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     rows = []
     for item in page:
         label = f"#{item.id} {item.title or item.file_path[-30:]}"
-        rows.append([InlineKeyboardButton(label, callback_data=f"pool:classify:{item.id}")])
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"pool:classify:{item.id}"),
+            InlineKeyboardButton("🗑️", callback_data=f"pool:delete:{item.id}"),
+        ])
 
     nav = []
     if flow.page > 0:
@@ -261,11 +337,18 @@ async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         nav.append(InlineKeyboardButton("Forward →", callback_data=f"pool:page:{flow.page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("Menu", callback_data="pool:menu")])
+    if filter_id is not None:
+        rows.append([InlineKeyboardButton("✖ Clear filter", callback_data="pool:filter_clear")])
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="pool:menu")])
 
-    text = f"Pool ({total} items):"
+    if filter_id is not None:
+        classification = await get_classification(db_path, filter_id)
+        name = classification.name if classification else str(filter_id)
+        text = f"🏊 Pool filtered by \"{name}\" ({total} items):"
+    else:
+        text = f"🏊 Pool ({total} items):"
     if total == 0:
-        text = "Pool is empty. Add videos from /settings -> Edit Existing Video or send a video file."
+        text = "Pool is empty. Use Add to Pool or /settings → Edit Existing Video."
     await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
 
@@ -279,16 +362,36 @@ async def _show_classify_select(update: Update, context: ContextTypes.DEFAULT_TY
             flow.data["pool_item_id"] = pool_item_id
         except (ValueError, IndexError):
             pass
+    if pool_item_id is None:
+        await _edit_or_send(update, "No pool item selected.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("← Back", callback_data="pool:list")],
+        ]))
+        return
 
+    tags = await list_pool_tags(db_path, pool_item_id)
+    tagged_ids = {t.classification_id for t in tags}
     classifications = await list_classifications(db_path)
     rows = []
     for c in classifications:
-        rows.append([InlineKeyboardButton(
-            c.name,
-            callback_data=f"pool:tag:{pool_item_id}:{c.id}",
-        )])
-    rows.append([InlineKeyboardButton("← Back", callback_data="pool:menu")])
-    await _edit_or_send(update, "Select a classification to tag this item:", InlineKeyboardMarkup(rows))
+        if c.id in tagged_ids:
+            rows.append([InlineKeyboardButton(
+                f"✅ {c.name} (untag)",
+                callback_data=f"pool:untag:{pool_item_id}:{c.id}",
+            )])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"🏷️ {c.name}",
+                callback_data=f"pool:tag:{pool_item_id}:{c.id}",
+            )])
+    rows.append([
+        InlineKeyboardButton("🗑️ Delete item", callback_data=f"pool:delete:{pool_item_id}"),
+        InlineKeyboardButton("← Back", callback_data="pool:list"),
+    ])
+    await _edit_or_send(
+        update,
+        f"Classifications for pool item #{pool_item_id}:",
+        InlineKeyboardMarkup(rows),
+    )
 
 
 async def _show_workflow_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -301,13 +404,16 @@ async def _show_workflow_list(update: Update, context: ContextTypes.DEFAULT_TYPE
     rows = []
     for wf in workflows:
         status = "ON" if wf.enabled else "OFF"
-        rows.append([InlineKeyboardButton(
-            f"{wf.name} [{status}] - {wf.action_type}",
-            callback_data=f"workflow:toggle:{wf.id}",
-        )])
-    rows.append([InlineKeyboardButton("Create workflow", callback_data="workflow:create")])
-    rows.append([InlineKeyboardButton("Menu", callback_data="pool:menu")])
-    text = f"Workflows ({len(workflows)}):"
+        rows.append([
+            InlineKeyboardButton(
+                f"{wf.name} [{status}] - {wf.action_type}",
+                callback_data=f"workflow:toggle:{wf.id}",
+            ),
+            InlineKeyboardButton("🗑️", callback_data=f"workflow:delete:{wf.id}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Create workflow", callback_data="workflow:create")])
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="pool:menu")])
+    text = f"⚙️ Workflows ({len(workflows)}):"
     await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
 
@@ -316,9 +422,10 @@ async def _show_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     classifications = await list_classifications(db_path)
     rows = []
     for c in classifications:
-        rows.append([InlineKeyboardButton(c.name, callback_data=f"pool:filter:{c.id}")])
-    rows.append([InlineKeyboardButton("Menu", callback_data="pool:menu")])
-    await _edit_or_send(update, "Filter pool by classification:", InlineKeyboardMarkup(rows))
+        rows.append([InlineKeyboardButton(f"🏷️ {c.name}", callback_data=f"pool:filter:{c.id}")])
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="pool:menu")])
+    text = "🔎 Filter pool by classification:" if classifications else "No classifications yet."
+    await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
 
 async def _add_pool_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE, db_path: Path) -> None:

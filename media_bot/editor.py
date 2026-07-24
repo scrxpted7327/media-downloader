@@ -405,11 +405,8 @@ async def render_captions(
     else:
         if not caption_text:
             raise DownloadError("caption_text is required when auto_captions is off")
-        color_map = {
-            "white": "white", "black": "black", "yellow": "yellow",
-            "red": "red", "blue": "blue", "green": "green",
-        }
-        font_color = color_map.get(color.lower(), "white")
+        from .colors import resolve_drawtext_color
+        font_color = resolve_drawtext_color(color, "white")
         if style == "bold":
             fontsize, borderw, shadow = "24", "3", "2"
         elif style == "bubble":
@@ -449,10 +446,7 @@ async def render_captions(
 
 
 def _build_ass_style(color: str, style: str, position: str) -> dict:
-    color_hex = {
-        "white": "FFFFFF", "black": "000000", "yellow": "FFFF00",
-        "red": "0000FF", "blue": "FF0000", "green": "00FF00",
-    }
+    from .colors import resolve_ass_color
     style_map = {
         "bold": {"fontsize": 24, "bold": 1, "borderstyle": 1, "outline": 3, "shadow": 2},
         "bubble": {"fontsize": 20, "bold": 0, "borderstyle": 3, "outline": 4, "shadow": 3},
@@ -461,7 +455,7 @@ def _build_ass_style(color: str, style: str, position: str) -> dict:
     s = style_map.get(style.lower(), default)
     align_map = {"low": 2, "middle": 8, "high": 8}
     s["alignment"] = align_map.get(position.lower(), 2)
-    s["color"] = color_hex.get(color.lower(), "FFFFFF")
+    s["color"] = resolve_ass_color(color)
     return s
 
 

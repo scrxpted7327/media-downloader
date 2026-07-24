@@ -20,7 +20,7 @@ class DownloadReporterTests(unittest.TestCase):
         asyncio.run(reporter.progress(0))
         asyncio.run(reporter.progress(50))
 
-        self.assertEqual(message.edits, ["Downloading…"])
+        self.assertEqual(message.edits, ["⬇️ Downloading…"])
 
 
 if __name__ == "__main__":

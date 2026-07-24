@@ -27,7 +27,14 @@ from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
 from .fix_agent import ERRORS_DIR, FIX_SCRIPTS_DIR, apply_known_fix, categorize_error, invoke_opencode_fix, load_error_log
 from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url
-from .settings_ui import settings_callback, settings_command, settings_photo_handler, settings_text_handler
+from .settings_ui import (
+    handle_editconfig_callback,
+    settings_callback,
+    settings_command,
+    settings_photo_handler,
+    settings_text_handler,
+    show_editconfig_menu,
+)
 from .storage import (
     cleanup_expired_tokens,
     cleanup_old_jobs,
@@ -51,12 +58,14 @@ LOGGER = logging.getLogger(__name__)
 
 HELP_TEXT = (
     "Commands:\n"
+    "/start - show this help message\n"
     "/help - show this message\n"
     "/settings - video presets and customization\n"
     "/pool - manage video pool and workflows\n"
     "/jobs - list your recent downloads\n"
     "/editconfig - set options for the current edit job\n"
     "/delete <job_id> - delete a downloaded file\n"
+    "/cleanup - delete bot status messages from recent jobs\n"
     "/voices - list available TTS voices\n"
     "/fix - attempt auto-fix for bot errors\n"
     "/status - bot error status and health\n\n"
@@ -76,7 +85,7 @@ class DownloadReporter:
         if self.started:
             return
         self.started = True
-        await self.message.edit_text("Downloading…")
+        await self.message.edit_text("⬇️ Downloading…")
 
 
 def _authorized(update: Update, settings: Settings) -> bool:
@@ -91,16 +100,35 @@ def _authorized(update: Update, settings: Settings) -> bool:
 
 async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
     rows = [
-        [InlineKeyboardButton("Download Original", callback_data=f"download:orig:{job_id}")],
-        [InlineKeyboardButton("Edit", callback_data=f"download:edit:{job_id}"),
-         InlineKeyboardButton("Reset", callback_data=f"download:reset:{job_id}")],
+        [InlineKeyboardButton("⬇️ Download Original", callback_data=f"download:orig:{job_id}")],
+        [InlineKeyboardButton("✂️ Edit", callback_data=f"download:edit:{job_id}"),
+         InlineKeyboardButton("🔄 Reset", callback_data=f"download:reset:{job_id}")],
     ]
-    from .storage import list_presets
+    from .storage import get_or_create_user_settings, list_presets
     presets = await list_presets(db_path, user_id)
-    for p in presets:
-        rows.append([InlineKeyboardButton(f"Download {p.name}", callback_data=f"download:preset:{job_id}:{p.id}")])
+    settings = await get_or_create_user_settings(db_path, user_id)
+    active_name = settings.preset_name
+    active = next((p for p in presets if active_name and p.name == active_name), None)
+    others = [p for p in presets if active is None or p.id != active.id]
+    if active is not None:
+        rows.append([InlineKeyboardButton(
+            f"⭐ 📥 Download {active.name}",
+            callback_data=f"download:preset:{job_id}:{active.id}",
+        )])
+    if others:
+        if len(others) <= 2:
+            for p in others:
+                rows.append([InlineKeyboardButton(
+                    f"📥 Download {p.name}",
+                    callback_data=f"download:preset:{job_id}:{p.id}",
+                )])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"📦 More presets ({len(others)})",
+                callback_data=f"download:presets:{job_id}",
+            )])
     keyboard = InlineKeyboardMarkup(rows)
-    await status_message.edit_text("Download complete. Choose an action:", reply_markup=keyboard)
+    await status_message.edit_text("✅ Download complete. Choose an action:", reply_markup=keyboard)
 
 
 def _build_download_url(settings: Settings, token: str) -> str:
@@ -182,7 +210,7 @@ async def _process_single_url(
     settings: Settings, ytdlp: Path, gallerydl: Path,
     db_path: Path, storage_dir: Path,
 ) -> str:
-    status = await update.effective_message.reply_text("Searching…")
+    status = await update.effective_message.reply_text("🔍 Searching…")
     job = await create_job(db_path, url, user_id, chat_id)
     await update_job(db_path, job.id, status_message_id=status.message_id)
     temporary = None
@@ -202,7 +230,7 @@ async def _process_single_url(
                 ytdlp, url, settings.max_filesize_mb, settings.timeout_seconds,
                 DownloadReporter(status).progress,
             )
-        await status.edit_text("Saving…")
+        await status.edit_text("💾 Saving…")
         persisted = await persist_download(media, job.id, storage_dir)
         await update_job(db_path, job.id, file_path=str(persisted), file_size=persisted.stat().st_size)
         await _send_secure_link(status, job.id, db_path, user_id)
@@ -211,7 +239,7 @@ async def _process_single_url(
     except DownloadError as exc:
         LOGGER.warning("Download failed for %s: %s", url, exc)
         try:
-            await status.edit_text(f"Download failed: {exc}")
+            await status.edit_text(f"❌ Download failed: {exc}")
         except Exception:
             pass
         await update_job(db_path, job.id, status="failed", error_message=str(exc))
@@ -219,7 +247,7 @@ async def _process_single_url(
     except Exception as exc:
         LOGGER.exception("Unexpected failure for %s", url)
         try:
-            await status.edit_text(f"Download failed: {exc.__class__.__name__}: {exc}")
+            await status.edit_text(f"❌ Download failed: {exc.__class__.__name__}: {exc}")
         except Exception:
             pass
         await update_job(db_path, job.id, status="failed", error_message=f"unexpected error: {exc}")
@@ -227,57 +255,6 @@ async def _process_single_url(
     finally:
         if temporary is not None:
             temporary.cleanup()
-
-
-async def secure_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]
-    db_path: Path = context.application.bot_data["db_path"]
-    query = update.callback_query
-    if query is None or query.data is None:
-        return
-
-    user = update.effective_user
-    if not _authorized(update, settings):
-        LOGGER.warning("Secure link rejected for unauthorised user %s", user.id if user else "?")
-        await query.answer("Not authorized", show_alert=True)
-        return
-
-    try:
-        _, job_id_str = query.data.split(":", 1)
-        job_id = int(job_id_str)
-    except (ValueError, IndexError):
-        LOGGER.warning("Invalid secure_link callback data: %s", query.data)
-        await query.answer("Invalid request", show_alert=True)
-        return
-
-    job = await get_job(db_path, job_id)
-    if job is None:
-        LOGGER.warning("Secure link: job #%s not found in DB", job_id)
-        await query.answer("Job not found", show_alert=True)
-        return
-    if job.file_path is None:
-        LOGGER.warning("Secure link: job #%s has no file", job_id)
-        await query.answer("File not available", show_alert=True)
-        return
-
-    if job.user_id != query.from_user.id:
-        LOGGER.warning("Secure link: user %s tried to access job #%s owned by %s", query.from_user.id, job_id, job.user_id)
-        await query.answer("Not your file", show_alert=True)
-        return
-
-    token = await create_download_token(db_path, job.id, job.user_id, settings.token_expiry_minutes)
-    url = _build_download_url(settings, token)
-    link_text = (
-        f"Download ready (one-time link, "
-        f"expires in {settings.token_expiry_minutes} min):\n{url}"
-    )
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=link_text,
-        reply_to_message_id=query.message.message_id,
-        disable_web_page_preview=True,
-    )
-    await query.answer("Link sent")
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -306,6 +283,31 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Not your file", show_alert=True)
         return
 
+    if action == "presets":
+        await query.answer()
+        from .storage import get_or_create_user_settings, list_presets
+        presets = await list_presets(db_path, job.user_id)
+        user_settings = await get_or_create_user_settings(db_path, job.user_id)
+        active_name = user_settings.preset_name
+        rows = []
+        for p in presets:
+            mark = "⭐ " if active_name and p.name == active_name else ""
+            rows.append([InlineKeyboardButton(
+                f"{mark}📥 {p.name}",
+                callback_data=f"download:preset:{job_id}:{p.id}",
+            )])
+        rows.append([InlineKeyboardButton("← Back", callback_data=f"download:actions:{job_id}")])
+        await query.edit_message_text(
+            "📦 Choose a preset to render with:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if action == "actions":
+        await query.answer()
+        await _send_secure_link(query.message, job_id, db_path, job.user_id)
+        return
+
     if action == "orig":
         await query.answer()
         token = await create_download_token(db_path, job.id, job.user_id, settings.token_expiry_minutes)
@@ -329,31 +331,17 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
         await query.answer()
         edit_id = edit.id
-        flow = context.user_data.get("settings_flow")
-        if flow is None:
-            flow = {"action": "editconfig", "edit_id": edit_id, "source_job_id": job_id}
-            context.user_data["settings_flow"] = flow
-        else:
-            flow["action"] = "editconfig"
-            flow["edit_id"] = edit_id
-            flow["source_job_id"] = job_id
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Caption color", callback_data="editcfg:caption_color")],
-            [InlineKeyboardButton("Caption style", callback_data="editcfg:caption_style")],
-            [InlineKeyboardButton("Caption position", callback_data="editcfg:caption_position")],
-            [InlineKeyboardButton("Voice name", callback_data="editcfg:voice_over_voice")],
-            [InlineKeyboardButton("Voice text", callback_data="editcfg:voice_text")],
-            [InlineKeyboardButton("Voice quality", callback_data="editcfg:voice_quality")],
-            [InlineKeyboardButton("Voice speed", callback_data="editcfg:voice_speed")],
-            [InlineKeyboardButton("TTS engine", callback_data="editcfg:tts_engine")],
-            [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
-            [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
-            [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
-            [InlineKeyboardButton("Remove watermark", callback_data="editcfg:watermark_removal")],
-            [InlineKeyboardButton("Channel banner", callback_data="editcfg:channel_banner")],
-            [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
-        ])
-        await query.edit_message_text(f"Edit job #{edit_id} created.\nChoose an option:", reply_markup=keyboard)
+        context.user_data["settings_flow"] = {
+            "action": "editconfig",
+            "edit_id": edit_id,
+            "source_job_id": job_id,
+        }
+        await show_editconfig_menu(
+            update,
+            context,
+            edit_id,
+            intro=f"🎬 Edit job #{edit_id} created.\nCurrent settings are shown on each button.",
+        )
         return
 
     if action == "reset":
@@ -478,6 +466,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         LOGGER.warning("Rejected help request for unapproved chat/user")
         return
     await message.reply_text(HELP_TEXT)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await help_command(update, context)
 
 
 async def settings_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -626,59 +618,26 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("No pending edit job. Use /settings -> Edit Existing Video first.")
         return
     edit_id, source_job_id = edit_jobs
-    flow = context.user_data.get("settings_flow")
-    if flow is None:
-        flow = {"action": "editconfig", "edit_id": edit_id, "source_job_id": source_job_id}
-        context.user_data["settings_flow"] = flow
-    else:
-        flow["action"] = "editconfig"
-        flow["edit_id"] = edit_id
-        flow["source_job_id"] = source_job_id
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Caption color", callback_data="editcfg:caption_color")],
-        [InlineKeyboardButton("Caption style", callback_data="editcfg:caption_style")],
-        [InlineKeyboardButton("Caption position", callback_data="editcfg:caption_position")],
-        [InlineKeyboardButton("Voice name", callback_data="editcfg:voice_over_voice")],
-        [InlineKeyboardButton("Voice text", callback_data="editcfg:voice_text")],
-        [InlineKeyboardButton("Voice quality", callback_data="editcfg:voice_quality")],
-        [InlineKeyboardButton("Voice speed", callback_data="editcfg:voice_speed")],
-        [InlineKeyboardButton("TTS engine", callback_data="editcfg:tts_engine")],
-        [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
-        [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
-        [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
-        [InlineKeyboardButton("Remove watermark", callback_data="editcfg:watermark_removal")],
-        [InlineKeyboardButton("Channel banner", callback_data="editcfg:channel_banner")],
-        [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
-    ])
-    await message.reply_text(f"Edit job #{edit_id} from source #{source_job_id}\nChoose an option:", reply_markup=keyboard)
+    context.user_data["settings_flow"] = {
+        "action": "editconfig",
+        "edit_id": edit_id,
+        "source_job_id": source_job_id,
+    }
+    await show_editconfig_menu(update, context, edit_id)
 
 
 async def editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if query is None or query.data is None:
-        return
-    await query.answer()
-    settings: Settings = context.application.bot_data["settings"]
-    db_path: Path = context.application.bot_data["db_path"]
-    flow = context.user_data.get("settings_flow")
-    if not flow or flow.get("action") != "editconfig":
-        await query.edit_message_text("No active edit config. Use /editconfig.")
-        return
-
-    edit_id = flow.get("edit_id")
-    if query.data == "editcfg:render":
-        await _render_edit_job(update, context, edit_id)
-        return
-
-    field = query.data.split(":", 1)[1]
-    flow["field_name"] = field
-    pretty = field.replace("_", " ").title()
-    await query.edit_message_text(f"Send new value for {pretty} (or /skip to clear):")
+    result = await handle_editconfig_callback(update, context)
+    if result == "render":
+        flow = context.user_data.get("settings_flow") or {}
+        edit_id = flow.get("edit_id") if isinstance(flow, dict) else None
+        if edit_id is not None:
+            await _render_edit_job(update, context, edit_id)
 
 
 async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     flow = context.user_data.get("settings_flow")
-    if not flow or flow.get("action") != "editconfig" or not update.message or not update.message.text:
+    if not flow or not isinstance(flow, dict) or flow.get("action") != "editconfig" or not update.message or not update.message.text:
         return False
     field = flow.get("field_name")
     edit_id = flow.get("edit_id")
@@ -721,7 +680,7 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update_edit_job(context.application.bot_data["db_path"], edit_id, **{field: value})
     flow.pop("field_name", None)
-    await update.message.reply_text("Updated. Use /editconfig to change more or Render.")
+    await show_editconfig_menu(update, context, edit_id)
     return True
 
 
@@ -963,6 +922,7 @@ def main() -> None:
     application.bot_data["db_path"] = db_path
     application.bot_data["storage_dir"] = storage_dir
 
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("voices", voices_command))
     application.add_handler(CommandHandler("settings", settings_command_entry))
@@ -972,6 +932,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^settings:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^preset:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^edit:"))
+    application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^preset_create:"))
     application.add_handler(CallbackQueryHandler(pool_callback_entry, pattern=r"^pool:"))
     application.add_handler(CallbackQueryHandler(pool_callback_entry, pattern=r"^workflow:"))
     application.add_handler(CommandHandler("jobs", jobs_command))
@@ -980,7 +941,6 @@ def main() -> None:
     application.add_handler(CommandHandler("editconfig", editconfig_command))
     application.add_handler(CallbackQueryHandler(editconfig_callback, pattern=r"^editcfg:"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^download:"))
-    application.add_handler(CallbackQueryHandler(secure_link_callback, pattern=r"^secure_link:\d+$"))
     application.add_handler(MessageHandler(filters.PHOTO, _message_router))
     application.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.CAPTION, _message_router))
 
