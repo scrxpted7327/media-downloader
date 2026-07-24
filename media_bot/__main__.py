@@ -10,7 +10,7 @@ import aiosqlite
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import NetworkError, TimedOut
+from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -21,11 +21,11 @@ from telegram.ext import (
 )
 
 from .config import Settings
-from .downloader import DownloadError, download_media, download_tiktok_slideshow, persist_download
+from .downloader import DownloadError, download_instagram, download_media, download_tiktok_slideshow, persist_download
 from .download_server import create_download_app
-from .editor import render_edit
-from .platforms import extract_supported_urls, is_tiktok_photo_url
-from .settings_ui import settings_callback, settings_command, settings_text_handler
+from .editor import list_tts_voices, render_edit
+from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url
+from .settings_ui import settings_callback, settings_command, settings_photo_handler, settings_text_handler
 from .storage import (
     cleanup_expired_tokens,
     cleanup_old_jobs,
@@ -54,10 +54,10 @@ HELP_TEXT = (
     "/pool - manage video pool and workflows\n"
     "/jobs - list your recent downloads\n"
     "/editconfig - set options for the current edit job\n"
-    "/delete <job_id> - delete a downloaded file\n\n"
+    "/delete <job_id> - delete a downloaded file\n"
+    "/voices - list available TTS voices\n\n"
     "Send a YouTube, Instagram, TikTok, or Facebook link anywhere in a message. "
-    "The bot downloads the first supported link it finds.\n\n"
-    "Large files may receive a secure download link instead of a Telegram upload."
+    "The bot downloads the first supported link it finds and provides a secure download link."
 )
 
 
@@ -75,30 +75,6 @@ class DownloadReporter:
         await self.message.edit_text("Downloading…")
 
 
-async def _upload_with_retry(message, media: Path, settings: Settings) -> tuple[bool, str | None]:
-    """Try to upload via Telegram. Returns (success, error_message)."""
-    file_size = media.stat().st_size
-    local_api_limit = 2 * 1024 * 1024 * 1024
-
-    if file_size > local_api_limit and not settings.local_api_url:
-        return False, f"File is {file_size / 1024 / 1024:.1f} MB, exceeding Telegram's limit"
-
-    last_exc = None
-    for attempt in range(2):
-        try:
-            with media.open("rb") as uploaded:
-                await message.reply_document(document=uploaded, filename=media.name, caption="Media")
-            return True, None
-        except (NetworkError, TimedOut) as exc:
-            last_exc = exc
-            if attempt:
-                break
-            LOGGER.warning("Telegram upload timed out; retrying once")
-            await asyncio.sleep(3)
-
-    return False, f"Upload failed: {last_exc}"
-
-
 def _authorized(update: Update, settings: Settings) -> bool:
     chat = update.effective_chat
     user = update.effective_user
@@ -109,15 +85,18 @@ def _authorized(update: Update, settings: Settings) -> bool:
     return bool(user and user.id in settings.allowed_user_ids) or chat.id in settings.allowed_chat_ids
 
 
-async def _send_secure_link_button(status_message, job_id: int) -> None:
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Get secure link", callback_data=f"secure_link:{job_id}")]]
-    )
-    await status_message.edit_text(
-        "Download complete. File is too large for Telegram.\n"
-        "Press the button below to get a secure download link.",
-        reply_markup=keyboard,
-    )
+async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
+    rows = [
+        [InlineKeyboardButton("Download Original", callback_data=f"download:orig:{job_id}")],
+        [InlineKeyboardButton("Edit", callback_data=f"download:edit:{job_id}"),
+         InlineKeyboardButton("Reset", callback_data=f"download:reset:{job_id}")],
+    ]
+    from .storage import list_presets
+    presets = await list_presets(db_path, user_id)
+    for p in presets:
+        rows.append([InlineKeyboardButton(f"Download {p.name}", callback_data=f"download:preset:{job_id}:{p.id}")])
+    keyboard = InlineKeyboardMarkup(rows)
+    await status_message.edit_text("Download complete. Choose an action:", reply_markup=keyboard)
 
 
 def _build_download_url(settings: Settings, token: str) -> str:
@@ -134,6 +113,9 @@ async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     handled = await settings_text_entry(update, context)
     if handled:
         return
+    handled = await settings_photo_entry(update, context)
+    if handled:
+        return
     handled = await pool_text_entry(update, context)
     if handled:
         return
@@ -141,6 +123,12 @@ async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if handled:
         return
     await handle_url(update, context)
+
+
+async def settings_photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not _authorized(update, context.application.bot_data["settings"]):
+        return False
+    return await settings_photo_handler(update, context)
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -170,9 +158,16 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     job = await create_job(db_path, url, user_id, chat_id)
     temporary = None
     try:
-        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_DOCUMENT)
         if is_tiktok_photo_url(url):
             temporary, media = await download_tiktok_slideshow(
+                gallerydl,
+                url,
+                settings.max_filesize_mb,
+                settings.timeout_seconds,
+                DownloadReporter(status).progress,
+            )
+        elif is_instagram_url(url):
+            temporary, media = await download_instagram(
                 gallerydl,
                 url,
                 settings.max_filesize_mb,
@@ -190,30 +185,32 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await status.edit_text("Saving…")
         persisted = await persist_download(media, job.id, storage_dir)
+        file_size = persisted.stat().st_size
         await update_job(
-            db_path, job.id, file_path=str(persisted), file_size=persisted.stat().st_size,
+            db_path, job.id, file_path=str(persisted), file_size=file_size,
         )
 
-        success, error = await _upload_with_retry(message, persisted, settings)
-        if success:
-            await update_job(
-                db_path, job.id, status="uploaded", local_api_used=bool(settings.local_api_url),
-            )
-            await status.edit_text("Downloaded")
-        else:
-            await update_job(db_path, job.id, status="failed", error_message=error)
-            await status.edit_text(f"Upload failed: {error}")
-            if settings.download_domain:
-                await _send_secure_link_button(status, job.id)
-    except DownloadError as exc:
-        await status.edit_text(f"Download failed: {exc}")
-        await update_job(db_path, job.id, status="failed", error_message=str(exc))
-    except Exception:
-        LOGGER.exception("Unexpected download/upload failure")
-        await status.edit_text(
-            "Download or upload failed. The source may be unavailable or exceed Telegram's limit."
+        await _send_secure_link(status, job.id, db_path, user_id)
+        await update_job(
+            db_path, job.id, status="uploaded", local_api_used=bool(settings.local_api_url),
         )
-        await update_job(db_path, job.id, status="failed", error_message="unexpected error")
+    except DownloadError as exc:
+        msg = f"Download failed for {url}: {exc}"
+        LOGGER.warning(msg)
+        try:
+            await status.edit_text(f"Download failed: {exc}")
+        except Exception:
+            pass
+        await update_job(db_path, job.id, status="failed", error_message=str(exc))
+    except Exception as exc:
+        LOGGER.exception("Unexpected download/upload failure for %s", url)
+        try:
+            await status.edit_text(
+                f"Download failed: {exc.__class__.__name__}: {exc}"
+            )
+        except Exception:
+            pass
+        await update_job(db_path, job.id, status="failed", error_message=f"unexpected error: {exc}")
     finally:
         if temporary is not None:
             temporary.cleanup()
@@ -226,7 +223,9 @@ async def secure_link_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if query is None or query.data is None:
         return
 
+    user = update.effective_user
     if not _authorized(update, settings):
+        LOGGER.warning("Secure link rejected for unauthorised user %s", user.id if user else "?")
         await query.answer("Not authorized", show_alert=True)
         return
 
@@ -234,25 +233,215 @@ async def secure_link_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         _, job_id_str = query.data.split(":", 1)
         job_id = int(job_id_str)
     except (ValueError, IndexError):
+        LOGGER.warning("Invalid secure_link callback data: %s", query.data)
         await query.answer("Invalid request", show_alert=True)
+        return
+
+    job = await get_job(db_path, job_id)
+    if job is None:
+        LOGGER.warning("Secure link: job #%s not found in DB", job_id)
+        await query.answer("Job not found", show_alert=True)
+        return
+    if job.file_path is None:
+        LOGGER.warning("Secure link: job #%s has no file", job_id)
+        await query.answer("File not available", show_alert=True)
+        return
+
+    if job.user_id != query.from_user.id:
+        LOGGER.warning("Secure link: user %s tried to access job #%s owned by %s", query.from_user.id, job_id, job.user_id)
+        await query.answer("Not your file", show_alert=True)
+        return
+
+    token = await create_download_token(db_path, job.id, job.user_id, settings.token_expiry_minutes)
+    url = _build_download_url(settings, token)
+    link_text = (
+        f"Download ready (one-time link, "
+        f"expires in {settings.token_expiry_minutes} min):\n{url}"
+    )
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=link_text,
+        reply_to_message_id=query.message.message_id,
+        disable_web_page_preview=True,
+    )
+    await query.answer("Link sent")
+
+
+async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    db_path: Path = context.application.bot_data["db_path"]
+    storage_dir: Path = context.application.bot_data["storage_dir"]
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    if not _authorized(update, settings):
+        await query.answer("Not authorized", show_alert=True)
+        return
+    parts = query.data.split(":")
+    action, job_id_str = parts[1], parts[2]
+    try:
+        job_id = int(job_id_str)
+    except ValueError:
+        await query.answer("Invalid job", show_alert=True)
         return
 
     job = await get_job(db_path, job_id)
     if job is None or job.file_path is None:
         await query.answer("File not found", show_alert=True)
         return
-
     if job.user_id != query.from_user.id:
         await query.answer("Not your file", show_alert=True)
         return
 
-    token = await create_download_token(db_path, job.id, job.user_id, settings.token_expiry_minutes)
-    url = _build_download_url(settings, token)
-    await query.edit_message_text(
-        f"Secure download link (one-time use, expires in {settings.token_expiry_minutes} min):\n{url}",
-        disable_web_page_preview=True,
-    )
-    await query.answer()
+    if action == "orig":
+        await query.answer()
+        token = await create_download_token(db_path, job.id, job.user_id, settings.token_expiry_minutes)
+        url = _build_download_url(settings, token)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"Download ready (one-time, {settings.token_expiry_minutes} min):\n{url}",
+            reply_to_message_id=query.message.message_id,
+            disable_web_page_preview=True,
+        )
+        return
+
+    if action == "edit":
+        source_path = Path(job.file_path)
+        if not source_path.is_file():
+            await query.answer("Source file missing", show_alert=True)
+            return
+        edit = await create_edit_job(db_path, job_id, job.user_id, preset_id=None)
+        dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
+        shutil.copy2(source_path, dest)
+        await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
+        await query.answer()
+        edit_id = edit.id
+        flow = context.user_data.get("settings_flow")
+        if flow is None:
+            flow = {"action": "editconfig", "edit_id": edit_id, "source_job_id": job_id}
+            context.user_data["settings_flow"] = flow
+        else:
+            flow["action"] = "editconfig"
+            flow["edit_id"] = edit_id
+            flow["source_job_id"] = job_id
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Caption color", callback_data="editcfg:caption_color")],
+            [InlineKeyboardButton("Caption style", callback_data="editcfg:caption_style")],
+            [InlineKeyboardButton("Caption position", callback_data="editcfg:caption_position")],
+            [InlineKeyboardButton("Voice name", callback_data="editcfg:voice_over_voice")],
+            [InlineKeyboardButton("Voice text", callback_data="editcfg:voice_text")],
+            [InlineKeyboardButton("Voice quality", callback_data="editcfg:voice_quality")],
+            [InlineKeyboardButton("Voice speed", callback_data="editcfg:voice_speed")],
+            [InlineKeyboardButton("TTS engine", callback_data="editcfg:tts_engine")],
+            [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
+            [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
+            [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
+            [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
+        ])
+        await query.edit_message_text(f"Edit job #{edit_id} created.\nChoose an option:", reply_markup=keyboard)
+        return
+
+    if action == "reset":
+        await query.answer()
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("DELETE FROM edit_jobs WHERE source_job_id = ? AND user_id = ? AND status IN ('pending', 'rendered')", (job_id, job.user_id))
+            await db.commit()
+        flow = context.user_data.get("settings_flow")
+        if flow and flow.get("action") == "editconfig":
+            context.user_data.pop("settings_flow", None)
+        await query.edit_message_text("Edit config reset for this download.")
+        return
+
+    if action == "preset":
+        await query.answer()
+        preset_id = int(parts[3])
+        from .storage import list_presets
+        preset = next((p for p in await list_presets(db_path, job.user_id) if p.id == preset_id), None)
+        if preset is None:
+            await query.edit_message_text("Preset not found.")
+            return
+        source_path = Path(job.file_path)
+        if not source_path.is_file():
+            await query.edit_message_text("Source file missing.")
+            return
+        edit = await create_edit_job(db_path, job_id, job.user_id, preset_id)
+        dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
+        shutil.copy2(source_path, dest)
+        await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
+
+        await query.edit_message_text("Rendering with preset...")
+        out_path = storage_dir / f"edit-{edit.id}-final.mp4"
+        try:
+            await render_edit(
+                input_path=Path(dest),
+                output_path=out_path,
+                caption_text=preset.caption_text,
+                caption_color=preset.caption_color or "white",
+                caption_style=preset.caption_style or "basic",
+                caption_position=preset.caption_position or "bottom",
+                auto_captions=True,
+                voice_text=preset.voice_text,
+                voice=preset.voice_over_voice or "default",
+                voice_quality=preset.voice_quality or "basic",
+                voice_speed=preset.voice_speed or 1.0,
+                tts_engine=preset.tts_engine,
+                banner_path=Path(preset.banner_path) if preset.banner_path else None,
+                banner_position=preset.banner_position or "bottom",
+                banner_scale=preset.banner_scale or "fit",
+                timeout_seconds=settings.timeout_seconds,
+            )
+        except DownloadError as exc:
+            await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
+            await query.edit_message_text(f"Render failed: {exc}")
+            return
+        await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size)
+        token = await create_download_token(db_path, edit.id, job.user_id, settings.token_expiry_minutes)
+        url = _build_download_url(settings, token)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"Rendered with \"{preset.name}\" – one-time download ({settings.token_expiry_minutes} min):\n{url}",
+            reply_to_message_id=query.message.message_id,
+            disable_web_page_preview=True,
+        )
+        return
+
+
+async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        LOGGER.warning("Rejected voices request for unapproved chat/user")
+        return
+    await message.reply_chat_action(ChatAction.TYPING)
+    try:
+        voices = await list_tts_voices()
+    except Exception as exc:
+        await message.reply_text(f"Could not list voices: {exc}")
+        return
+    if not voices:
+        await message.reply_text("No TTS voices found.")
+        return
+    groups: dict[str, list[str]] = {}
+    for v in voices:
+        key = v["locale"].split("-")[0] if "-" in v["locale"] else v["locale"]
+        groups.setdefault(key, []).append(v["desc"])
+    lines = [f"Available voices ({len(voices)} total, engine: auto-detected):"]
+    for locale in sorted(groups):
+        entries = groups[locale][:5]
+        lines.append(f"\n{locale}:")
+        for e in entries:
+            lines.append(f"  {e}")
+        if len(groups[locale]) > 5:
+            lines.append(f"  ... and {len(groups[locale]) - 5} more")
+    lines.append("\nSet a voice with e.g.: /settings -> Preset -> Voice name")
+    lines.append("You can also use: default, male, female")
+    # Split into multiple messages if too long
+    full = "\n".join(lines)
+    if len(full) > 3800:
+        for i in range(0, len(full), 3800):
+            await message.reply_text(full[i:i + 3800])
+    else:
+        await message.reply_text(full, disable_web_page_preview=True)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -395,13 +584,17 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         flow["edit_id"] = edit_id
         flow["source_job_id"] = source_job_id
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Caption text", callback_data="editcfg:caption_text")],
         [InlineKeyboardButton("Caption color", callback_data="editcfg:caption_color")],
         [InlineKeyboardButton("Caption style", callback_data="editcfg:caption_style")],
         [InlineKeyboardButton("Caption position", callback_data="editcfg:caption_position")],
         [InlineKeyboardButton("Voice name", callback_data="editcfg:voice_over_voice")],
+        [InlineKeyboardButton("Voice text", callback_data="editcfg:voice_text")],
         [InlineKeyboardButton("Voice quality", callback_data="editcfg:voice_quality")],
         [InlineKeyboardButton("Voice speed", callback_data="editcfg:voice_speed")],
+        [InlineKeyboardButton("TTS engine", callback_data="editcfg:tts_engine")],
+        [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
+        [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
+        [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
         [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
     ])
     await message.reply_text(f"Edit job #{edit_id} from source #{source_job_id}\nChoose an option:", reply_markup=keyboard)
@@ -440,7 +633,15 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return False
     text = update.message.text.strip()
     value = None if text.lower() == "/skip" else text
-    if field == "voice_speed":
+    if field == "auto_captions":
+        if text.lower() in ("yes", "y", "on", "true", "1"):
+            value = True
+        elif text.lower() in ("no", "n", "off", "false", "0"):
+            value = False
+        else:
+            await update.message.reply_text("Enter yes or no")
+            return True
+    elif field == "voice_speed":
         try:
             value = float(text)
             if not (0.5 <= value <= 2.0):
@@ -448,13 +649,17 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except ValueError:
             await update.message.reply_text("Enter a number between 0.5 and 2.0")
             return True
-    if field in {"caption_color", "caption_style", "caption_position", "voice_quality"}:
-        opts = {
-            "caption_color": {"white", "black", "yellow", "red", "blue", "green"},
-            "caption_style": {"basic", "bold", "bubble"},
-            "caption_position": {"low", "middle", "high"},
-            "voice_quality": {"basic", "premium"},
-        }[field]
+    opts_map = {
+        "caption_color": {"white", "black", "yellow", "red", "blue", "green"},
+        "caption_style": {"basic", "bold", "bubble"},
+        "caption_position": {"low", "middle", "high"},
+        "voice_quality": {"basic", "premium"},
+        "tts_engine": {"edge-tts", "espeak-ng", "auto"},
+        "banner_position": {"top", "bottom", "overlay"},
+        "banner_scale": {"fit", "stretch", "fill"},
+    }
+    if field in opts_map:
+        opts = opts_map[field]
         if text.lower() not in opts:
             await update.message.reply_text(f"Choose: {', '.join(sorted(opts))}")
             return True
@@ -493,23 +698,42 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
     try:
         preset = None
         if edit.preset_id:
-            from .storage import get_preset_by_share_code, list_presets
-            preset = None
-            for p in await list_presets(db_path, edit.user_id):
-                if p.id == edit.preset_id:
-                    preset = p
-                    break
+            from .storage import list_presets
+            preset = next(
+                (p for p in await list_presets(db_path, edit.user_id) if p.id == edit.preset_id),
+                None,
+            )
+
+        cap_text = edit.caption_text if edit.caption_text is not None else (preset.caption_text if preset else None)
+        cap_color = edit.caption_color if edit.caption_color is not None else (preset.caption_color or "white" if preset else "white")
+        cap_style = edit.caption_style if edit.caption_style is not None else (preset.caption_style or "basic" if preset else "basic")
+        cap_pos = edit.caption_position if edit.caption_position is not None else (preset.caption_position or "bottom" if preset else "bottom")
+        auto_cap = edit.auto_captions if edit.auto_captions else (preset.auto_captions if preset else False)
+        v_text = edit.voice_text if edit.voice_text is not None else (preset.voice_text if preset else None)
+        v_voice = edit.voice_over_voice if edit.voice_over_voice is not None else (preset.voice_over_voice or "default" if preset else "default")
+        v_quality = edit.voice_quality if edit.voice_quality is not None else (preset.voice_quality or "basic" if preset else "basic")
+        v_speed = edit.voice_speed if edit.voice_speed is not None else (preset.voice_speed or 1.0 if preset else 1.0)
+        tts_eng = edit.tts_engine if edit.tts_engine is not None else (preset.tts_engine if preset else None)
+        b_path = edit.banner_path if edit.banner_path is not None else (preset.banner_path if preset else None)
+        b_pos = edit.banner_position if edit.banner_position is not None else (preset.banner_position or "bottom" if preset else "bottom")
+        b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fit" if preset else "fit")
+
         await render_edit(
             input_path=Path(edit.file_path),
             output_path=out_path,
-            caption_text=preset.caption_text if preset else None,
-            caption_color=preset.caption_color or "white" if preset else "white",
-            caption_style=preset.caption_style or "basic" if preset else "basic",
-            caption_position=preset.caption_position or "bottom" if preset else "bottom",
-            voice_text=preset.voice_over_voice if preset else None,
-            voice=preset.voice_over_voice or "default" if preset else "default",
-            voice_quality=preset.voice_quality or "basic" if preset else "basic",
-            voice_speed=preset.voice_speed or 1.0 if preset else 1.0,
+            caption_text=cap_text,
+            caption_color=cap_color,
+            caption_style=cap_style,
+            caption_position=cap_pos,
+            auto_captions=auto_cap,
+            voice_text=v_text,
+            voice=v_voice,
+            voice_quality=v_quality,
+            voice_speed=v_speed,
+            tts_engine=tts_eng,
+            banner_path=Path(b_path) if b_path else None,
+            banner_position=b_pos,
+            banner_scale=b_scale,
             timeout_seconds=settings.timeout_seconds,
         )
     except DownloadError as exc:
@@ -576,11 +800,15 @@ def main() -> None:
     application = builder.post_init(_post_init).build()
     application.bot_data["settings"] = settings
     application.bot_data["ytdlp"] = ytdlp
-    application.bot_data["gallerydl"] = Path(sys.executable).with_name("gallery-dl")
+    gallerydl_path = shutil.which("gallery-dl")
+    if gallerydl_path is None:
+        gallerydl_path = str(Path(sys.executable).with_name("gallery-dl"))
+    application.bot_data["gallerydl"] = Path(gallerydl_path)
     application.bot_data["db_path"] = db_path
     application.bot_data["storage_dir"] = storage_dir
 
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("voices", voices_command))
     application.add_handler(CommandHandler("settings", settings_command_entry))
     application.add_handler(CommandHandler("pool", pool_command_entry))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^settings:"))
@@ -592,7 +820,9 @@ def main() -> None:
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("editconfig", editconfig_command))
     application.add_handler(CallbackQueryHandler(editconfig_callback, pattern=r"^editcfg:"))
+    application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^download:"))
     application.add_handler(CallbackQueryHandler(secure_link_callback, pattern=r"^secure_link:\d+$"))
+    application.add_handler(MessageHandler(filters.PHOTO, _message_router))
     application.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.CAPTION, _message_router))
 
     application.job_queue.run_repeating(cleanup_task, interval=6 * 60 * 60, first=60)

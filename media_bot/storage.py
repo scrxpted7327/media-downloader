@@ -56,8 +56,14 @@ class Preset:
     caption_color: str | None
     caption_style: str | None
     caption_position: str | None
+    auto_captions: bool
     voice_quality: str | None
     voice_speed: float | None
+    voice_text: str | None
+    tts_engine: str | None
+    banner_path: str | None
+    banner_position: str | None
+    banner_scale: str | None
     shared: bool
     share_code: str | None
     created_at: datetime
@@ -70,6 +76,19 @@ class EditJob:
     source_job_id: int
     user_id: int
     preset_id: int | None
+    caption_text: str | None
+    caption_color: str | None
+    caption_style: str | None
+    caption_position: str | None
+    auto_captions: bool
+    voice_text: str | None
+    voice_over_voice: str | None
+    voice_quality: str | None
+    voice_speed: float | None
+    tts_engine: str | None
+    banner_path: str | None
+    banner_position: str | None
+    banner_scale: str | None
     status: str
     file_path: str | None
     file_size: int | None
@@ -280,6 +299,36 @@ async def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id);
             CREATE INDEX IF NOT EXISTS idx_workflow_runs_item ON workflow_runs(pool_item_id);
         """)
+        for _table, _cols in [
+            ("presets", [
+                ("auto_captions", "INTEGER NOT NULL DEFAULT 0"),
+                ("voice_text", "TEXT"),
+                ("tts_engine", "TEXT"),
+                ("banner_path", "TEXT"),
+                ("banner_position", "TEXT"),
+                ("banner_scale", "TEXT"),
+            ]),
+            ("edit_jobs", [
+                ("caption_text", "TEXT"),
+                ("caption_color", "TEXT"),
+                ("caption_style", "TEXT"),
+                ("caption_position", "TEXT"),
+                ("auto_captions", "INTEGER NOT NULL DEFAULT 0"),
+                ("voice_text", "TEXT"),
+                ("voice_over_voice", "TEXT"),
+                ("voice_quality", "TEXT"),
+                ("voice_speed", "REAL"),
+                ("tts_engine", "TEXT"),
+                ("banner_path", "TEXT"),
+                ("banner_position", "TEXT"),
+                ("banner_scale", "TEXT"),
+            ]),
+        ]:
+            for col, ctype in _cols:
+                try:
+                    await db.execute(f"ALTER TABLE {_table} ADD COLUMN {col} {ctype}")
+                except aiosqlite.OperationalError:
+                    pass
         await db.commit()
 
 
@@ -405,8 +454,9 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             "INSERT INTO presets (user_id, name, crop_preset, caption_text, voice_over_voice, "
-            "caption_color, caption_style, caption_position, voice_quality, voice_speed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "caption_color, caption_style, caption_position, auto_captions, voice_quality, voice_speed, "
+            "voice_text, tts_engine, banner_path, banner_position, banner_scale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 name,
@@ -416,8 +466,14 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
                 kwargs.get("caption_color"),
                 kwargs.get("caption_style"),
                 kwargs.get("caption_position"),
+                int(bool(kwargs.get("auto_captions"))),
                 kwargs.get("voice_quality"),
                 kwargs.get("voice_speed"),
+                kwargs.get("voice_text"),
+                kwargs.get("tts_engine"),
+                kwargs.get("banner_path"),
+                kwargs.get("banner_position"),
+                kwargs.get("banner_scale"),
             ),
         )
         await db.commit()
@@ -860,8 +916,14 @@ def _row_to_preset(row: aiosqlite.Row) -> Preset:
         caption_color=row["caption_color"],
         caption_style=row["caption_style"],
         caption_position=row["caption_position"],
+        auto_captions=_safe_bool(row, "auto_captions"),
         voice_quality=row["voice_quality"],
         voice_speed=row["voice_speed"],
+        voice_text=row["voice_text"],
+        tts_engine=row["tts_engine"],
+        banner_path=row["banner_path"],
+        banner_position=row["banner_position"],
+        banner_scale=row["banner_scale"],
         shared=bool(row["shared"]),
         share_code=row["share_code"],
         created_at=datetime.fromisoformat(row["created_at"]),
@@ -875,6 +937,19 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         source_job_id=row["source_job_id"],
         user_id=row["user_id"],
         preset_id=row["preset_id"],
+        caption_text=row["caption_text"],
+        caption_color=row["caption_color"],
+        caption_style=row["caption_style"],
+        caption_position=row["caption_position"],
+        auto_captions=_safe_bool(row, "auto_captions"),
+        voice_text=row["voice_text"],
+        voice_over_voice=row["voice_over_voice"],
+        voice_quality=row["voice_quality"],
+        voice_speed=row["voice_speed"],
+        tts_engine=row["tts_engine"],
+        banner_path=row["banner_path"],
+        banner_position=row["banner_position"],
+        banner_scale=row["banner_scale"],
         status=row["status"],
         file_path=row["file_path"],
         file_size=row["file_size"],
@@ -931,6 +1006,13 @@ def _row_to_workflow(row: aiosqlite.Row) -> Workflow:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )
+
+
+def _safe_bool(row: aiosqlite.Row, key: str) -> bool:
+    try:
+        return bool(row[key])
+    except IndexError:
+        return False
 
 
 def _row_to_workflow_run(row: aiosqlite.Row) -> WorkflowRun:

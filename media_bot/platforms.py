@@ -27,6 +27,12 @@ def extract_supported_urls(text: str) -> list[str]:
     ]
 
 
+def is_instagram_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host == "instagram.com" or host.endswith(".instagram.com")
+
+
 def is_tiktok_photo_url(url: str) -> bool:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")

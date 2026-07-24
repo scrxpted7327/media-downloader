@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, PhotoSize, Update
 from telegram.ext import ContextTypes
 
 from .storage import JobRecord, Preset
@@ -23,8 +24,14 @@ class _State:
     PRESET_CREATE_CAPTION_STYLE = "preset_create_caption_style"
     PRESET_CREATE_CAPTION_POS = "preset_create_caption_pos"
     PRESET_CREATE_VOICE = "preset_create_voice"
+    PRESET_CREATE_VOICE_TEXT = "preset_create_voice_text"
     PRESET_CREATE_VOICE_QUALITY = "preset_create_voice_quality"
     PRESET_CREATE_VOICE_SPEED = "preset_create_voice_speed"
+    PRESET_CREATE_TTS_ENGINE = "preset_create_tts_engine"
+    PRESET_CREATE_BANNER = "preset_create_banner"
+    PRESET_CREATE_BANNER_POS = "preset_create_banner_pos"
+    PRESET_CREATE_BANNER_SCALE = "preset_create_banner_scale"
+    PRESET_CREATE_BANNER_UPLOAD = "preset_create_banner_upload"
     PRESET_EDIT = "preset_edit"
     PRESET_EDIT_FIELD = "preset_edit_field"
     STATS = "stats"
@@ -72,6 +79,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         flow.action = _State.PRESET_CREATE_NAME
         flow.data.clear()
         await _edit_message(query, "Send the preset name (e.g. \"default\"):")
+        return
+
+    if query.data == "settings:profile_banner":
+        flow.action = "set_profile_banner"
+        await _edit_message(query, "Send a photo to use as your profile banner:")
         return
 
     if query.data == "settings:stats":
@@ -158,6 +170,39 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
 
+async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    flow: FlowState = context.user_data.get("settings_flow")
+    if flow is None or not update.message or not update.message.photo:
+        return False
+    if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner"):
+        return False
+    user = update.effective_user
+    if user is None:
+        return False
+    storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
+    banners_dir = storage_dir / "banners"
+    banners_dir.mkdir(parents=True, exist_ok=True)
+
+    photo: PhotoSize = update.message.photo[-1]
+    file = await photo.get_file()
+    dest = banners_dir / f"banner_{user.id}.png"
+    await file.download_to_drive(dest)
+
+    if flow.action == "set_profile_banner":
+        flow.action = _State.MENU
+        await update.message.reply_text("Profile banner saved!")
+        await _show_menu(update, context)
+        return True
+
+    if flow.action == _State.PRESET_CREATE_BANNER:
+        flow.data["banner_path"] = str(dest)
+        flow.action = _State.PRESET_CREATE_BANNER_POS
+        await update.message.reply_text("Banner position? (top, bottom, overlay):")
+        return True
+
+    return False
+
+
 async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     flow: FlowState = context.user_data.get("settings_flow")
     if flow is None or not update.message or not update.message.text:
@@ -168,23 +213,17 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     if flow.action == _State.PRESET_CREATE_NAME:
         flow.data["name"] = text
-        flow.action = _State.PRESET_CREATE_CAPTION
-        await update.message.reply_text("Send caption text (or /skip for none):")
-        return True
-
-    if flow.action == _State.PRESET_CREATE_CAPTION:
-        if text.lower() != "/skip":
-            flow.data["caption_text"] = text
+        flow.data["auto_captions"] = True
         flow.action = _State.PRESET_CREATE_CAPTION_COLOR
         await update.message.reply_text("Caption border color? (white, black, yellow, red, blue, green):")
         return True
 
     if flow.action == _State.PRESET_CREATE_CAPTION_COLOR:
-        color = text.lower()
-        if color not in {"white", "black", "yellow", "red", "blue", "green"}:
+        cap = text.lower()
+        if cap not in {"white", "black", "yellow", "red", "blue", "green"}:
             await update.message.reply_text("Choose: white, black, yellow, red, blue, green")
             return True
-        flow.data["caption_color"] = color
+        flow.data["caption_color"] = cap
         flow.action = _State.PRESET_CREATE_CAPTION_STYLE
         await update.message.reply_text("Caption style? (basic, bold, bubble):")
         return True
@@ -212,6 +251,13 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if flow.action == _State.PRESET_CREATE_VOICE:
         if text.lower() != "/skip":
             flow.data["voice_over_voice"] = text
+        flow.action = _State.PRESET_CREATE_VOICE_TEXT
+        await update.message.reply_text("Voice-over text to speak (or /skip for none):")
+        return True
+
+    if flow.action == _State.PRESET_CREATE_VOICE_TEXT:
+        if text.lower() != "/skip":
+            flow.data["voice_text"] = text
         flow.action = _State.PRESET_CREATE_VOICE_QUALITY
         await update.message.reply_text("Voice quality? (basic, premium):")
         return True
@@ -235,6 +281,55 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("Enter a number between 0.5 and 2.0")
             return True
         flow.data["voice_speed"] = speed
+        flow.action = _State.PRESET_CREATE_TTS_ENGINE
+        await update.message.reply_text("TTS engine? (edge-tts, espeak-ng, auto):")
+        return True
+
+    if flow.action == _State.PRESET_CREATE_TTS_ENGINE:
+        engine = text.lower()
+        if engine not in {"edge-tts", "espeak-ng", "auto"}:
+            await update.message.reply_text("Choose: edge-tts, espeak-ng, auto")
+            return True
+        flow.data["tts_engine"] = engine
+        flow.action = _State.PRESET_CREATE_BANNER
+        await update.message.reply_text("Add a banner/watermark? Send a photo, paste an image URL, or /skip:")
+        return True
+
+    if flow.action == _State.PRESET_CREATE_BANNER:
+        if text.lower() != "/skip":
+            storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
+            banner_file = storage_dir / "banners" / f"banner_{user.id if (user := update.effective_user) else 0}.png"
+            if text.lower() in ("profile", "p") and banner_file.is_file():
+                flow.data["banner_path"] = str(banner_file)
+                flow.action = _State.PRESET_CREATE_BANNER_POS
+                await update.message.reply_text("Banner position? (top, bottom, overlay):")
+            elif text.startswith("http://") or text.startswith("https://"):
+                flow.data["banner_url"] = text
+                flow.action = _State.PRESET_CREATE_BANNER_POS
+                await update.message.reply_text("Banner position? (top, bottom, overlay):")
+            else:
+                await update.message.reply_text("Send a photo, type 'profile', paste an image URL, or /skip:")
+            return True
+        flow.action = _State.PRESET_CREATE_BANNER_POS
+        await update.message.reply_text("Banner position? (top, bottom, overlay):")
+        return True
+
+    if flow.action == _State.PRESET_CREATE_BANNER_POS:
+        pos = text.lower()
+        if pos not in {"top", "bottom", "overlay"}:
+            await update.message.reply_text("Choose: top, bottom, overlay")
+            return True
+        flow.data["banner_position"] = pos
+        flow.action = _State.PRESET_CREATE_BANNER_SCALE
+        await update.message.reply_text("Banner scale? (fit, stretch, fill):")
+        return True
+
+    if flow.action == _State.PRESET_CREATE_BANNER_SCALE:
+        scale = text.lower()
+        if scale not in {"fit", "stretch", "fill"}:
+            await update.message.reply_text("Choose: fit, stretch, fill")
+            return True
+        flow.data["banner_scale"] = scale
         await _finalize_preset_create(update, context, db_path)
         return True
 
@@ -244,7 +339,33 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if preset_id is None or field_name is None:
             return False
         value = None if text.lower() == "/skip" else text
-        if field_name == "voice_speed":
+        valid_opts = {
+            "caption_color": {"white", "black", "yellow", "red", "blue", "green"},
+            "caption_style": {"basic", "bold", "bubble"},
+            "caption_position": {"low", "middle", "high"},
+            "voice_quality": {"basic", "premium"},
+            "tts_engine": {"edge-tts", "espeak-ng", "auto"},
+            "banner_position": {"top", "bottom", "overlay"},
+            "banner_scale": {"fit", "stretch", "fill"},
+        }
+        if field_name == "auto_captions":
+            if value is None:
+                value = False
+            elif value.lower() in ("yes", "y", "on", "true", "1"):
+                value = True
+            elif value.lower() in ("no", "n", "off", "false", "0"):
+                value = False
+            else:
+                await update.message.reply_text("Enter yes or no")
+                return True
+        elif field_name in valid_opts:
+            opts = valid_opts[field_name]
+            if value is not None and value.lower() not in opts:
+                await update.message.reply_text(f"Choose: {', '.join(sorted(opts))}")
+                return True
+            if value is not None:
+                value = value.lower()
+        if field_name in ("voice_speed",):
             try:
                 value = float(text)
                 if not (0.5 <= value <= 2.0):
@@ -252,26 +373,9 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
             except ValueError:
                 await update.message.reply_text("Enter a number between 0.5 and 2.0")
                 return True
-        if field_name == "caption_color":
-            if text.lower() not in {"white", "black", "yellow", "red", "blue", "green"}:
-                await update.message.reply_text("Choose: white, black, yellow, red, blue, green")
-                return True
-            value = text.lower()
-        if field_name == "caption_style":
-            if text.lower() not in {"basic", "bold", "bubble"}:
-                await update.message.reply_text("Choose: basic, bold, bubble")
-                return True
-            value = text.lower()
-        if field_name == "caption_position":
-            if text.lower() not in {"low", "middle", "high"}:
-                await update.message.reply_text("Choose: low, middle, high")
-                return True
-            value = text.lower()
-        if field_name == "voice_quality":
-            if text.lower() not in {"basic", "premium"}:
-                await update.message.reply_text("Choose: basic, premium")
-                return True
-            value = text.lower()
+        if field_name == "banner_path" and value is not None and not value.startswith("http"):
+            await update.message.reply_text("Send a URL for the banner image, or /skip to clear")
+            return True
         await _apply_preset_edit(update, context, preset_id, field_name, value)
         return True
 
@@ -282,6 +386,7 @@ async def _show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("My Presets", callback_data="settings:presets")],
         [InlineKeyboardButton("Create Preset", callback_data="settings:create_preset")],
+        [InlineKeyboardButton("Set Profile Banner", callback_data="settings:profile_banner")],
         [InlineKeyboardButton("Stats / History", callback_data="settings:stats")],
         [InlineKeyboardButton("Edit Existing Video", callback_data="settings:edit_source")],
     ])
@@ -336,13 +441,18 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await _edit_or_send(update, "Preset not found.", InlineKeyboardMarkup([[InlineKeyboardButton("Menu", callback_data="settings:menu")]]))
         return
 
-    cap = preset.caption_text or "(none)"
+    cap = "(AI auto-transcribed)"
     style = preset.caption_style or "none"
     color = preset.caption_color or "none"
     pos = preset.caption_position or "none"
     voice = preset.voice_over_voice or "(none)"
+    v_text = preset.voice_text or "(none)"
     quality = preset.voice_quality or "none"
     speed = preset.voice_speed if preset.voice_speed is not None else "none"
+    tts = preset.tts_engine or "auto"
+    banner = preset.banner_path or "(none)"
+    b_pos = preset.banner_position or "none"
+    b_scale = preset.banner_scale or "none"
     shared = "yes" if preset.shared else "no"
 
     text = (
@@ -350,17 +460,24 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Caption: {cap}\n"
         f"  Style: {style} | Color: {color} | Position: {pos}\n"
         f"Voice: {voice}\n"
-        f"  Quality: {quality} | Speed: {speed}\n"
+        f"  Voice text: {v_text}\n"
+        f"  Quality: {quality} | Speed: {speed} | TTS: {tts}\n"
+        f"Banner: {banner}\n"
+        f"  Position: {b_pos} | Scale: {b_scale}\n"
         f"Shared: {shared}"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Caption text", callback_data=f"preset:field:{preset.id}:caption_text")],
         [InlineKeyboardButton("Caption color", callback_data=f"preset:field:{preset.id}:caption_color")],
         [InlineKeyboardButton("Caption style", callback_data=f"preset:field:{preset.id}:caption_style")],
         [InlineKeyboardButton("Caption position", callback_data=f"preset:field:{preset.id}:caption_position")],
         [InlineKeyboardButton("Voice name", callback_data=f"preset:field:{preset.id}:voice_over_voice")],
+        [InlineKeyboardButton("Voice text", callback_data=f"preset:field:{preset.id}:voice_text")],
         [InlineKeyboardButton("Voice quality", callback_data=f"preset:field:{preset.id}:voice_quality")],
         [InlineKeyboardButton("Voice speed", callback_data=f"preset:field:{preset.id}:voice_speed")],
+        [InlineKeyboardButton("TTS engine", callback_data=f"preset:field:{preset.id}:tts_engine")],
+        [InlineKeyboardButton("Banner image", callback_data=f"preset:field:{preset.id}:banner_path")],
+        [InlineKeyboardButton("Banner position", callback_data=f"preset:field:{preset.id}:banner_position")],
+        [InlineKeyboardButton("Banner scale", callback_data=f"preset:field:{preset.id}:banner_scale")],
         [InlineKeyboardButton("Share", callback_data=f"preset:share:{preset.id}")],
         [InlineKeyboardButton("Delete", callback_data=f"preset:delete:{preset.id}")],
         [InlineKeyboardButton("← Back", callback_data="preset:back")],
@@ -425,6 +542,20 @@ async def _finalize_preset_create(update: Update, context: ContextTypes.DEFAULT_
     if user is None:
         return
     flow: FlowState = context.user_data["settings_flow"]
+
+    banner_url = flow.data.pop("banner_url", None)
+    if banner_url:
+        await update.message.reply_text("Downloading banner image...")
+        import urllib.request
+        storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
+        banner_dest = storage_dir / f"banner_{user.id}_{flow.data['name']}.png"
+        try:
+            urllib.request.urlretrieve(banner_url, banner_dest)
+            flow.data["banner_path"] = str(banner_dest)
+        except Exception as exc:
+            LOGGER.warning("Banner download failed: %s", exc)
+            await update.message.reply_text(f"Banner download failed: {exc}. Preset created without banner.")
+
     preset = await create_preset(db_path, user.id, flow.data["name"], **flow.data)
     flow.action = _State.PRESET_LIST
     await update.message.reply_text(f"Preset \"{preset.name}\" created.")
@@ -627,13 +758,17 @@ async def _start_editconfig_from_settings(update: Update, context: ContextTypes.
         flow["edit_id"] = edit_id
         flow["source_job_id"] = edit.source_job_id
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Caption text", callback_data="editcfg:caption_text")],
         [InlineKeyboardButton("Caption color", callback_data="editcfg:caption_color")],
         [InlineKeyboardButton("Caption style", callback_data="editcfg:caption_style")],
         [InlineKeyboardButton("Caption position", callback_data="editcfg:caption_position")],
         [InlineKeyboardButton("Voice name", callback_data="editcfg:voice_over_voice")],
+        [InlineKeyboardButton("Voice text", callback_data="editcfg:voice_text")],
         [InlineKeyboardButton("Voice quality", callback_data="editcfg:voice_quality")],
         [InlineKeyboardButton("Voice speed", callback_data="editcfg:voice_speed")],
+        [InlineKeyboardButton("TTS engine", callback_data="editcfg:tts_engine")],
+        [InlineKeyboardButton("Banner image URL", callback_data="editcfg:banner_path")],
+        [InlineKeyboardButton("Banner position", callback_data="editcfg:banner_position")],
+        [InlineKeyboardButton("Banner scale", callback_data="editcfg:banner_scale")],
         [InlineKeyboardButton("Render now", callback_data="editcfg:render")],
     ])
     await _edit_or_send(update, f"Edit job #{edit_id}\nChoose an option:", keyboard)
