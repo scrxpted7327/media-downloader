@@ -5,6 +5,10 @@ TikTok, and Facebook, downloads them using `yt-dlp`, and replies with the media.
 It is deliberately closed by default: only Telegram users and chats/channels
 explicitly listed in its configuration can trigger a download.
 
+TikTok photo-post links (`/photo/`) are rendered as an MP4 slideshow with the
+post's downloadable music. That path uses `gallery-dl` to fetch the slides and
+audio, then `ffmpeg` to render the video.
+
 ## Setup
 
 1. Use Python 3.10+ and install the application dependency:
@@ -30,12 +34,11 @@ to `MEDIA_BOT_TOOLS_DIR` (by default a per-user application-data directory).
 No downloader binary is bundled with this project. The release checksum is
 downloaded from the same official yt-dlp release and verified before use.
 
-`ffmpeg` is optional: yt-dlp can download many formats without it, but it is
-needed to merge some separate audio/video streams. Install it using your OS
-package manager when higher-quality merged downloads are needed (`brew install
-ffmpeg`, `apt install ffmpeg`, etc.). The bot detects it and tells the operator
-when it is missing; it does not silently package or execute an unverified
-ffmpeg build.
+`ffmpeg` is optional for ordinary downloads, but required for TikTok photo
+posts and for merging some separate audio/video streams. Install it using your
+OS package manager (`brew install ffmpeg`, `apt install ffmpeg`, etc.). The bot
+detects it and tells the operator when it is missing; it does not silently
+package or execute an unverified ffmpeg build.
 
 ## Telegram setup
 
@@ -47,8 +50,10 @@ with `-100`) in `TELEGRAM_ALLOWED_CHAT_IDS`.
 The bot handles only URLs whose hostname belongs to an allowlist. Redirects,
 arbitrary downloader arguments, and arbitrary local paths are never accepted.
 Downloaded files live in a unique temporary directory and are deleted after the
-Telegram upload attempt. The configured size limit is passed to yt-dlp before
-download; Telegram's own upload limits also apply.
+Telegram upload attempt. The default download timeout is one hour, and the
+default Telegram upload write timeout is 15 minutes. The default 47 MiB source
+limit leaves headroom below Telegram's 50 MB public Bot API upload limit. A
+local Bot API server is required for larger uploads.
 
 Only download media you are authorized to access and use, and comply with the
 source platform's terms and applicable law.

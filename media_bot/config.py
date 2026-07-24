@@ -35,6 +35,7 @@ class Settings:
     ytdlp_version: str | None
     max_filesize_mb: int
     timeout_seconds: int
+    upload_timeout_seconds: int
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -46,16 +47,18 @@ class Settings:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
         if not (users or chats):
             raise ValueError("configure at least one allowed user or chat ID")
-        max_size = int(os.getenv("MEDIA_BOT_MAX_FILESIZE_MB", "45"))
-        timeout = int(os.getenv("MEDIA_BOT_DOWNLOAD_TIMEOUT_SECONDS", "900"))
-        if max_size < 1 or timeout < 1:
-            raise ValueError("download size and timeout must be positive")
+        max_size = int(os.getenv("MEDIA_BOT_MAX_FILESIZE_MB") or "47")
+        timeout = int(os.getenv("MEDIA_BOT_DOWNLOAD_TIMEOUT_SECONDS") or "3600")
+        upload_timeout = int(os.getenv("MEDIA_BOT_UPLOAD_TIMEOUT_SECONDS") or "900")
+        if max_size < 1 or timeout < 1 or upload_timeout < 1:
+            raise ValueError("download size and timeouts must be positive")
         return cls(
             token=token,
             allowed_user_ids=users,
             allowed_chat_ids=chats,
-            tools_dir=Path(os.getenv("MEDIA_BOT_TOOLS_DIR", "~/.local/share/media-downloader/tools")).expanduser(),
+            tools_dir=Path(os.getenv("MEDIA_BOT_TOOLS_DIR") or "~/.local/share/media-downloader/tools").expanduser(),
             ytdlp_version=os.getenv("YTDLP_VERSION", "").strip() or None,
             max_filesize_mb=max_size,
             timeout_seconds=timeout,
+            upload_timeout_seconds=upload_timeout,
         )
