@@ -184,3 +184,11 @@ async def download_tiktok_slideshow(
     except Exception:
         temporary.cleanup()
         raise
+
+
+async def persist_download(temp_path: Path, job_id: int, storage_dir: Path) -> Path:
+    """Move a downloaded file to persistent job storage."""
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    dest = storage_dir / f"{job_id}-{temp_path.name}"
+    temp_path.replace(dest)
+    return dest
