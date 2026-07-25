@@ -36,8 +36,14 @@ async def handle_download(request: web.Request) -> web.Response:
         return web.Response(status=403, text="Access denied")
 
     LOGGER.info("Serving download for job %s to user %s", job.id, token_data.user_id)
-    headers = {"Content-Disposition": f'attachment; filename="{file_path.name}"'}
-    return web.FileResponse(file_path, headers=headers)
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{file_path.name}"',
+        "X-Content-Type-Options": "nosniff",
+    }
+    resp = web.FileResponse(file_path, headers=headers)
+    resp.content_type = "application/octet-stream"
+    return resp
 
 
 def create_download_app(db_path: Path, storage_dir: Path) -> web.Application:

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -36,6 +37,7 @@ from .settings_ui import (
     show_editconfig_menu,
 )
 from .storage import (
+    cleanup_download_messages,
     cleanup_expired_tokens,
     cleanup_old_jobs,
     consume_download_token,
@@ -45,8 +47,11 @@ from .storage import (
     get_edit_job,
     get_job,
     init_db,
+    list_all_jobs,
     list_source_jobs_for_user,
     list_user_jobs,
+    mark_download_message_deleted,
+    store_download_message,
     update_edit_job,
     update_job,
 )
@@ -86,6 +91,63 @@ class DownloadReporter:
             return
         self.started = True
         await self.message.edit_text("⬇️ Downloading…")
+
+
+class _ProgressReporter:
+    """Reports rendering progress to a Telegram message with step names and ETA."""
+
+    def __init__(self, message, steps: list[str]) -> None:
+        self.message = message
+        self.steps = steps
+        self.start_time = time.monotonic()
+        self.step_idx = 0
+        self.last_pct = -1
+
+    def set_step(self, idx: int) -> None:
+        self.step_idx = idx
+
+    async def __call__(self, pct: int) -> None:
+        step_idx = self.step_idx
+        step_name = self.steps[step_idx] if step_idx < len(self.steps) else "Finalizing"
+        elapsed = time.monotonic() - self.start_time
+
+        step_weight = 100.0 / len(self.steps)
+        overall = int(step_idx * step_weight + (pct * step_weight / 100.0))
+        overall = min(99, overall)
+
+        if overall == self.last_pct:
+            return
+        self.last_pct = overall
+
+        if overall > 0 and elapsed > 5:
+            eta_seconds = elapsed * (100 - overall) / overall
+            if eta_seconds > 60:
+                eta_str = f" (~{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s)"
+            elif eta_seconds > 0:
+                eta_str = f" (~{int(eta_seconds)}s)"
+            else:
+                eta_str = ""
+        else:
+            eta_str = ""
+
+        if elapsed < 60:
+            elapsed_str = f"{int(elapsed)}s"
+        else:
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+
+        bar_len = 10
+        filled = overall * bar_len // 100
+        bar = "▓" * filled + "░" * (bar_len - filled)
+
+        text = (
+            f"🎬 Step {step_idx + 1}/{len(self.steps)}: {step_name}\n"
+            f"{bar} {overall}%\n"
+            f"⏱ {elapsed_str}{eta_str}"
+        )
+        try:
+            await self.message.edit_text(text)
+        except Exception:
+            pass
 
 
 def _authorized(update: Update, settings: Settings) -> bool:
@@ -134,6 +196,15 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
 def _build_download_url(settings: Settings, token: str) -> str:
     domain = settings.download_domain or "localhost"
     return f"https://{domain}/download/{token}"
+
+
+async def _delete_expired_link(context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except Exception as exc:
+        LOGGER.warning("Failed to delete expired download message: %s", exc)
+    await mark_download_message_deleted(data["db_path"], data["msg_record_id"])
 
 
 _RENDER_QUEUE: asyncio.Queue = asyncio.Queue()
@@ -289,15 +360,14 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if job is None or job.file_path is None:
         await query.answer("File not found", show_alert=True)
         return
-    if job.user_id != query.from_user.id:
-        await query.answer("Not your file", show_alert=True)
-        return
+
+    current_user_id = query.from_user.id
 
     if action == "presets":
         await query.answer()
         from .storage import get_or_create_user_settings, list_presets
-        presets = await list_presets(db_path, job.user_id)
-        user_settings = await get_or_create_user_settings(db_path, job.user_id)
+        presets = await list_presets(db_path, current_user_id)
+        user_settings = await get_or_create_user_settings(db_path, current_user_id)
         active_name = user_settings.preset_name
         rows = []
         for p in presets:
@@ -315,18 +385,24 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "actions":
         await query.answer()
-        await _send_secure_link(query.message, job_id, db_path, job.user_id)
+        await _send_secure_link(query.message, job_id, db_path, current_user_id)
         return
 
     if action == "orig":
         await query.answer()
-        token = await create_download_token(db_path, job.id, job.user_id, settings.token_expiry_minutes)
+        token = await create_download_token(db_path, job.id, current_user_id, settings.token_expiry_minutes)
         url = _build_download_url(settings, token)
-        await context.bot.send_message(
+        msg = await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=f"Download ready (one-time, {settings.token_expiry_minutes} min):\n{url}",
             reply_to_message_id=query.message.message_id,
             disable_web_page_preview=True,
+        )
+        msg_record_id = await store_download_message(db_path, msg.chat_id, msg.message_id, settings.token_expiry_minutes)
+        context.job_queue.run_once(
+            _delete_expired_link,
+            settings.token_expiry_minutes * 60,
+            data={"chat_id": msg.chat_id, "message_id": msg.message_id, "db_path": str(db_path), "msg_record_id": msg_record_id},
         )
         return
 
@@ -335,7 +411,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not source_path.is_file():
             await query.answer("Source file missing", show_alert=True)
             return
-        edit = await create_edit_job(db_path, job_id, job.user_id, preset_id=None)
+        edit = await create_edit_job(db_path, job_id, current_user_id, preset_id=None)
         dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
         shutil.copy2(source_path, dest)
         await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
@@ -357,7 +433,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "reset":
         await query.answer()
         async with aiosqlite.connect(db_path) as db:
-            await db.execute("DELETE FROM edit_jobs WHERE source_job_id = ? AND user_id = ? AND status IN ('pending', 'rendered')", (job_id, job.user_id))
+            await db.execute("DELETE FROM edit_jobs WHERE source_job_id = ? AND user_id = ? AND status IN ('pending', 'rendered')", (job_id, current_user_id))
             await db.commit()
         flow = context.user_data.get("settings_flow")
         if flow and flow.get("action") == "editconfig":
@@ -369,7 +445,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer()
         preset_id = int(parts[3])
         from .storage import list_presets
-        preset = next((p for p in await list_presets(db_path, job.user_id) if p.id == preset_id), None)
+        preset = next((p for p in await list_presets(db_path, current_user_id) if p.id == preset_id), None)
         if preset is None:
             await query.edit_message_text("Preset not found.")
             return
@@ -377,57 +453,101 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         if not source_path.is_file():
             await query.edit_message_text("Source file missing.")
             return
-        edit = await create_edit_job(db_path, job_id, job.user_id, preset_id)
+        edit = await create_edit_job(db_path, job_id, current_user_id, preset_id)
         dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
         shutil.copy2(source_path, dest)
-        await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
-
-        await query.edit_message_text("Rendering with preset...")
-        out_path = storage_dir / f"edit-{edit.id}-final.mp4"
-        try:
-            out_path, subtitles_path = await render_edit(
-                input_path=Path(dest),
-                output_path=out_path,
-                caption_text=preset.caption_text,
-                caption_color=preset.caption_color or "white",
-                caption_style=preset.caption_style or "basic",
-                caption_position=preset.caption_position or "bottom",
-                auto_captions=preset.auto_captions,
-                voice_text=preset.voice_text,
-                voice=preset.voice_over_voice or "default",
-                voice_quality=preset.voice_quality or "basic",
-                voice_speed=preset.voice_speed or 1.0,
-                tts_engine=preset.tts_engine,
-                banner_path=Path(preset.banner_path) if preset.banner_path else None,
-                banner_position=preset.banner_position or "bottom",
-                banner_scale=preset.banner_scale or "fit",
-                watermark_removal=preset.watermark_removal,
-                watermark_position=preset.watermark_position or "auto",
-                channel_banner=preset.channel_banner,
-                source_url=job.url,
-                timeout_seconds=settings.timeout_seconds,
-            )
-        except DownloadError as exc:
-            await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
-            await query.edit_message_text(f"Render failed: {exc}")
-            return
-        await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-        token = await create_download_token(db_path, edit.id, job.user_id, settings.token_expiry_minutes)
-        url = _build_download_url(settings, token)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"Rendered with \"{preset.name}\" – one-time download ({settings.token_expiry_minutes} min):\n{url}",
-            reply_to_message_id=query.message.message_id,
-            disable_web_page_preview=True,
+        await update_edit_job(
+            db_path, edit.id,
+            file_path=str(dest), file_size=dest.stat().st_size,
+            auto_captions=preset.auto_captions,
+            watermark_removal=preset.watermark_removal,
+            channel_banner=preset.channel_banner,
         )
-        if subtitles_path:
-            srt_token = await create_download_token(db_path, edit.id, job.user_id, settings.token_expiry_minutes)
-            srt_url = _build_download_url(settings, srt_token)
-            await context.bot.send_message(
+
+        msg = await query.edit_message_text(f"🎬 Rendering with \"{preset.name}\"...")
+
+        async def _preset_render_task():
+            out_path = storage_dir / f"edit-{edit.id}-final.mp4"
+            try:
+                steps = []
+                if preset.watermark_removal:
+                    steps.append("Watermark removal")
+                if preset.caption_text or preset.auto_captions:
+                    steps.append("Captions")
+                if preset.voice_text:
+                    steps.append("Voice-over")
+                if preset.channel_banner and job.url:
+                    steps.append("Channel banner")
+                if preset.banner_path:
+                    steps.append("Banner overlay")
+                if not steps:
+                    steps.append("Rendering")
+
+                reporter = _ProgressReporter(msg, steps)
+
+                out_path, subtitles_path = await render_edit(
+                    input_path=Path(dest),
+                    output_path=out_path,
+                    caption_text=preset.caption_text,
+                    caption_color=preset.caption_color or "white",
+                    caption_style=preset.caption_style or "basic",
+                    caption_position=preset.caption_position or "bottom",
+                    auto_captions=preset.auto_captions,
+                    voice_text=preset.voice_text,
+                    voice=preset.voice_over_voice or "default",
+                    voice_quality=preset.voice_quality or "basic",
+                    voice_speed=preset.voice_speed or 1.0,
+                    tts_engine=preset.tts_engine,
+                    banner_path=Path(preset.banner_path) if preset.banner_path else None,
+                    banner_position=preset.banner_position or "bottom",
+                    banner_scale=preset.banner_scale or "fit",
+                    watermark_removal=preset.watermark_removal,
+                    watermark_position=preset.watermark_position or "auto",
+                    channel_banner=preset.channel_banner,
+                    source_url=job.url,
+                    timeout_seconds=settings.timeout_seconds,
+                    progress_callback=reporter,
+                )
+            except DownloadError as exc:
+                await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
+                await msg.edit_text(f"❌ Render failed: {exc}")
+                return
+            await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
+            token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
+            url = _build_download_url(settings, token)
+            dl_msg = await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"Subtitles: {srt_url}",
+                text=f"✅ Rendered with \"{preset.name}\" – one-time download ({settings.token_expiry_minutes} min):\n{url}",
                 reply_to_message_id=query.message.message_id,
+                disable_web_page_preview=True,
             )
+            msg_record_id = await store_download_message(db_path, dl_msg.chat_id, dl_msg.message_id, settings.token_expiry_minutes)
+            context.job_queue.run_once(
+                _delete_expired_link,
+                settings.token_expiry_minutes * 60,
+                data={"chat_id": dl_msg.chat_id, "message_id": dl_msg.message_id, "db_path": str(db_path), "msg_record_id": msg_record_id},
+            )
+            if subtitles_path:
+                srt_token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
+                srt_url = _build_download_url(settings, srt_token)
+                srt_msg = await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text=f"📄 Subtitles: {srt_url}",
+                    reply_to_message_id=query.message.message_id,
+                    disable_web_page_preview=True,
+                )
+                srt_record_id = await store_download_message(db_path, srt_msg.chat_id, srt_msg.message_id, settings.token_expiry_minutes)
+                context.job_queue.run_once(
+                    _delete_expired_link,
+                    settings.token_expiry_minutes * 60,
+                    data={"chat_id": srt_msg.chat_id, "message_id": srt_msg.message_id, "db_path": str(db_path), "msg_record_id": srt_record_id},
+                )
+            try:
+                await msg.edit_text(f"✅ Rendered with \"{preset.name}\" — download link sent above.")
+            except Exception:
+                pass
+
+        asyncio.create_task(_preset_render_task())
         return
 
 
@@ -548,18 +668,41 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if user is None:
         return
 
-    jobs = await list_user_jobs(settings.db_path, user.id, limit=10)
-    if not jobs:
-        await message.reply_text("No downloads yet.")
-        return
+    show_all = context.args and context.args[0].lower() in ("all", "--all", "-a")
 
-    lines = ["Your recent downloads:"]
-    for job in jobs:
-        status_label = {"pending": "pending", "downloading": "downloading", "uploaded": "uploaded", "failed": "failed"}.get(
-            job.status, "unknown"
-        )
-        size = f"{job.file_size / 1024 / 1024:.1f} MB" if job.file_size else "unknown size"
-        lines.append(f"[{status_label}] Job #{job.id}: {job.url[:60]}... ({size})")
+    if show_all:
+        jobs = await list_all_jobs(settings.db_path, limit=30)
+        if not jobs:
+            await message.reply_text("No downloads yet.")
+            return
+        lines = ["📂 All recent downloads:"]
+        user_cache: dict[int, str] = {}
+        for job in jobs:
+            status_label = {"pending": "pending", "downloading": "downloading", "uploaded": "uploaded", "failed": "failed"}.get(
+                job.status, "unknown"
+            )
+            size = f"{job.file_size / 1024 / 1024:.1f} MB" if job.file_size else "unknown size"
+            owner = user_cache.get(job.user_id)
+            if not owner:
+                try:
+                    chat_member = await context.bot.get_chat_member(chat_id=message.chat_id, user_id=job.user_id)
+                    owner = chat_member.user.full_name if chat_member else f"user#{job.user_id}"
+                except Exception:
+                    owner = f"user#{job.user_id}"
+                user_cache[job.user_id] = owner
+            lines.append(f"[{status_label}] #{job.id} by {owner}: {job.url[:50]}... ({size})")
+    else:
+        jobs = await list_user_jobs(settings.db_path, user.id, limit=10)
+        if not jobs:
+            await message.reply_text("No downloads yet. Use `/jobs all` to browse community downloads.")
+            return
+        lines = ["Your recent downloads:"]
+        for job in jobs:
+            status_label = {"pending": "pending", "downloading": "downloading", "uploaded": "uploaded", "failed": "failed"}.get(
+                job.status, "unknown"
+            )
+            size = f"{job.file_size / 1024 / 1024:.1f} MB" if job.file_size else "unknown size"
+            lines.append(f"[{status_label}] Job #{job.id}: {job.url[:60]}... ({size})")
     await message.reply_text("\n".join(lines))
 
 
@@ -610,7 +753,11 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await asyncio.sleep(0.3)
             except Exception:
                 pass
-    await message.reply_text(f"Cleaned up {removed} bot messages.")
+    dl_removed = await cleanup_download_messages(db_path, context.bot)
+    text = f"Cleaned up {removed} bot status messages."
+    if dl_removed:
+        text += f" Removed {dl_removed} expired download links."
+    await message.reply_text(text)
 
 
 async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -716,7 +863,8 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
     if source is None:
         await update.effective_message.reply_text("Source job not found.")
         return
-    await update.effective_message.reply_text("Rendering... this may take a while.")
+
+    msg = await update.effective_message.reply_text("🎬 Preparing render...")
     out_path = storage_dir / f"edit-{edit.id}-final.mp4"
     try:
         preset = None
@@ -731,7 +879,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         cap_color = edit.caption_color if edit.caption_color is not None else (preset.caption_color or "white" if preset else "white")
         cap_style = edit.caption_style if edit.caption_style is not None else (preset.caption_style or "basic" if preset else "basic")
         cap_pos = edit.caption_position if edit.caption_position is not None else (preset.caption_position or "bottom" if preset else "bottom")
-        auto_cap = edit.auto_captions if edit.auto_captions else (preset.auto_captions if preset else False)
+        auto_cap = edit.auto_captions
         v_text = edit.voice_text if edit.voice_text is not None else (preset.voice_text if preset else None)
         v_voice = edit.voice_over_voice if edit.voice_over_voice is not None else (preset.voice_over_voice or "default" if preset else "default")
         v_quality = edit.voice_quality if edit.voice_quality is not None else (preset.voice_quality or "basic" if preset else "basic")
@@ -740,9 +888,25 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         b_path = edit.banner_path if edit.banner_path is not None else (preset.banner_path if preset else None)
         b_pos = edit.banner_position if edit.banner_position is not None else (preset.banner_position or "bottom" if preset else "bottom")
         b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fit" if preset else "fit")
-        wm_removal = edit.watermark_removal if edit.watermark_removal else (preset.watermark_removal if preset else True)
+        wm_removal = edit.watermark_removal
         wm_pos = edit.watermark_position if edit.watermark_position is not None else (preset.watermark_position or "auto" if preset else "auto")
-        ch_banner = edit.channel_banner if edit.channel_banner else (preset.channel_banner if preset else False)
+        ch_banner = edit.channel_banner
+
+        steps = []
+        if wm_removal:
+            steps.append("Watermark removal")
+        if cap_text or auto_cap:
+            steps.append("Captions")
+        if v_text:
+            steps.append("Voice-over")
+        if ch_banner and source.url:
+            steps.append("Channel banner")
+        if b_path:
+            steps.append("Banner overlay")
+        if not steps:
+            steps.append("Rendering")
+
+        reporter = _ProgressReporter(msg, steps)
 
         out_path, subtitles_path = await render_edit(
             input_path=Path(edit.file_path),
@@ -765,15 +929,18 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             channel_banner=ch_banner,
             source_url=source.url,
             timeout_seconds=settings.timeout_seconds,
+            progress_callback=reporter,
         )
     except DownloadError as exc:
         await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
-        await update.effective_message.reply_text(f"Render failed: {exc}")
+        await msg.edit_text(f"❌ Render failed: {exc}")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-    await update.effective_message.reply_document(document=out_path.open("rb"), caption=f"Render complete. Job #{edit.id} ready.")
+    with out_path.open("rb") as f:
+        await update.effective_message.reply_document(document=f, caption=f"✅ Render complete. Job #{edit.id} ready.")
     if subtitles_path:
-        await update.effective_message.reply_document(document=Path(subtitles_path).open("rb"), caption="Subtitles available.")
+        with Path(subtitles_path).open("rb") as f:
+            await update.effective_message.reply_document(document=f, caption="📄 Subtitles available.")
 
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -880,6 +1047,10 @@ async def cleanup_task(context: ContextTypes.DEFAULT_TYPE) -> None:
     if removed:
         LOGGER.info("Cleaned up %d old jobs", removed)
 
+    dl_removed = await cleanup_download_messages(db_path, context.bot)
+    if dl_removed:
+        LOGGER.info("Cleaned up %d expired download messages", dl_removed)
+
 
 async def _post_init(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
@@ -895,6 +1066,10 @@ async def _post_init(application: Application) -> None:
     LOGGER.info("Download server started on port %d", settings.download_port)
 
     await _start_auto_fix(application)
+
+    cleaned = await cleanup_download_messages(db_path, application.bot)
+    if cleaned:
+        LOGGER.info("Startup: cleaned up %d expired download messages", cleaned)
 
 
 def main() -> None:

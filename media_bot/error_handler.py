@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import traceback as tb
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,7 @@ def write_error_log(
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     error_info = {
         "id": error_id,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "message": message,
         "traceback": traceback_str,
         "category": categorize_error(message),
@@ -42,7 +42,7 @@ async def error_handler(update: Update | None, context: ContextTypes.DEFAULT_TYP
 
     tb_str = "".join(tb.format_exception(None, error, error.__traceback__))
     error_msg = str(error)[:500]
-    error_id = f"err_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{id(error)}"
+    error_id = f"err_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{id(error)}"
 
     update_data = None
     if update:

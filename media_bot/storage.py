@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Self
 
@@ -306,6 +306,14 @@ async def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_tags_class ON pool_tags(classification_id);
             CREATE INDEX IF NOT EXISTS idx_workflows_user ON workflows(user_id);
             CREATE INDEX IF NOT EXISTS idx_workflow_runs_item ON workflow_runs(pool_item_id);
+            CREATE TABLE IF NOT EXISTS download_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_dlmsg_expires ON download_messages(expires_at);
         """)
         for _table, _cols in [
             ("presets", [
@@ -400,10 +408,21 @@ async def list_user_jobs(db_path: Path, user_id: int, limit: int = 20) -> list[J
         return [_row_to_job(row) for row in rows]
 
 
+async def list_all_jobs(db_path: Path, limit: int = 30) -> list[JobRecord]:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_job(row) for row in rows]
+
+
 async def create_download_token(db_path: Path, job_id: int, user_id: int, expiry_minutes: int) -> str:
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    expires_at = datetime.utcnow() + timedelta(minutes=expiry_minutes)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "INSERT INTO download_tokens (token_hash, job_id, expires_at, user_id) VALUES (?, ?, ?, ?)",
@@ -417,7 +436,7 @@ async def consume_download_token(db_path: Path, raw_token: str) -> DownloadToken
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         async with db.execute(
             "SELECT * FROM download_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
             (token_hash, now),
@@ -860,18 +879,100 @@ async def update_workflow_run(db_path: Path, run_id: int, **kwargs) -> WorkflowR
         return _row_to_workflow_run(row) if row else None
 
 
+@dataclass(frozen=True)
+class DownloadMessage:
+    id: int
+    chat_id: int
+    message_id: int
+    expires_at: datetime
+    deleted: bool
+
+
+async def store_download_message(db_path: Path, chat_id: int, message_id: int, expiry_minutes: int) -> int:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "INSERT INTO download_messages (chat_id, message_id, expires_at) VALUES (?, ?, ?)",
+            (chat_id, message_id, expires_at.isoformat()),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def list_expired_download_messages(db_path: Path) -> list[DownloadMessage]:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, chat_id, message_id, expires_at, deleted FROM download_messages "
+            "WHERE deleted = 0 AND expires_at < ?",
+            (datetime.now(timezone.utc).isoformat(),),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [
+        DownloadMessage(
+            id=row["id"],
+            chat_id=row["chat_id"],
+            message_id=row["message_id"],
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+            deleted=bool(row["deleted"]),
+        )
+        for row in rows
+    ]
+
+
+async def list_undeleted_download_messages(db_path: Path) -> list[DownloadMessage]:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, chat_id, message_id, expires_at, deleted FROM download_messages WHERE deleted = 0",
+        ) as cur:
+            rows = await cur.fetchall()
+    return [
+        DownloadMessage(
+            id=row["id"],
+            chat_id=row["chat_id"],
+            message_id=row["message_id"],
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+            deleted=bool(row["deleted"]),
+        )
+        for row in rows
+    ]
+
+
+async def mark_download_message_deleted(db_path: Path, msg_id: int) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE download_messages SET deleted = 1 WHERE id = ?",
+            (msg_id,),
+        )
+        await db.commit()
+
+
+async def cleanup_download_messages(db_path: Path, bot) -> int:
+    messages = await list_expired_download_messages(db_path)
+    removed = 0
+    for msg in messages:
+        try:
+            await bot.delete_message(chat_id=msg.chat_id, message_id=msg.message_id)
+        except Exception:
+            pass
+        await mark_download_message_deleted(db_path, msg.id)
+        removed += 1
+    return removed
+
+
 async def cleanup_expired_tokens(db_path: Path) -> int:
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute(
             "DELETE FROM download_tokens WHERE expires_at < ?",
-            (datetime.utcnow().isoformat(),),
+            (datetime.now(timezone.utc).isoformat(),),
         )
         await db.commit()
         return cursor.rowcount
 
 
 async def cleanup_old_jobs(db_path: Path, storage_dir: Path, retention_days: int) -> int:
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(

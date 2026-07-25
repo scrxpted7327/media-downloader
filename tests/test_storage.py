@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -133,7 +133,6 @@ class StorageTests(unittest.TestCase):
 
     def test_expired_token_is_rejected(self):
         import asyncio
-        from datetime import datetime, timedelta
 
         async def run():
             await init_db(self.db_path)
@@ -167,7 +166,7 @@ class StorageTests(unittest.TestCase):
             fake = storage_dir / f"{job.id}-fake.mp4"
             fake.write_text("data")
             await update_job(self.db_path, job.id, status="uploaded", file_path=str(fake))
-            old_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
+            old_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE jobs SET created_at = ? WHERE id = ?", (old_ts, job.id))
                 await db.commit()

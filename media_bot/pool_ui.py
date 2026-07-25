@@ -327,7 +327,7 @@ async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         label = f"#{item.id} {item.title or item.file_path[-30:]}"
         rows.append([
             InlineKeyboardButton(label, callback_data=f"pool:classify:{item.id}"),
-            InlineKeyboardButton("🗑️", callback_data=f"pool:delete:{item.id}"),
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"pool:delete:{item.id}"),
         ])
 
     nav = []

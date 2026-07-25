@@ -555,6 +555,7 @@ async def render_voice_over(
     quality: str = "basic",
     speed: float = 1.0,
     timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
     if not input_video.is_file():
         raise DownloadError(f"input video not found for voice-over ({input_video.name})")
@@ -574,11 +575,19 @@ async def render_voice_over(
         raise DownloadError(f"unsupported TTS engine: {engine}")
 
     try:
+        if progress_callback:
+            await progress_callback(10)
         await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
+        if progress_callback:
+            await progress_callback(30)
 
         if not tmp_audio.is_file() or tmp_audio.stat().st_size == 0:
             raise DownloadError(f"TTS engine ({engine}) produced no audio")
 
+        if progress_callback:
+            await progress_callback(50)
+        if progress_callback:
+            await progress_callback(50)
         await _run_checked(
             [
                 "ffmpeg", "-y",
@@ -598,6 +607,8 @@ async def render_voice_over(
             timeout_seconds,
             f"voice-over merge failed for {input_video.name}",
         )
+        if progress_callback:
+            await progress_callback(100)
     except DownloadError:
         raise
     except Exception as exc:
@@ -617,6 +628,7 @@ async def render_banner(
     position: str = "bottom",
     scale: str = "fit",
     timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
     if not input_path.is_file():
         raise DownloadError(f"input file not found for banner overlay ({input_path.name})")
@@ -659,7 +671,12 @@ async def render_banner(
         str(output_path),
     ]
     try:
-        await _run_checked(cmd, timeout_seconds, f"banner overlay failed for {input_path.name}")
+        duration_us = _get_duration_us(input_path)
+        await _run_ffmpeg_with_progress(
+            cmd, timeout_seconds, f"banner overlay failed for {input_path.name}",
+            total_duration_us=duration_us,
+            progress_callback=progress_callback,
+        )
     except DownloadError as exc:
         raise DownloadError(f"Banner render failed: {exc}") from exc
 
@@ -821,6 +838,7 @@ async def render_channel_banner(
     source_url: str,
     caption_text: str | None = None,
     timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
     if not input_path.is_file():
         raise DownloadError(f"input file not found for channel banner ({input_path.name})")
@@ -891,7 +909,11 @@ async def render_channel_banner(
             "-movflags", "+faststart",
             str(output_path),
         ]
-        await _run_checked(cmd, timeout_seconds, f"channel banner overlay failed for {input_path.name}")
+        await _run_ffmpeg_with_progress(
+            cmd, timeout_seconds, f"channel banner overlay failed for {input_path.name}",
+            total_duration_us=duration_us,
+            progress_callback=progress_callback,
+        )
     finally:
         tmpdir.cleanup()
 
@@ -987,43 +1009,68 @@ async def render_edit(
     channel_banner: bool = False,
     source_url: str | None = None,
     timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[Path, str | None]:
     current = input_path
     intermediate = output_path.with_suffix(".intermediate" + output_path.suffix)
+    step_idx = 0
+    advance = getattr(progress_callback, "set_step", None)
 
     if watermark_removal:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_wm{output_path.suffix}")
-        current = await remove_watermark(current, tmp, watermark_position, timeout_seconds)
+        if advance:
+            advance(step_idx)
+        current = await remove_watermark(current, tmp, watermark_position, timeout_seconds, progress_callback=progress_callback)
+        if progress_callback:
+            await progress_callback(100)
+        step_idx += 1
 
     subtitles_result: str | None = None
     if caption_text or auto_captions:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_cap{output_path.suffix}")
+        if advance:
+            advance(step_idx)
         current = await render_captions(
             current, tmp,
             caption_text, caption_color, caption_style, caption_position, auto_captions, timeout_seconds,
             srt_output_path=output_path.with_suffix(".srt"),
+            progress_callback=progress_callback,
         )
         if auto_captions:
             srt_path = output_path.with_suffix(".srt")
             if srt_path.is_file():
                 subtitles_result = str(srt_path)
+        if progress_callback:
+            await progress_callback(100)
+        step_idx += 1
 
     if voice_text:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_voice{output_path.suffix}")
+        if advance:
+            advance(step_idx)
         current = await render_voice_over(
             current, tmp, voice_text, tts_engine, voice, voice_quality, voice_speed, timeout_seconds,
+            progress_callback=progress_callback,
         )
+        step_idx += 1
 
     if channel_banner and source_url:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_chan{output_path.suffix}")
+        if advance:
+            advance(step_idx)
         current = await render_channel_banner(
             current, tmp, source_url, caption_text, timeout_seconds,
+            progress_callback=progress_callback,
         )
+        step_idx += 1
 
     if banner_path:
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_banner{output_path.suffix}")
+        if advance:
+            advance(step_idx)
         current = await render_banner(
             current, tmp, banner_path, banner_position, banner_scale, timeout_seconds,
+            progress_callback=progress_callback,
         )
 
     if current != output_path:

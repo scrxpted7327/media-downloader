@@ -72,8 +72,12 @@ class FlowState:
 
 _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
     "caption_style": [("✍️ Basic", "basic"), ("💪 Bold", "bold"), ("💬 Bubble", "bubble"), ("🖼️ Border", "border"), ("🎨 Filled", "filled")],
-    "caption_position": [("⬆️ Low", "low"), ("↔️ Middle", "middle"), ("⬇️ High", "high")],
+    "caption_position": [("⬆️ Top", "low"), ("↔️ Middle", "middle"), ("⬇️ Bottom", "high")],
     "voice_quality": [("📶 Basic", "basic"), ("✨ Premium", "premium")],
+    "voice_speed": [
+        ("🐢 0.50×", "0.5"), ("0.75×", "0.75"), ("1.00×", "1.0"),
+        ("1.25×", "1.25"), ("1.50×", "1.5"), ("🐇 2.00×", "2.0"),
+    ],
     "tts_engine": [("🔊 edge-tts", "edge-tts"), ("🗣️ espeak-ng", "espeak-ng"), ("🤖 Auto", "auto")],
     "banner_position": [("⬆️ Top", "top"), ("⬇️ Bottom", "bottom"), ("🖼️ Overlay", "overlay")],
     "banner_scale": [("📐 Fit", "fit"), ("↔️ Stretch", "stretch"), ("⬜ Fill", "fill")],
@@ -91,7 +95,7 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
 }
 
 _TEXT_FIELDS = frozenset({
-    "voice_over_voice", "voice_text", "caption_text", "banner_path", "voice_speed",
+    "voice_over_voice", "voice_text", "caption_text", "banner_path",
 })
 
 _BOOL_FIELDS = frozenset({"watermark_removal", "channel_banner", "auto_captions"})
@@ -136,6 +140,27 @@ def _color_shade_keyboard(hue: str, back_data: str, set_prefix: str) -> InlineKe
     return InlineKeyboardMarkup(rows)
 
 
+async def _show_voice_selector(query, prefix: str, flow, *, back_data: str) -> None:
+    common = [
+        ("🔊 Aria (en-US, Female)", "en-US-AriaNeural"),
+        ("🔊 Guy (en-US, Male)", "en-US-GuyNeural"),
+        ("🔊 Jenny (en-US, Female)", "en-US-JennyNeural"),
+        ("🔊 Sonia (en-GB, Female)", "en-GB-SoniaNeural"),
+        ("🔊 Ryan (en-GB, Male)", "en-GB-RyanNeural"),
+        ("🔊 Xiaoxiao (zh-CN, Female)", "zh-CN-XiaoxiaoNeural"),
+        ("🔊 default", "default"),
+        ("🔊 male", "male"),
+        ("🔊 female", "female"),
+    ]
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"{prefix}:set:voice_over_voice:{value}")]
+        for label, value in common
+    ]
+    rows.append([InlineKeyboardButton("✏️ Custom…", callback_data=f"{prefix}:voice_over_voice_custom")])
+    rows.append([InlineKeyboardButton("← Back", callback_data=back_data)])
+    await _edit_message(query, "🎤 Choose a voice:", InlineKeyboardMarkup(rows))
+
+
 def _choice_keyboard(field: str, back_data: str, set_prefix: str) -> InlineKeyboardMarkup:
     options = _FIELD_CHOICES.get(field, [])
     rows = [
@@ -148,11 +173,13 @@ def _choice_keyboard(field: str, back_data: str, set_prefix: str) -> InlineKeybo
 
 def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
     return {
+        "auto_captions": cfg.auto_captions,
+        "caption_text": cfg.caption_text,
         "caption_color": cfg.caption_color,
         "caption_style": cfg.caption_style,
         "caption_position": cfg.caption_position,
-        "voice_over_voice": cfg.voice_over_voice,
         "voice_text": cfg.voice_text,
+        "voice_over_voice": cfg.voice_over_voice,
         "voice_quality": cfg.voice_quality,
         "voice_speed": cfg.voice_speed,
         "tts_engine": cfg.tts_engine,
@@ -186,7 +213,6 @@ def _voice_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{back_data}:voice_over_voice")],
         [InlineKeyboardButton("📝 Voice Text", callback_data=f"{back_data}:voice_text")],
         [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{back_data}:voice_quality")],
-        [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{back_data}:voice_speed")],
         [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{back_data}:tts_engine")],
         [InlineKeyboardButton("✅ Done", callback_data=f"{back_data}:done")],
     ]
@@ -209,19 +235,28 @@ def _build_config_rows(
     field_prefix: str,
     include_watermark_position: bool = False,
 ) -> list[list[InlineKeyboardButton]]:
+    auto = _fmt_current(values.get("auto_captions"))
+    cap_text = _fmt_current(values.get("caption_text"))
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
     pos = _fmt_current(values.get("caption_position"))
-    v_summary = _voice_summary(values)
+    v_text = _fmt_current(values.get("voice_text"))
+    v_name = _fmt_current(values.get("voice_over_voice"))
+    v_speed = _fmt_current(values.get("voice_speed"))
     b_path = _fmt_current(values.get("banner_path"))
     wm = _fmt_current(values.get("watermark_removal"))
     ch = _fmt_current(values.get("channel_banner"))
 
     rows = [
+        [InlineKeyboardButton(f"📝 Auto Captions [{auto}]", callback_data=f"{field_prefix}:auto_captions")],
+        [InlineKeyboardButton(f"💬 Caption Text [{cap_text}]", callback_data=f"{field_prefix}:caption_text")],
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
-        [InlineKeyboardButton(f"🎤 Voice [{v_summary}]", callback_data=f"{field_prefix}:voice_menu")],
+        [InlineKeyboardButton(f"🎤 Voice Name [{v_name}]", callback_data=f"{field_prefix}:voice_over_voice")],
+        [InlineKeyboardButton(f"📝 Voice Text [{v_text}]", callback_data=f"{field_prefix}:voice_text")],
+        [InlineKeyboardButton(f"⏩ Voice Speed [{v_speed}x]", callback_data=f"{field_prefix}:voice_speed")],
+        [InlineKeyboardButton(f"🎤 Voice Settings…", callback_data=f"{field_prefix}:voice_menu")],
         [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
         [InlineKeyboardButton(f"🚫 Remove Watermark [{wm}]", callback_data=f"{field_prefix}:watermark_removal")],
     ]
@@ -285,7 +320,8 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
         await _show_options(update, context, action, "Voice quality:", "voice_quality",
             *_FIELD_CHOICES["voice_quality"])
     elif action == _State.PRESET_CREATE_VOICE_SPEED:
-        await _edit_message(query, "Voice speed? (0.5 to 2.0, e.g. 1.0):")
+        await _show_options(update, context, action, "Voice speed:", "voice_speed",
+            *_FIELD_CHOICES["voice_speed"])
     elif action == _State.PRESET_CREATE_TTS_ENGINE:
         await _show_options(update, context, action, "TTS engine:", "tts_engine",
             *_FIELD_CHOICES["tts_engine"])
@@ -388,6 +424,9 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         return
 
     if data == "preset_create:voice:done":
+        flow.data.setdefault("voice_quality", "basic")
+        flow.data.setdefault("voice_speed", 1.0)
+        flow.data.setdefault("tts_engine", "auto")
         flow.action = _State.PRESET_CREATE_BANNER_MENU
         await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
         return
@@ -395,6 +434,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
     if data == "preset_create:banner:done":
         flow.data.setdefault("watermark_removal", True)
         flow.data.setdefault("watermark_position", "auto")
+        flow.data.setdefault("channel_banner", False)
         flow.action = _State.PRESET_CREATE_CHANNEL_BANNER
         await _show_confirm(update, context, flow.action, "Channel banner for landscape videos?")
         return
@@ -413,7 +453,8 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
                 *_FIELD_CHOICES["voice_quality"])
         elif inner == "voice_speed":
             flow.action = _State.PRESET_CREATE_VOICE_SPEED
-            await _edit_message(query, "Voice speed? (0.5 to 2.0, e.g. 1.0):")
+            await _show_options(update, context, flow.action, "Voice speed:", "voice_speed",
+                *_FIELD_CHOICES["voice_speed"])
         elif inner == "tts_engine":
             flow.action = _State.PRESET_CREATE_TTS_ENGINE
             await _show_options(update, context, flow.action, "TTS engine:", "tts_engine",
@@ -563,7 +604,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 [InlineKeyboardButton("🎤 Voice Name", callback_data=f"preset:field:{preset_id}:voice_over_voice")],
                 [InlineKeyboardButton("📝 Voice Text", callback_data=f"preset:field:{preset_id}:voice_text")],
                 [InlineKeyboardButton("✨ Voice Quality", callback_data=f"preset:field:{preset_id}:voice_quality")],
-                [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"preset:field:{preset_id}:voice_speed")],
                 [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"preset:field:{preset_id}:tts_engine")],
                 [InlineKeyboardButton("✅ Done", callback_data=f"preset:menu:{preset_id}")],
             ]
@@ -714,6 +754,15 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return True
         flow.data["name"] = text
         flow.data["auto_captions"] = True
+        flow.data["caption_color"] = "white"
+        flow.data["caption_style"] = "basic"
+        flow.data["caption_position"] = "bottom"
+        flow.data["voice_quality"] = "basic"
+        flow.data["voice_speed"] = 1.0
+        flow.data["tts_engine"] = "auto"
+        flow.data["watermark_removal"] = True
+        flow.data["watermark_position"] = "auto"
+        flow.data["channel_banner"] = False
         flow.action = _State.PRESET_CREATE_CAPTION_COLOR
         await update.message.reply_text(
             "Caption colour:",
@@ -861,10 +910,10 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     rows.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"preset:delete:{preset.id}")])
     rows.append([InlineKeyboardButton("← Back", callback_data="preset:back")])
 
-    status = "⭐ ACTIVE  " if is_active else ""
+    status = "⭐ Active " if is_active else ""
     text = (
         f"{status}Preset: {preset.name}\n"
-        f"Tap a setting to change it. Current values are shown on each button."
+        f"Tap any setting to change it."
     )
     await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
@@ -1318,7 +1367,6 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{prefix}:voice_menu:voice_over_voice")],
             [InlineKeyboardButton("📝 Voice Text", callback_data=f"{prefix}:voice_menu:voice_text")],
             [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{prefix}:voice_menu:voice_quality")],
-            [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{prefix}:voice_menu:voice_speed")],
             [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{prefix}:voice_menu:tts_engine")],
             [InlineKeyboardButton("✅ Done", callback_data=f"{prefix}:menu")],
         ]
@@ -1329,6 +1377,9 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         field_name = rest.split(":", 1)[-1]
         if isinstance(flow, dict):
             flow["field_name"] = field_name
+        if field_name == "voice_over_voice":
+            await _show_voice_selector(query, prefix, flow, back_data=f"{prefix}:voice_menu")
+            return None
         if field_name in _FIELD_CHOICES:
             pretty = field_name.replace("_", " ").title()
             await _edit_message(
@@ -1386,6 +1437,20 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             query,
             "Caption colour — pick a hue:",
             _color_hue_keyboard(f"{prefix}:menu", f"{prefix}:hue"),
+        )
+        return None
+
+    if field == "voice_over_voice":
+        await _show_voice_selector(query, prefix, flow, back_data=f"{prefix}:menu")
+        return None
+
+    if rest == "voice_over_voice_custom":
+        if isinstance(flow, dict):
+            flow["field_name"] = "voice_over_voice"
+        await _edit_message(
+            query,
+            "Send a voice name (e.g. en-US-AriaNeural) or /skip to keep current:",
+            InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:voice_over_voice")]]),
         )
         return None
 
