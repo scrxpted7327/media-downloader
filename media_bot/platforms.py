@@ -37,3 +37,9 @@ def is_tiktok_photo_url(url: str) -> bool:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     return (host == "tiktok.com" or host.endswith(".tiktok.com")) and "/photo/" in parsed.path.lower()
+
+
+def is_tiktok_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host == "tiktok.com" or host.endswith(".tiktok.com")

@@ -26,7 +26,7 @@ from .download_server import create_download_app
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
 from .fix_agent import ERRORS_DIR, FIX_SCRIPTS_DIR, apply_known_fix, categorize_error, invoke_opencode_fix, load_error_log
-from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url
+from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url, is_tiktok_url
 from .settings_ui import (
     handle_editconfig_callback,
     settings_callback,
@@ -226,10 +226,20 @@ async def _process_single_url(
                 DownloadReporter(status).progress,
             )
         else:
-            temporary, media = await download_media(
-                ytdlp, url, settings.max_filesize_mb, settings.timeout_seconds,
-                DownloadReporter(status).progress,
-            )
+            try:
+                temporary, media = await download_media(
+                    ytdlp, url, settings.max_filesize_mb, settings.timeout_seconds,
+                    DownloadReporter(status).progress,
+                )
+            except DownloadError as exc:
+                if is_tiktok_url(url) and ("Unsupported URL" in str(exc) or "not supported" in str(exc).lower()):
+                    LOGGER.info("yt-dlp unsupported on TikTok URL, trying gallery-dl: %s", url)
+                    temporary, media = await download_tiktok_slideshow(
+                        gallerydl, url, settings.max_filesize_mb, settings.timeout_seconds,
+                        DownloadReporter(status).progress,
+                    )
+                else:
+                    raise
         await status.edit_text("💾 Saving…")
         persisted = await persist_download(media, job.id, storage_dir)
         await update_job(db_path, job.id, file_path=str(persisted), file_size=persisted.stat().st_size)
@@ -382,7 +392,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 caption_color=preset.caption_color or "white",
                 caption_style=preset.caption_style or "basic",
                 caption_position=preset.caption_position or "bottom",
-                auto_captions=True,
+                auto_captions=preset.auto_captions,
                 voice_text=preset.voice_text,
                 voice=preset.voice_over_voice or "default",
                 voice_quality=preset.voice_quality or "basic",
@@ -628,11 +638,8 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = await handle_editconfig_callback(update, context)
-    if result == "render":
-        flow = context.user_data.get("settings_flow") or {}
-        edit_id = flow.get("edit_id") if isinstance(flow, dict) else None
-        if edit_id is not None:
-            await _render_edit_job(update, context, edit_id)
+    if isinstance(result, tuple) and result[0] == "render":
+        await _render_edit_job(update, context, result[1])
 
 
 async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -642,6 +649,8 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     field = flow.get("field_name")
     edit_id = flow.get("edit_id")
     if field is None or edit_id is None:
+        return False
+    if field in ("voice_menu", "banner_menu"):
         return False
     text = update.message.text.strip()
     value = None if text.lower() == "/skip" else text
@@ -696,6 +705,7 @@ async def _get_latest_pending_edit(db_path: Path, user_id: int) -> tuple[int, in
 
 
 async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
+    settings: Settings = context.application.bot_data["settings"]
     db_path: Path = context.application.bot_data["db_path"]
     storage_dir: Path = context.application.bot_data["storage_dir"]
     edit = await get_edit_job(db_path, edit_id)
@@ -730,7 +740,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         b_path = edit.banner_path if edit.banner_path is not None else (preset.banner_path if preset else None)
         b_pos = edit.banner_position if edit.banner_position is not None else (preset.banner_position or "bottom" if preset else "bottom")
         b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fit" if preset else "fit")
-        wm_removal = edit.watermark_removal if edit.watermark_removal else (preset.watermark_removal if preset else False)
+        wm_removal = edit.watermark_removal if edit.watermark_removal else (preset.watermark_removal if preset else True)
         wm_pos = edit.watermark_position if edit.watermark_position is not None else (preset.watermark_position or "auto" if preset else "auto")
         ch_banner = edit.channel_banner if edit.channel_banner else (preset.channel_banner if preset else False)
 

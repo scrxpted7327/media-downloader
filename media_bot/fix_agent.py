@@ -173,6 +173,8 @@ async def watch_and_fix(
             for ef in error_files:
                 if ef.name in processed:
                     continue
+                if ef.name.startswith(("fixed_", "failed_", "unfixed_")):
+                    continue
                 error_info = load_error_log(ef)
                 if error_info is None:
                     processed.add(ef.name)

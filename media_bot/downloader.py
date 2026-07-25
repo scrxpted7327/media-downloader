@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 
@@ -172,11 +173,10 @@ async def download_tiktok_slideshow(
     timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
-    """Download a TikTok photo post and render its slides with the post audio."""
+    """Download a TikTok photo post. Renders a video with audio when possible,
+    otherwise packages the images into a ZIP archive."""
     if not gallerydl.is_file() or not os.access(gallerydl, os.X_OK):
         raise DownloadError(f"gallery-dl is required for TikTok photo posts ({url[:80]})")
-    if shutil.which("ffmpeg") is None:
-        raise DownloadError(f"ffmpeg is required for TikTok photo posts ({url[:80]})")
 
     temporary = tempfile.TemporaryDirectory(prefix="media-bot-tiktok-")
     directory = Path(temporary.name)
@@ -192,43 +192,69 @@ async def download_tiktok_slideshow(
             f"TikTok slide download failed for {url[:80]}",
         )
         images = sorted(path for path in directory.iterdir() if path.suffix.lower() in _IMAGE_SUFFIXES)
-        audio = next((path for path in directory.iterdir() if path.name.startswith("audio_")), None)
         if not images:
             raise DownloadError(f"TikTok post did not contain downloadable slides ({url[:80]})")
-        if audio is None:
-            raise DownloadError(f"TikTok post did not provide downloadable music ({url[:80]})")
 
-        duration = await _media_duration(audio, timeout_seconds)
-        per_slide = duration / len(images)
-        inputs: list[str] = []
-        filters: list[str] = []
-        for index, image in enumerate(images):
-            inputs.extend(["-loop", "1", "-framerate", "30", "-t", f"{per_slide:.3f}", "-i", str(image)])
-            filters.append(
-                f"[{index}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-                f"pad=1080:1920:(ow-iw)/2:(oh-ih),setsar=1[v{index}]"
-            )
-        filters.append("".join(f"[v{index}]" for index in range(len(images))) + f"concat=n={len(images)}:v=1:a=0[v]")
-        output = directory / "tiktok-slideshow.mp4"
-        await _run_checked(
-            [
-                "ffmpeg", "-y", *inputs, "-i", str(audio), "-filter_complex", ";".join(filters),
-                "-map", "[v]", "-map", f"{len(images)}:a:0", "-c:v", _detect_video_encoder(), "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-movflags", "+faststart", "-shortest", str(output),
-            ],
-            timeout_seconds,
-            f"TikTok slide video rendering failed for {url[:80]}",
-        )
-        if not output.is_file():
-            raise DownloadError(f"TikTok slide video rendering produced no file ({url[:80]})")
-        if output.stat().st_size > max_filesize_mb * 1024 * 1024:
-            raise DownloadError(
-                f"rendered TikTok slide video exceeds {max_filesize_mb}MB limit ({url[:80]})"
-            )
-        return temporary, output
+        audio = next((path for path in directory.iterdir() if path.name.startswith("audio_")), None)
+        if audio is not None and shutil.which("ffmpeg") is not None:
+            try:
+                return await _render_tiktok_video(directory, images, audio, max_filesize_mb, timeout_seconds, temporary)
+            except DownloadError:
+                LOGGER.warning("TikTok video render failed, falling back to ZIP for %s", url[:80])
+
+        LOGGER.info("Packaging TikTok slides as ZIP for %s", url[:80])
+        return await _package_tiktok_zip(directory, images, max_filesize_mb, temporary)
     except Exception:
         temporary.cleanup()
         raise
+
+
+async def _render_tiktok_video(
+    directory: Path, images: list[Path], audio: Path,
+    max_filesize_mb: int, timeout_seconds: int,
+    temporary: tempfile.TemporaryDirectory[str],
+) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    duration = await _media_duration(audio, timeout_seconds)
+    per_slide = duration / len(images)
+    inputs: list[str] = []
+    filters: list[str] = []
+    for index, image in enumerate(images):
+        inputs.extend(["-loop", "1", "-framerate", "30", "-t", f"{per_slide:.3f}", "-i", str(image)])
+        filters.append(
+            f"[{index}:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+            f"pad=1080:1920:(ow-iw)/2:(oh-ih),setsar=1[v{index}]"
+        )
+    filters.append("".join(f"[v{index}]" for index in range(len(images))) + f"concat=n={len(images)}:v=1:a=0[v]")
+    output = directory / "tiktok-slideshow.mp4"
+    await _run_checked(
+        [
+            "ffmpeg", "-y", *inputs, "-i", str(audio), "-filter_complex", ";".join(filters),
+            "-map", "[v]", "-map", f"{len(images)}:a:0", "-c:v", _detect_video_encoder(), "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-movflags", "+faststart", "-shortest", str(output),
+        ],
+        timeout_seconds,
+        f"TikTok slide video rendering failed for {directory.name}",
+    )
+    if not output.is_file():
+        raise DownloadError("TikTok slide video rendering produced no file")
+    if output.stat().st_size > max_filesize_mb * 1024 * 1024:
+        raise DownloadError(f"rendered TikTok slide video exceeds {max_filesize_mb}MB limit")
+    return temporary, output
+
+
+async def _package_tiktok_zip(
+    directory: Path, images: list[Path], max_filesize_mb: int,
+    temporary: tempfile.TemporaryDirectory[str],
+) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+    zip_path = directory / "tiktok-slides.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for img in images:
+            zf.write(img, img.name)
+    if not zip_path.is_file():
+        raise DownloadError("ZIP creation failed")
+    if zip_path.stat().st_size > max_filesize_mb * 1024 * 1024:
+        raise DownloadError(f"ZIP archive exceeds {max_filesize_mb}MB limit")
+    return temporary, zip_path
 
 
 async def download_instagram(

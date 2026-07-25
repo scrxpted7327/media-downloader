@@ -340,6 +340,7 @@ async def render_captions(
     auto_captions: bool = True,
     timeout_seconds: int = 600,
     progress_callback: ProgressCallback | None = None,
+    srt_output_path: Path | None = None,
 ) -> Path:
     if not input_path.is_file():
         raise DownloadError(f"input file not found for caption rendering ({input_path.name})")
@@ -354,9 +355,8 @@ async def render_captions(
         tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-srt-")
         srt_path = Path(tmpdir.name) / "captions.srt"
         srt_path.write_text(srt_content, encoding="utf-8")
-
-        srt_output = output_path.with_suffix(".srt")
-        srt_output.write_text(srt_content, encoding="utf-8")
+        if srt_output_path:
+            srt_output_path.write_text(srt_content, encoding="utf-8")
 
         ass_style = _build_ass_style(color, style, position)
         ass_header = (
@@ -366,7 +366,7 @@ async def render_captions(
             "PlayDepth: 0\n"
             "[V4+ Styles]\n"
             f"Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            f"Style: Default,Arial,{ass_style['fontsize']},&H00{ass_style['color']},&H00000000,&H00000000,&H00000000,{ass_style['bold']},0,0,0,100,100,0,0,{ass_style['borderstyle']},{ass_style['outline']},{ass_style['shadow']},{ass_style['alignment']},10,10,10,1\n"
+            f"Style: Default,Arial,{ass_style['fontsize']},{ass_style['color']},&H00000000,&H00000000,{ass_style['backcolour']},{ass_style['bold']},0,0,0,100,100,0,0,{ass_style['borderstyle']},{ass_style['outline']},{ass_style['shadow']},{ass_style['alignment']},10,10,10,1\n"
             "[Events]\n"
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
@@ -411,18 +411,24 @@ async def render_captions(
             fontsize, borderw, shadow = "24", "3", "2"
         elif style == "bubble":
             fontsize, borderw, shadow = "20", "4", "3"
+        elif style == "border":
+            fontsize, borderw, shadow = "18", "4", "1"
+        elif style == "filled":
+            fontsize, borderw, shadow = "18", "0", "0"
         else:
             fontsize, borderw, shadow = "18", "2", "1"
         position_map = {
-            "low": "h-text_h-20",
+            "low": "20",
             "middle": "(h-text_h)/2",
-            "high": "20",
+            "high": "h-text_h-20",
         }
         y_expr = position_map.get(position.lower(), "h-text_h-20")
         safe_text = caption_text.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
+        box_param = ":box=1:boxcolor=black@0.5" if style == "filled" else ""
         drawtext = (
             f"drawtext=text='{safe_text}':fontcolor={font_color}:fontsize={fontsize}:"
-            f"borderw={borderw}:bordercolor=black:shadowx=2:shadowy={shadow}:"
+            f"borderw={borderw}:bordercolor=black:shadowx=2:shadowy={shadow}"
+            f"{box_param}:"
             f"x=(w-text_w)/2:y={y_expr}:enable='between(t,0,t+86400)'"
         )
         cmd = [
@@ -450,10 +456,13 @@ def _build_ass_style(color: str, style: str, position: str) -> dict:
     style_map = {
         "bold": {"fontsize": 24, "bold": 1, "borderstyle": 1, "outline": 3, "shadow": 2},
         "bubble": {"fontsize": 20, "bold": 0, "borderstyle": 3, "outline": 4, "shadow": 3},
+        "border": {"fontsize": 18, "bold": 0, "borderstyle": 1, "outline": 3, "shadow": 1},
+        "filled": {"fontsize": 18, "bold": 0, "borderstyle": 3, "outline": 1, "shadow": 0, "backcolour": "&H80000000"},
     }
     default = {"fontsize": 18, "bold": 0, "borderstyle": 1, "outline": 2, "shadow": 1}
     s = style_map.get(style.lower(), default)
-    align_map = {"low": 2, "middle": 8, "high": 8}
+    s.setdefault("backcolour", "&H00000000")
+    align_map = {"low": 8, "middle": 5, "high": 2}
     s["alignment"] = align_map.get(position.lower(), 2)
     s["color"] = resolve_ass_color(color)
     return s
@@ -602,20 +611,22 @@ async def remove_watermark(
 
     pw = max(1, int(vid_w * _WATERMARK_REGION_RATIO))
     ph = max(1, int(vid_h * _WATERMARK_REGION_RATIO * 0.6))
+    pw = min(pw, vid_w - 3)
+    ph = min(ph, vid_h - 3)
 
     position_map = {
-        "top-left": (0, 0),
-        "top-right": (vid_w - pw, 0),
-        "bottom-left": (0, vid_h - ph),
-        "bottom-right": (vid_w - pw, vid_h - ph),
+        "top-left": (1, 1),
+        "top-right": (vid_w - pw - 1, 1),
+        "bottom-left": (1, vid_h - ph - 1),
+        "bottom-right": (vid_w - pw - 1, vid_h - ph - 1),
         "center": ((vid_w - pw) // 2, (vid_h - ph) // 2),
     }
-    x, y = position_map.get(position, (vid_w - pw, 0))
+    x, y = position_map.get(position, (vid_w - pw - 1, 1))
     delogo = f"delogo=x={x}:y={y}:w={pw}:h={ph}"
 
     cmd = [
         "ffmpeg", "-y", "-i", str(input_path),
-        "-vf", delogo,
+        "-vf", f"{delogo},format=yuv420p",
         "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
@@ -627,11 +638,13 @@ async def remove_watermark(
             total_duration_us=duration_us,
             progress_callback=progress_callback,
         )
-    except DownloadError as exc:
-        raise DownloadError(f"Watermark removal failed: {exc}") from exc
+    except DownloadError:
+        LOGGER.warning("Watermark removal failed for %s, skipping", input_path.name)
+        return input_path
 
     if not output_path.is_file():
-        raise DownloadError(f"watermark removal produced no output file ({output_path.name})")
+        LOGGER.warning("Watermark removal produced no output for %s, skipping", input_path.name)
+        return input_path
     return output_path
 
 
@@ -902,6 +915,7 @@ async def render_edit(
         current = await render_captions(
             current, tmp,
             caption_text, caption_color, caption_style, caption_position, auto_captions, timeout_seconds,
+            srt_output_path=output_path.with_suffix(".srt"),
         )
         if auto_captions:
             srt_path = output_path.with_suffix(".srt")

@@ -43,17 +43,17 @@ class _State:
     PRESET_CREATE_CAPTION_HUE = "preset_create_caption_hue"
     PRESET_CREATE_CAPTION_STYLE = "preset_create_caption_style"
     PRESET_CREATE_CAPTION_POS = "preset_create_caption_pos"
+    PRESET_CREATE_VOICE_MENU = "preset_create_voice_menu"
     PRESET_CREATE_VOICE = "preset_create_voice"
     PRESET_CREATE_VOICE_TEXT = "preset_create_voice_text"
     PRESET_CREATE_VOICE_QUALITY = "preset_create_voice_quality"
     PRESET_CREATE_VOICE_SPEED = "preset_create_voice_speed"
     PRESET_CREATE_TTS_ENGINE = "preset_create_tts_engine"
+    PRESET_CREATE_BANNER_MENU = "preset_create_banner_menu"
     PRESET_CREATE_BANNER = "preset_create_banner"
     PRESET_CREATE_BANNER_POS = "preset_create_banner_pos"
     PRESET_CREATE_BANNER_SCALE = "preset_create_banner_scale"
     PRESET_CREATE_BANNER_UPLOAD = "preset_create_banner_upload"
-    PRESET_CREATE_WATERMARK = "preset_create_watermark"
-    PRESET_CREATE_WATERMARK_POS = "preset_create_watermark_pos"
     PRESET_CREATE_CHANNEL_BANNER = "preset_create_channel_banner"
     PRESET_EDIT = "preset_edit"
     PRESET_EDIT_FIELD = "preset_edit_field"
@@ -71,8 +71,8 @@ class FlowState:
 
 
 _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
-    "caption_style": [("✍️ Basic", "basic"), ("💪 Bold", "bold"), ("💬 Bubble", "bubble")],
-    "caption_position": [("⬇️ Low", "low"), ("↔️ Middle", "middle"), ("⬆️ High", "high")],
+    "caption_style": [("✍️ Basic", "basic"), ("💪 Bold", "bold"), ("💬 Bubble", "bubble"), ("🖼️ Border", "border"), ("🎨 Filled", "filled")],
+    "caption_position": [("⬆️ Low", "low"), ("↔️ Middle", "middle"), ("⬇️ High", "high")],
     "voice_quality": [("📶 Basic", "basic"), ("✨ Premium", "premium")],
     "tts_engine": [("🔊 edge-tts", "edge-tts"), ("🗣️ espeak-ng", "espeak-ng"), ("🤖 Auto", "auto")],
     "banner_position": [("⬆️ Top", "top"), ("⬇️ Bottom", "bottom"), ("🖼️ Overlay", "overlay")],
@@ -165,6 +165,44 @@ def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
     }
 
 
+def _voice_summary(values: dict[str, Any]) -> str:
+    parts = []
+    v = values.get("voice_over_voice")
+    if v:
+        parts.append(f"🎤 {_fmt_current(v)}")
+    s = values.get("voice_speed")
+    if s:
+        parts.append(f"⚡ {s}x")
+    q = values.get("voice_quality")
+    if q == "premium":
+        parts.append("⭐")
+    else:
+        parts.append("🍃")
+    return " ".join(parts) if parts else "none"
+
+
+def _voice_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{back_data}:voice_over_voice")],
+        [InlineKeyboardButton("📝 Voice Text", callback_data=f"{back_data}:voice_text")],
+        [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{back_data}:voice_quality")],
+        [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{back_data}:voice_speed")],
+        [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{back_data}:tts_engine")],
+        [InlineKeyboardButton("✅ Done", callback_data=f"{back_data}:done")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _banner_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🖼️ Banner Image", callback_data=f"{back_data}:banner_path")],
+        [InlineKeyboardButton("📌 Banner Position", callback_data=f"{back_data}:banner_position")],
+        [InlineKeyboardButton("📏 Banner Scale", callback_data=f"{back_data}:banner_scale")],
+        [InlineKeyboardButton("✅ Done", callback_data=f"{back_data}:done")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def _build_config_rows(
     values: dict[str, Any],
     *,
@@ -174,14 +212,8 @@ def _build_config_rows(
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
     pos = _fmt_current(values.get("caption_position"))
-    voice = _fmt_current(values.get("voice_over_voice"))
-    v_text = _fmt_current(values.get("voice_text"))
-    quality = _fmt_current(values.get("voice_quality"))
-    speed = _fmt_current(values.get("voice_speed"))
-    tts = _fmt_current(values.get("tts_engine"))
-    banner = _fmt_current(values.get("banner_path"))
-    b_pos = _fmt_current(values.get("banner_position"))
-    b_scale = _fmt_current(values.get("banner_scale"))
+    v_summary = _voice_summary(values)
+    b_path = _fmt_current(values.get("banner_path"))
     wm = _fmt_current(values.get("watermark_removal"))
     ch = _fmt_current(values.get("channel_banner"))
 
@@ -189,14 +221,8 @@ def _build_config_rows(
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
-        [InlineKeyboardButton(f"🗣️ Voice Name [{voice}]", callback_data=f"{field_prefix}:voice_over_voice")],
-        [InlineKeyboardButton(f"📝 Voice Text [{v_text}]", callback_data=f"{field_prefix}:voice_text")],
-        [InlineKeyboardButton(f"✨ Voice Quality [{quality}]", callback_data=f"{field_prefix}:voice_quality")],
-        [InlineKeyboardButton(f"⏩ Voice Speed [{speed}]", callback_data=f"{field_prefix}:voice_speed")],
-        [InlineKeyboardButton(f"🔊 TTS Engine [{tts}]", callback_data=f"{field_prefix}:tts_engine")],
-        [InlineKeyboardButton(f"🖼️ Banner Image [{banner}]", callback_data=f"{field_prefix}:banner_path")],
-        [InlineKeyboardButton(f"📌 Banner Position [{b_pos}]", callback_data=f"{field_prefix}:banner_position")],
-        [InlineKeyboardButton(f"📏 Banner Scale [{b_scale}]", callback_data=f"{field_prefix}:banner_scale")],
+        [InlineKeyboardButton(f"🎤 Voice [{v_summary}]", callback_data=f"{field_prefix}:voice_menu")],
+        [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
         [InlineKeyboardButton(f"🚫 Remove Watermark [{wm}]", callback_data=f"{field_prefix}:watermark_removal")],
     ]
     if include_watermark_position:
@@ -249,8 +275,10 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
     elif action == _State.PRESET_CREATE_CAPTION_POS:
         await _show_options(update, context, action, "Caption position:", "caption_position",
             *_FIELD_CHOICES["caption_position"])
+    elif action == _State.PRESET_CREATE_VOICE_MENU:
+        await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
     elif action == _State.PRESET_CREATE_VOICE:
-        await _edit_message(query, "Send voice-over voice name (or /skip for none):\n← Use Back to return")
+        await _edit_message(query, "Send voice-over voice name (or /skip for none):")
     elif action == _State.PRESET_CREATE_VOICE_TEXT:
         await _edit_message(query, "Voice-over text to speak (or /skip for none):")
     elif action == _State.PRESET_CREATE_VOICE_QUALITY:
@@ -261,6 +289,8 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
     elif action == _State.PRESET_CREATE_TTS_ENGINE:
         await _show_options(update, context, action, "TTS engine:", "tts_engine",
             *_FIELD_CHOICES["tts_engine"])
+    elif action == _State.PRESET_CREATE_BANNER_MENU:
+        await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
     elif action == _State.PRESET_CREATE_BANNER:
         await _edit_message(query, "Add a banner/watermark? Send a photo, paste an image URL, or /skip:")
     elif action == _State.PRESET_CREATE_BANNER_POS:
@@ -269,11 +299,6 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
     elif action == _State.PRESET_CREATE_BANNER_SCALE:
         await _show_options(update, context, action, "Banner scale:", "banner_scale",
             *_FIELD_CHOICES["banner_scale"])
-    elif action == _State.PRESET_CREATE_WATERMARK:
-        await _show_confirm(update, context, action, "Remove watermark?")
-    elif action == _State.PRESET_CREATE_WATERMARK_POS:
-        await _show_options(update, context, action, "Watermark position:", "watermark_position",
-            *_FIELD_CHOICES["watermark_position"])
     elif action == _State.PRESET_CREATE_CHANNEL_BANNER:
         await _show_confirm(update, context, action, "Channel banner for landscape videos?")
     else:
@@ -288,17 +313,17 @@ _CREATE_PREV_STEP: dict[str, str | None] = {
     _State.PRESET_CREATE_CAPTION_HUE: _State.PRESET_CREATE_CAPTION_COLOR,
     _State.PRESET_CREATE_CAPTION_STYLE: _State.PRESET_CREATE_CAPTION_COLOR,
     _State.PRESET_CREATE_CAPTION_POS: _State.PRESET_CREATE_CAPTION_STYLE,
-    _State.PRESET_CREATE_VOICE: _State.PRESET_CREATE_CAPTION_POS,
-    _State.PRESET_CREATE_VOICE_TEXT: _State.PRESET_CREATE_VOICE,
-    _State.PRESET_CREATE_VOICE_QUALITY: _State.PRESET_CREATE_VOICE_TEXT,
-    _State.PRESET_CREATE_VOICE_SPEED: _State.PRESET_CREATE_VOICE_QUALITY,
-    _State.PRESET_CREATE_TTS_ENGINE: _State.PRESET_CREATE_VOICE_SPEED,
-    _State.PRESET_CREATE_BANNER: _State.PRESET_CREATE_TTS_ENGINE,
-    _State.PRESET_CREATE_BANNER_POS: _State.PRESET_CREATE_BANNER,
-    _State.PRESET_CREATE_BANNER_SCALE: _State.PRESET_CREATE_BANNER_POS,
-    _State.PRESET_CREATE_WATERMARK: _State.PRESET_CREATE_BANNER,
-    _State.PRESET_CREATE_WATERMARK_POS: _State.PRESET_CREATE_WATERMARK,
-    _State.PRESET_CREATE_CHANNEL_BANNER: _State.PRESET_CREATE_WATERMARK,
+    _State.PRESET_CREATE_VOICE_MENU: _State.PRESET_CREATE_CAPTION_POS,
+    _State.PRESET_CREATE_VOICE: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_VOICE_TEXT: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_VOICE_QUALITY: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_VOICE_SPEED: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_TTS_ENGINE: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_BANNER_MENU: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_BANNER: _State.PRESET_CREATE_BANNER_MENU,
+    _State.PRESET_CREATE_BANNER_POS: _State.PRESET_CREATE_BANNER_MENU,
+    _State.PRESET_CREATE_BANNER_SCALE: _State.PRESET_CREATE_BANNER_MENU,
+    _State.PRESET_CREATE_CHANNEL_BANNER: _State.PRESET_CREATE_BANNER_MENU,
 }
 
 
@@ -312,27 +337,22 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
             await _show_menu(update, context)
             return
         prev = _CREATE_PREV_STEP[flow.action]
-        if flow.action == _State.PRESET_CREATE_CHANNEL_BANNER and flow.data.get("watermark_removal"):
-            prev = _State.PRESET_CREATE_WATERMARK_POS
-        if flow.action == _State.PRESET_CREATE_WATERMARK and (
+        if flow.action == _State.PRESET_CREATE_BANNER and (
             flow.data.get("banner_path") or flow.data.get("banner_url")
         ):
-            prev = _State.PRESET_CREATE_BANNER_SCALE
-        # Clear fields for the step we're leaving
+            prev = _State.PRESET_CREATE_BANNER_MENU
         if flow.action == _State.PRESET_CREATE_CAPTION_STYLE:
             flow.data.pop("caption_style", None)
         elif flow.action == _State.PRESET_CREATE_CAPTION_POS:
             flow.data.pop("caption_position", None)
-        elif flow.action == _State.PRESET_CREATE_VOICE:
+        elif flow.action in (_State.PRESET_CREATE_VOICE, _State.PRESET_CREATE_VOICE_TEXT,
+                             _State.PRESET_CREATE_VOICE_QUALITY, _State.PRESET_CREATE_VOICE_SPEED,
+                             _State.PRESET_CREATE_TTS_ENGINE):
             pass
         elif flow.action == _State.PRESET_CREATE_BANNER_POS:
             flow.data.pop("banner_position", None)
         elif flow.action == _State.PRESET_CREATE_BANNER_SCALE:
             flow.data.pop("banner_scale", None)
-        elif flow.action == _State.PRESET_CREATE_WATERMARK:
-            flow.data.pop("watermark_removal", None)
-        elif flow.action == _State.PRESET_CREATE_WATERMARK_POS:
-            flow.data.pop("watermark_position", None)
         elif flow.action == _State.PRESET_CREATE_CHANNEL_BANNER:
             flow.data.pop("channel_banner", None)
         if prev == _State.PRESET_CREATE_CAPTION_COLOR:
@@ -367,6 +387,54 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         )
         return
 
+    if data == "preset_create:voice:done":
+        flow.action = _State.PRESET_CREATE_BANNER_MENU
+        await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
+        return
+
+    if data == "preset_create:banner:done":
+        flow.data.setdefault("watermark_removal", True)
+        flow.data.setdefault("watermark_position", "auto")
+        flow.action = _State.PRESET_CREATE_CHANNEL_BANNER
+        await _show_confirm(update, context, flow.action, "Channel banner for landscape videos?")
+        return
+
+    if data.startswith("preset_create:voice:"):
+        inner = data.split(":", 2)[-1]
+        if inner == "voice_over_voice":
+            flow.action = _State.PRESET_CREATE_VOICE
+            await _edit_message(query, "Send voice-over voice name (or /skip for none):")
+        elif inner == "voice_text":
+            flow.action = _State.PRESET_CREATE_VOICE_TEXT
+            await _edit_message(query, "Voice-over text to speak (or /skip for none):")
+        elif inner == "voice_quality":
+            flow.action = _State.PRESET_CREATE_VOICE_QUALITY
+            await _show_options(update, context, flow.action, "Voice quality:", "voice_quality",
+                *_FIELD_CHOICES["voice_quality"])
+        elif inner == "voice_speed":
+            flow.action = _State.PRESET_CREATE_VOICE_SPEED
+            await _edit_message(query, "Voice speed? (0.5 to 2.0, e.g. 1.0):")
+        elif inner == "tts_engine":
+            flow.action = _State.PRESET_CREATE_TTS_ENGINE
+            await _show_options(update, context, flow.action, "TTS engine:", "tts_engine",
+                *_FIELD_CHOICES["tts_engine"])
+        return
+
+    if data.startswith("preset_create:banner:"):
+        inner = data.split(":", 2)[-1]
+        if inner == "banner_path":
+            flow.action = _State.PRESET_CREATE_BANNER
+            await _edit_message(query, "Add a banner/watermark? Send a photo, paste an image URL, or /skip:")
+        elif inner == "banner_position":
+            flow.action = _State.PRESET_CREATE_BANNER_POS
+            await _show_options(update, context, flow.action, "Banner position:", "banner_position",
+                *_FIELD_CHOICES["banner_position"])
+        elif inner == "banner_scale":
+            flow.action = _State.PRESET_CREATE_BANNER_SCALE
+            await _show_options(update, context, flow.action, "Banner scale:", "banner_scale",
+                *_FIELD_CHOICES["banner_scale"])
+        return
+
     parts = data.split(":", 2)
     if len(parts) < 3:
         return
@@ -391,50 +459,21 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         await _show_options(update, context, flow.action, "Caption position:", "caption_position",
             *_FIELD_CHOICES["caption_position"])
     elif field == "caption_position":
-        flow.action = _State.PRESET_CREATE_VOICE
-        await _edit_message(query, "Send voice-over voice name (or /skip for none):")
-    elif field == "voice_quality":
-        flow.action = _State.PRESET_CREATE_VOICE_SPEED
-        await _edit_message(query, "Voice speed? (0.5 to 2.0, e.g. 1.0):")
-    elif field == "tts_engine":
-        flow.action = _State.PRESET_CREATE_BANNER
-        await _edit_message(query, "Add a banner/watermark? Send a photo, paste an image URL, or /skip:")
-    elif field == "banner_position":
-        flow.action = _State.PRESET_CREATE_BANNER_SCALE
-        await _show_options(update, context, flow.action, "Banner scale:", "banner_scale",
-            *_FIELD_CHOICES["banner_scale"])
-    elif field == "banner_scale":
-        flow.action = _State.PRESET_CREATE_WATERMARK
-        await _show_confirm(update, context, flow.action, "Remove watermark?")
-    elif field == "watermark_position":
-        flow.action = _State.PRESET_CREATE_CHANNEL_BANNER
-        await _show_confirm(update, context, flow.action, "Channel banner for landscape videos?")
-    elif field == "watermark_removal":
-        val = value == "yes"
-        flow.data["watermark_removal"] = val
-        if val:
-            flow.action = _State.PRESET_CREATE_WATERMARK_POS
-            await _show_options(update, context, flow.action, "Watermark position:", "watermark_position",
-                *_FIELD_CHOICES["watermark_position"])
-        else:
-            flow.action = _State.PRESET_CREATE_CHANNEL_BANNER
-            await _show_confirm(update, context, flow.action, "Channel banner for landscape videos?")
+        flow.action = _State.PRESET_CREATE_VOICE_MENU
+        await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
+    elif field in ("voice_quality", "voice_speed", "tts_engine", "voice_text", "voice_over_voice"):
+        flow.action = _State.PRESET_CREATE_VOICE_MENU
+        await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
+    elif field in ("banner_position", "banner_scale", "banner_path"):
+        flow.action = _State.PRESET_CREATE_BANNER_MENU
+        await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
     elif field == "channel_banner":
         flow.data["channel_banner"] = value == "yes"
         await _finalize_preset_create(update, context, context.application.bot_data["db_path"])
 
 
 async def _handle_yesno(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: FlowState, query, next_action: str, choice: bool) -> None:
-    if next_action == str(_State.PRESET_CREATE_WATERMARK):
-        flow.data["watermark_removal"] = choice
-        if choice:
-            flow.action = _State.PRESET_CREATE_WATERMARK_POS
-            await _show_options(update, context, flow.action, "Watermark position:", "watermark_position",
-                *_FIELD_CHOICES["watermark_position"])
-        else:
-            flow.action = _State.PRESET_CREATE_CHANNEL_BANNER
-            await _show_confirm(update, context, flow.action, "Channel banner for landscape videos?")
-    elif next_action == str(_State.PRESET_CREATE_CHANNEL_BANNER):
+    if next_action == str(_State.PRESET_CREATE_CHANNEL_BANNER):
         flow.data["channel_banner"] = choice
         await _finalize_preset_create(update, context, context.application.bot_data["db_path"])
 
@@ -519,6 +558,26 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         parts = query.data.split(":")
         preset_id = int(parts[2])
         field_name = parts[3]
+        if field_name == "voice_menu":
+            rows = [
+                [InlineKeyboardButton("🎤 Voice Name", callback_data=f"preset:field:{preset_id}:voice_over_voice")],
+                [InlineKeyboardButton("📝 Voice Text", callback_data=f"preset:field:{preset_id}:voice_text")],
+                [InlineKeyboardButton("✨ Voice Quality", callback_data=f"preset:field:{preset_id}:voice_quality")],
+                [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"preset:field:{preset_id}:voice_speed")],
+                [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"preset:field:{preset_id}:tts_engine")],
+                [InlineKeyboardButton("✅ Done", callback_data=f"preset:menu:{preset_id}")],
+            ]
+            await _edit_message(query, "Voice settings:", InlineKeyboardMarkup(rows))
+            return
+        if field_name == "banner_menu":
+            rows = [
+                [InlineKeyboardButton("🖼️ Banner Image", callback_data=f"preset:field:{preset_id}:banner_path")],
+                [InlineKeyboardButton("📌 Banner Position", callback_data=f"preset:field:{preset_id}:banner_position")],
+                [InlineKeyboardButton("📏 Banner Scale", callback_data=f"preset:field:{preset_id}:banner_scale")],
+                [InlineKeyboardButton("✅ Done", callback_data=f"preset:menu:{preset_id}")],
+            ]
+            await _edit_message(query, "Banner settings:", InlineKeyboardMarkup(rows))
+            return
         await _start_edit_field(update, context, preset_id, field_name)
         return
 
@@ -632,12 +691,8 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if flow.action == _State.PRESET_CREATE_BANNER:
         flow.data["banner_path"] = str(dest)
-        flow.action = _State.PRESET_CREATE_BANNER_POS
-        await _show_options(
-            update, context, flow.action,
-            "Banner position:", "banner_position",
-            *_FIELD_CHOICES["banner_position"],
-        )
+        flow.action = _State.PRESET_CREATE_BANNER_MENU
+        await update.message.reply_text("Banner saved!", reply_markup=_banner_menu_keyboard("preset_create:banner"))
         return True
 
     return False
@@ -669,19 +724,15 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if flow.action == _State.PRESET_CREATE_VOICE:
         if text.lower() != "/skip":
             flow.data["voice_over_voice"] = text
-        flow.action = _State.PRESET_CREATE_VOICE_TEXT
-        await update.message.reply_text("Voice-over text to speak (or /skip for none):")
+        flow.action = _State.PRESET_CREATE_VOICE_MENU
+        await _edit_or_send(update, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
         return True
 
     if flow.action == _State.PRESET_CREATE_VOICE_TEXT:
         if text.lower() != "/skip":
             flow.data["voice_text"] = text
-        flow.action = _State.PRESET_CREATE_VOICE_QUALITY
-        await _show_options(
-            update, context, flow.action,
-            "Voice quality:", "voice_quality",
-            *_FIELD_CHOICES["voice_quality"],
-        )
+        flow.action = _State.PRESET_CREATE_VOICE_MENU
+        await _edit_or_send(update, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
         return True
 
     if flow.action == _State.PRESET_CREATE_VOICE_SPEED:
@@ -693,12 +744,8 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("Enter a number between 0.5 and 2.0")
             return True
         flow.data["voice_speed"] = speed
-        flow.action = _State.PRESET_CREATE_TTS_ENGINE
-        await _show_options(
-            update, context, flow.action,
-            "TTS engine:", "tts_engine",
-            *_FIELD_CHOICES["tts_engine"],
-        )
+        flow.action = _State.PRESET_CREATE_VOICE_MENU
+        await _edit_or_send(update, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
         return True
 
     if flow.action == _State.PRESET_CREATE_BANNER:
@@ -707,25 +754,13 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
             banner_file = storage_dir / "banners" / f"banner_{user.id if user else 0}.png"
             if text.lower() in ("profile", "p") and banner_file.is_file():
                 flow.data["banner_path"] = str(banner_file)
-                flow.action = _State.PRESET_CREATE_BANNER_POS
-                await _show_options(
-                    update, context, flow.action,
-                    "Banner position:", "banner_position",
-                    *_FIELD_CHOICES["banner_position"],
-                )
             elif text.startswith("http://") or text.startswith("https://"):
                 flow.data["banner_url"] = text
-                flow.action = _State.PRESET_CREATE_BANNER_POS
-                await _show_options(
-                    update, context, flow.action,
-                    "Banner position:", "banner_position",
-                    *_FIELD_CHOICES["banner_position"],
-                )
             else:
                 await update.message.reply_text("Send a photo, type 'profile', paste an image URL, or /skip:")
-            return True
-        flow.action = _State.PRESET_CREATE_WATERMARK
-        await _show_confirm(update, context, flow.action, "Remove watermark?")
+                return True
+        flow.action = _State.PRESET_CREATE_BANNER_MENU
+        await _edit_or_send(update, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
         return True
 
     if flow.action == _State.PRESET_EDIT_FIELD:
@@ -1162,14 +1197,12 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
     if preset is not None:
         preset_vals = _config_snapshot(preset)
         for key, val in list(values.items()):
-            if isinstance(val, bool):
-                if not val and preset_vals.get(key):
-                    values[key] = preset_vals[key]
-            elif val is None:
+            if val is None:
                 values[key] = preset_vals.get(key)
-    rows = _build_config_rows(values, field_prefix="editcfg", include_watermark_position=True)
-    rows.append([InlineKeyboardButton("🎬 Render now", callback_data="editcfg:render")])
-    rows.append([InlineKeyboardButton("← Back", callback_data="editcfg:back")])
+    prefix = f"editcfg:{edit.id}"
+    rows = _build_config_rows(values, field_prefix=prefix, include_watermark_position=True)
+    rows.append([InlineKeyboardButton("🎬 Render now", callback_data=f"{prefix}:render")])
+    rows.append([InlineKeyboardButton("🏠 Menu", callback_data=f"{prefix}:menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1206,62 +1239,71 @@ async def _start_editconfig_from_settings(update: Update, context: ContextTypes.
     await show_editconfig_menu(update, context, edit_id)
 
 
-async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    """Handle editcfg:* callbacks. Returns 'render' when render was requested."""
+async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple | None:
+    """Handle editcfg:* callbacks. Returns ('render', edit_id) when render was requested."""
     query = update.callback_query
     if query is None or query.data is None:
         return None
     await query.answer()
     db_path: Path = context.application.bot_data["db_path"]
-    flow = context.user_data.get("settings_flow")
-    if not flow or (isinstance(flow, dict) and flow.get("action") != "editconfig"):
-        if isinstance(flow, FlowState) and flow.action == "editconfig":
-            pass
-        else:
-            await query.edit_message_text("No active edit config. Use /editconfig.")
-            return None
+    data: str = query.data
 
-    if isinstance(flow, FlowState):
-        edit_id = flow.data.get("edit_id")
-    else:
-        edit_id = flow.get("edit_id")
-
-    data = query.data
-
-    if data == "editcfg:back":
-        # Leave submenu or return to settings menu when already on main config
-        if isinstance(flow, dict) and flow.get("field_name"):
-            flow.pop("field_name", None)
-            await show_editconfig_menu(update, context, edit_id)
-            return None
-        await _edit_message(query, "Closed edit config. Use /editconfig to reopen.")
+    if not data.startswith("editcfg:"):
         return None
 
-    if data == "editcfg:menu":
+    parts = data.split(":", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        edit_id = int(parts[1])
+    except ValueError:
+        await _edit_message(query, "Invalid edit ID.")
+        return None
+    rest = parts[2]
+
+    flow = context.user_data.get("settings_flow")
+    if isinstance(flow, FlowState):
+        pass
+    elif not isinstance(flow, dict):
+        flow = {}
+        context.user_data["settings_flow"] = flow
+
+    if isinstance(flow, dict):
+        flow["action"] = "editconfig"
+        flow["edit_id"] = edit_id
+
+    prefix = f"editcfg:{edit_id}"
+
+    if rest == "back":
+        if isinstance(flow, dict) and flow.get("field_name"):
+            flow.pop("field_name", None)
+        await show_editconfig_menu(update, context, edit_id)
+        return None
+
+    if rest == "menu":
         if isinstance(flow, dict):
             flow.pop("field_name", None)
         await show_editconfig_menu(update, context, edit_id)
         return None
 
-    if data == "editcfg:render":
-        return "render"
+    if rest == "render":
+        return ("render", edit_id)
 
-    if data.startswith("editcfg:hue:"):
-        hue = data.split(":")[-1]
+    if rest.startswith("hue:"):
+        hue = rest.split(":", 1)[-1]
         await _edit_message(
             query,
             f"Pick a shade of {color_label(hue)}:",
-            _color_shade_keyboard(hue, "editcfg:caption_color", "editcfg:set:caption_color"),
+            _color_shade_keyboard(hue, f"{prefix}:caption_color", f"{prefix}:set:caption_color"),
         )
         return None
 
-    if data.startswith("editcfg:set:"):
-        # editcfg:set:{field}:{value}
-        parts = data.split(":", 3)
-        if len(parts) < 4:
+    if rest.startswith("set:"):
+        inner = rest.split(":", 2)
+        if len(inner) < 3:
             return None
-        field_name = parts[2]
-        raw_value = parts[3]
+        field_name = inner[1]
+        raw_value = inner[2]
         value = _coerce_choice_value(field_name, raw_value)
         await update_edit_job(db_path, edit_id, **{field_name: value})
         if isinstance(flow, dict):
@@ -1269,7 +1311,73 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         await show_editconfig_menu(update, context, edit_id)
         return None
 
-    field = data.split(":", 1)[1]
+    if rest == "voice_menu":
+        if isinstance(flow, dict):
+            flow["field_name"] = "voice_menu"
+        rows = [
+            [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{prefix}:voice_menu:voice_over_voice")],
+            [InlineKeyboardButton("📝 Voice Text", callback_data=f"{prefix}:voice_menu:voice_text")],
+            [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{prefix}:voice_menu:voice_quality")],
+            [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{prefix}:voice_menu:voice_speed")],
+            [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{prefix}:voice_menu:tts_engine")],
+            [InlineKeyboardButton("✅ Done", callback_data=f"{prefix}:menu")],
+        ]
+        await _edit_message(query, "Voice settings:", InlineKeyboardMarkup(rows))
+        return None
+
+    if rest.startswith("voice_menu:"):
+        field_name = rest.split(":", 1)[-1]
+        if isinstance(flow, dict):
+            flow["field_name"] = field_name
+        if field_name in _FIELD_CHOICES:
+            pretty = field_name.replace("_", " ").title()
+            await _edit_message(
+                query,
+                f"Choose {pretty}:",
+                _choice_keyboard(field_name, f"{prefix}:voice_menu", f"{prefix}:set:{field_name}"),
+            )
+        else:
+            pretty = field_name.replace("_", " ").title()
+            await _edit_message(
+                query,
+                f"Send new value for {pretty} (or /skip to clear):",
+                InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:voice_menu")]]),
+            )
+        return None
+
+    if rest == "banner_menu":
+        if isinstance(flow, dict):
+            flow["field_name"] = "banner_menu"
+        rows = [
+            [InlineKeyboardButton("🖼️ Banner Image", callback_data=f"{prefix}:banner_menu:banner_path")],
+            [InlineKeyboardButton("📌 Banner Position", callback_data=f"{prefix}:banner_menu:banner_position")],
+            [InlineKeyboardButton("📏 Banner Scale", callback_data=f"{prefix}:banner_menu:banner_scale")],
+            [InlineKeyboardButton("✅ Done", callback_data=f"{prefix}:menu")],
+        ]
+        await _edit_message(query, "Banner settings:", InlineKeyboardMarkup(rows))
+        return None
+
+    if rest.startswith("banner_menu:"):
+        field_name = rest.split(":", 1)[-1]
+        if isinstance(flow, dict):
+            flow["field_name"] = field_name
+        if field_name in _FIELD_CHOICES:
+            pretty = field_name.replace("_", " ").title()
+            await _edit_message(
+                query,
+                f"Choose {pretty}:",
+                _choice_keyboard(field_name, f"{prefix}:banner_menu", f"{prefix}:set:{field_name}"),
+            )
+        else:
+            pretty = field_name.replace("_", " ").title()
+            await _edit_message(
+                query,
+                f"Send new value for {pretty} (or /skip to clear):",
+                InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:banner_menu")]]),
+            )
+        return None
+
+    field = rest
     if isinstance(flow, dict):
         flow["field_name"] = field
 
@@ -1277,7 +1385,7 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         await _edit_message(
             query,
             "Caption colour — pick a hue:",
-            _color_hue_keyboard("editcfg:menu", "editcfg:hue"),
+            _color_hue_keyboard(f"{prefix}:menu", f"{prefix}:hue"),
         )
         return None
 
@@ -1286,7 +1394,7 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         await _edit_message(
             query,
             f"Choose {pretty}:",
-            _choice_keyboard(field, "editcfg:menu", f"editcfg:set:{field}"),
+            _choice_keyboard(field, f"{prefix}:menu", f"{prefix}:set:{field}"),
         )
         return None
 
@@ -1294,6 +1402,6 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     await _edit_message(
         query,
         f"Send new value for {pretty} (or /skip to clear):",
-        InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="editcfg:menu")]]),
+        InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:menu")]]),
     )
     return None
