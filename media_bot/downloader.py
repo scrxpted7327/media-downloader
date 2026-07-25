@@ -12,6 +12,10 @@ import zipfile
 from pathlib import Path
 from collections.abc import Awaitable, Callable
 
+from .tools import prefer_ffmpeg_full
+
+prefer_ffmpeg_full()
+
 
 class DownloadError(RuntimeError):
     pass

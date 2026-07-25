@@ -13,6 +13,34 @@ from pathlib import Path
 GITHUB_RELEASE = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/"
 USER_AGENT = "media-downloader-bot/1.0"
 
+_FFMPEG_FULL_BIN_DIRS = (
+    Path("/opt/homebrew/opt/ffmpeg-full/bin"),
+    Path("/usr/local/opt/ffmpeg-full/bin"),
+)
+
+
+def prefer_ffmpeg_full() -> Path | None:
+    """Prefer Homebrew ffmpeg-full (drawtext/ass/libfreetype) over the slim bottle."""
+    for directory in _FFMPEG_FULL_BIN_DIRS:
+        ffmpeg = directory / "ffmpeg"
+        if ffmpeg.is_file() and os.access(ffmpeg, os.X_OK):
+            path = os.environ.get("PATH", "")
+            prefix = str(directory)
+            if not path.split(os.pathsep) or path.split(os.pathsep)[0] != prefix:
+                os.environ["PATH"] = prefix + os.pathsep + path
+            return ffmpeg
+    return None
+
+
+def ffmpeg_bin() -> str:
+    prefer_ffmpeg_full()
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def ffprobe_bin() -> str:
+    prefer_ffmpeg_full()
+    return shutil.which("ffprobe") or "ffprobe"
+
 
 def _asset_name() -> str:
     system, machine = platform.system(), platform.machine().lower()

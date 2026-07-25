@@ -10,6 +10,9 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .downloader import DownloadError, _run_checked
+from .tools import prefer_ffmpeg_full
+
+prefer_ffmpeg_full()
 
 ProgressCallback = Callable[[int], Awaitable[None]]
 _FFPROGRESS = re.compile(rb"out_time_us=(\d+)")
@@ -95,7 +98,8 @@ async def _tts_edge(
 ) -> None:
     import edge_tts
     voice_name = resolve_voice(voice, "edge-tts")
-    rate_str = f"+{int((speed - 1.0) * 100)}%" if speed >= 1.0 else f"{int((1.0 - speed) * 100)}%"
+    rate_pct = int(round((speed - 1.0) * 100))
+    rate_str = f"{rate_pct:+d}%"
     communicate = edge_tts.Communicate(text, voice_name, rate=rate_str)
     await asyncio.wait_for(
         communicate.save(str(output_path)),
@@ -547,16 +551,24 @@ async def render_banner(
     if shutil.which("ffmpeg") is None:
         raise DownloadError("ffmpeg is required for banner overlay")
 
+    vid_w, vid_h = _get_video_dimensions(input_path)
+    max_h = max(2, int(vid_h * 0.15) // 2 * 2)
+    max_w = max(2, vid_w // 2 * 2)
+
     if scale == "stretch":
-        overlay = f"scale=iw:{int(1080 * 0.15)}"
+        overlay = f"scale={max_w}:{max_h}"
     elif scale == "fill":
-        overlay = f"scale=max(iw\\,ih):max(iw\\,ih):force_original_aspect_ratio=increase,crop=iw:{int(1080 * 0.15)}"
+        overlay = (
+            f"scale={max_w}:{max_h}:force_original_aspect_ratio=increase,"
+            f"crop={max_w}:{max_h}"
+        )
     else:
-        overlay = f"scale=iw:trunc(oh*a/2)*2:force_original_aspect_ratio=decrease,scale=iw:min(ih\\,{int(1080 * 0.15)})"
+        # fit: preserve aspect ratio, fit inside video width × 15% height
+        overlay = f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease"
 
     position_map = {
         "top": "0:0",
-        "bottom": f"0:ih-overlay_h",
+        "bottom": "0:main_h-overlay_h",
         "overlay": "(main_w-overlay_w)/2:(main_h-overlay_h)/2",
     }
     pos = position_map.get(position.lower(), position_map["bottom"])
@@ -577,7 +589,7 @@ async def render_banner(
     except DownloadError as exc:
         raise DownloadError(f"Banner render failed: {exc}") from exc
 
-    if not output_path.is_file():
+    if not output_path.is_file() or output_path.stat().st_size == 0:
         raise DownloadError(f"banner overlay produced no output file ({output_path.name})")
     return output_path
 

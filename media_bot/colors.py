@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 COLOR_HUES: list[tuple[str, str, str]] = [
     ("red", "Red", "🔴"),
     ("orange", "Orange", "🟠"),
@@ -143,28 +141,41 @@ def _get_hue_for_hex(hex_color: str) -> str | None:
     return _HEX_TO_HUE.get(v)
 
 
-def resolve_ass_color(color: str) -> str:
+_NAMED_RGB: dict[str, str] = {
+    "white": "FFFFFF",
+    "black": "000000",
+    "red": "FF0000",
+    "green": "00FF00",
+    "blue": "0000FF",
+    "yellow": "FFFF00",
+    "cyan": "00FFFF",
+    "magenta": "FF00FF",
+    "orange": "FFA500",
+    "purple": "800080",
+    "pink": "FFC0CB",
+    "gray": "808080",
+}
+
+
+def _normalize_rgb_hex(color: str, default: str = "FFFFFF") -> str:
     c = color.strip()
     if c.startswith("#"):
         c = c.lstrip("#")
         if len(c) == 6:
-            r, g, b = c[0:2], c[2:4], c[4:6]
-            return f"&H00{b}{g}{r}"
+            return c.upper()
         if len(c) == 3:
-            r, g, b = c[0] * 2, c[1] * 2, c[2] * 2
-            return f"&H00{b}{g}{r}"
-    named = {
-        "white": "&H00FFFFFF",
-        "black": "&H00000000",
-        "red": "&H000000FF",
-        "green": "&H0000FF00",
-        "blue": "&H00FF0000",
-        "yellow": "&H0000FFFF",
-        "cyan": "&H00FFFF00",
-        "magenta": "&H00FF00FF",
-        "orange": "&H0000A5FF",
-        "purple": "&H00800080",
-        "pink": "&H00C0CBFF",
-        "gray": "&H00808080",
-    }
-    return named.get(c.lower(), "&H00FFFFFF")
+            return "".join(ch * 2 for ch in c).upper()
+        return default
+    return _NAMED_RGB.get(c.lower(), default)
+
+
+def resolve_ass_color(color: str) -> str:
+    rgb = _normalize_rgb_hex(color)
+    r, g, b = rgb[0:2], rgb[2:4], rgb[4:6]
+    return f"&H00{b}{g}{r}"
+
+
+def resolve_drawtext_color(value: str | None, default: str = "white") -> str:
+    if not value:
+        return f"#{_normalize_rgb_hex(default)}"
+    return f"#{_normalize_rgb_hex(value, _normalize_rgb_hex(default))}"

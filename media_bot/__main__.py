@@ -50,7 +50,7 @@ from .storage import (
     update_edit_job,
     update_job,
 )
-from .tools import provision_ytdlp
+from .tools import prefer_ffmpeg_full, provision_ytdlp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -232,8 +232,8 @@ async def _process_single_url(
                     DownloadReporter(status).progress,
                 )
             except DownloadError as exc:
-                if is_tiktok_url(url) and ("Unsupported URL" in str(exc) or "not supported" in str(exc).lower()):
-                    LOGGER.info("yt-dlp unsupported on TikTok URL, trying gallery-dl: %s", url)
+                if is_tiktok_url(url):
+                    LOGGER.info("yt-dlp failed on TikTok URL, trying gallery-dl: %s (%s)", url, exc)
                     temporary, media = await download_tiktok_slideshow(
                         gallerydl, url, settings.max_filesize_mb, settings.timeout_seconds,
                         DownloadReporter(status).progress,
@@ -898,6 +898,7 @@ async def _post_init(application: Application) -> None:
 
 
 def main() -> None:
+    prefer_ffmpeg_full()
     settings = Settings.from_environment()
     ytdlp = provision_ytdlp(settings.tools_dir, settings.ytdlp_version)
     if shutil.which("ffmpeg") is None:
