@@ -639,7 +639,7 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = await handle_editconfig_callback(update, context)
     if isinstance(result, tuple) and result[0] == "render":
-        await _render_edit_job(update, context, result[1])
+        asyncio.create_task(_render_edit_job(update, context, result[1]))
 
 
 async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -771,9 +771,9 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         await update.effective_message.reply_text(f"Render failed: {exc}")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-    await update.effective_message.reply_text(f"Render complete. Job #{edit.id} ready.", document=out_path.open("rb"))
+    await update.effective_message.reply_document(document=out_path.open("rb"), caption=f"Render complete. Job #{edit.id} ready.")
     if subtitles_path:
-        await update.effective_message.reply_text("Subtitles available.", document=Path(subtitles_path).open("rb"))
+        await update.effective_message.reply_document(document=Path(subtitles_path).open("rb"), caption="Subtitles available.")
 
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

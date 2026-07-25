@@ -61,13 +61,23 @@ def _detect_video_encoder() -> str:
     return _VIDEO_ENCODER
 
 _WHISPER_MODEL = None
+_WHISPER_LOCK = asyncio.Lock()
+_transcribe_semaphore = asyncio.Semaphore(1)
 
-def _get_whisper_model():
+
+async def _get_whisper_model_async():
     global _WHISPER_MODEL
-    if _WHISPER_MODEL is None:
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    async with _WHISPER_LOCK:
+        if _WHISPER_MODEL is not None:
+            return _WHISPER_MODEL
         from faster_whisper import WhisperModel
-        LOGGER.info("Loading faster-whisper tiny model...")
-        _WHISPER_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
+        LOGGER.info("Loading faster-whisper tiny model in thread...")
+        loop = asyncio.get_running_loop()
+        _WHISPER_MODEL = await loop.run_in_executor(
+            None, lambda: WhisperModel("tiny", device="cpu", compute_type="int8"),
+        )
         LOGGER.info("faster-whisper model loaded")
     return _WHISPER_MODEL
 
@@ -284,7 +294,7 @@ async def transcribe_audio(
     if shutil.which("ffmpeg") is None:
         raise DownloadError("ffmpeg is required for transcription")
 
-    model = _get_whisper_model()
+    model = await _get_whisper_model_async()
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-whisper-")
     wav_path = Path(tmpdir.name) / "audio.wav"
 
@@ -299,9 +309,13 @@ async def transcribe_audio(
             raise DownloadError("audio extraction produced empty output")
 
         LOGGER.info("Transcribing %s...", input_path.name)
-        segments, info = model.transcribe(
-            str(wav_path), beam_size=1, language=language,
-        )
+        async with _transcribe_semaphore:
+            loop = asyncio.get_running_loop()
+            segments_gen, info = await loop.run_in_executor(
+                None,
+                lambda: model.transcribe(str(wav_path), beam_size=1, language=language),
+            )
+            segments = await loop.run_in_executor(None, lambda: list(segments_gen))
         result = [
             {"start": round(seg.start, 3), "end": round(seg.end, 3), "text": seg.text.strip()}
             for seg in segments
