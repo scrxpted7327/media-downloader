@@ -287,27 +287,58 @@ def _get_duration_us(path: Path) -> int | None:
     return None
 
 
-async def _transcribe_remote(wav_path: Path, language: str | None, timeout: int) -> list[dict]:
-    import aiohttp
-    api_url = os.environ.get("WHISPER_API_URL", "").rstrip("/")
-    if not api_url:
-        raise DownloadError("WHISPER_API_URL not set")
-    auth_token = os.environ.get("WHISPER_AUTH_TOKEN", "")
-    headers = {}
-    if auth_token:
-        headers["X-Whisper-Token"] = auth_token
-    timeout_obj = aiohttp.ClientTimeout(total=timeout)
-    async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-        with wav_path.open("rb") as f:
-            data = aiohttp.FormData()
-            data.add_field("audio", f, filename="audio.wav", content_type="audio/wav")
-            async with session.post(f"{api_url}/transcribe", data=data, headers=headers) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise DownloadError(f"remote whisper failed ({resp.status}): {body[:200]}")
-                result = await resp.json()
+_SSH_WHISPER_SCRIPT = r"""
+import sys, json, tempfile, os
+from pathlib import Path
+data = sys.stdin.buffer.read()
+tmp = tempfile.NamedTemporaryFile(prefix='whisper-', suffix='.wav', delete=False)
+tmp.write(data)
+tmp.close()
+try:
+    from faster_whisper import WhisperModel
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    segments, info = model.transcribe(tmp.name, beam_size=1)
+    result = [{"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text.strip()} for s in segments]
+    print(json.dumps({"segments": result, "language": info.language, "duration": info.duration}))
+except Exception as e:
+    print(json.dumps({"error": str(e)}), file=sys.stderr)
+    sys.exit(1)
+finally:
+    os.unlink(tmp.name)
+"""
+
+
+async def _transcribe_ssh(wav_path: Path, language: str | None, timeout: int) -> list[dict]:
+    ssh_target = os.environ.get("WHISPER_SSH_HOST", "").strip()
+    if not ssh_target:
+        raise DownloadError("WHISPER_SSH_HOST not set")
+    ssh_key = os.environ.get("WHISPER_SSH_KEY", "").strip()
+    ssh_args = ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+    if ssh_key:
+        ssh_args.extend(["-i", ssh_key])
+    ssh_args.append(ssh_target)
+    ssh_args.extend(["python3", "-c", _SSH_WHISPER_SCRIPT])
+    LOGGER.info("Transcribing via SSH to %s...", ssh_target)
+    proc = await asyncio.create_subprocess_exec(
+        *ssh_args,
+        stdin=wav_path.open("rb"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise DownloadError(f"SSH whisper timed out on {ssh_target}")
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", "replace")[:300]
+        raise DownloadError(f"SSH whisper failed on {ssh_target}: {err}")
+    result = json.loads(stdout.decode("utf-8", "replace"))
+    if "error" in result:
+        raise DownloadError(f"SSH whisper error: {result['error']}")
     segments = result.get("segments", [])
-    LOGGER.info("Remote transcription: %d segments, language %s", len(segments), result.get("language", "?"))
+    LOGGER.info("SSH transcription: %d segments, language %s", len(segments), result.get("language", "?"))
     return segments
 
 
@@ -332,9 +363,9 @@ async def transcribe_audio(
         if not wav_path.is_file() or wav_path.stat().st_size == 0:
             raise DownloadError("audio extraction produced empty output")
 
-        remote_url = os.environ.get("WHISPER_API_URL", "")
-        if remote_url:
-            return await _transcribe_remote(wav_path, language, timeout_seconds)
+        ssh_host = os.environ.get("WHISPER_SSH_HOST", "")
+        if ssh_host:
+            return await _transcribe_ssh(wav_path, language, timeout_seconds)
 
         model = await _get_whisper_model_async()
         LOGGER.info("Transcribing %s locally...", input_path.name)
