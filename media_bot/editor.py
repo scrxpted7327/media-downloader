@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -286,6 +287,30 @@ def _get_duration_us(path: Path) -> int | None:
     return None
 
 
+async def _transcribe_remote(wav_path: Path, language: str | None, timeout: int) -> list[dict]:
+    import aiohttp
+    api_url = os.environ.get("WHISPER_API_URL", "").rstrip("/")
+    if not api_url:
+        raise DownloadError("WHISPER_API_URL not set")
+    auth_token = os.environ.get("WHISPER_AUTH_TOKEN", "")
+    headers = {}
+    if auth_token:
+        headers["X-Whisper-Token"] = auth_token
+    timeout_obj = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+        with wav_path.open("rb") as f:
+            data = aiohttp.FormData()
+            data.add_field("audio", f, filename="audio.wav", content_type="audio/wav")
+            async with session.post(f"{api_url}/transcribe", data=data, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise DownloadError(f"remote whisper failed ({resp.status}): {body[:200]}")
+                result = await resp.json()
+    segments = result.get("segments", [])
+    LOGGER.info("Remote transcription: %d segments, language %s", len(segments), result.get("language", "?"))
+    return segments
+
+
 async def transcribe_audio(
     input_path: Path,
     language: str | None = None,
@@ -294,7 +319,6 @@ async def transcribe_audio(
     if shutil.which("ffmpeg") is None:
         raise DownloadError("ffmpeg is required for transcription")
 
-    model = await _get_whisper_model_async()
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-whisper-")
     wav_path = Path(tmpdir.name) / "audio.wav"
 
@@ -308,7 +332,12 @@ async def transcribe_audio(
         if not wav_path.is_file() or wav_path.stat().st_size == 0:
             raise DownloadError("audio extraction produced empty output")
 
-        LOGGER.info("Transcribing %s...", input_path.name)
+        remote_url = os.environ.get("WHISPER_API_URL", "")
+        if remote_url:
+            return await _transcribe_remote(wav_path, language, timeout_seconds)
+
+        model = await _get_whisper_model_async()
+        LOGGER.info("Transcribing %s locally...", input_path.name)
         async with _transcribe_semaphore:
             loop = asyncio.get_running_loop()
             segments_gen, info = await loop.run_in_executor(
