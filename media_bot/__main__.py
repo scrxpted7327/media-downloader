@@ -79,21 +79,58 @@ HELP_TEXT = (
 
 
 class DownloadReporter:
-    """Change the status once yt-dlp starts transferring media bytes."""
+    """Show download progress with an ETA based on transferred percent."""
+
+    _MIN_EDIT_INTERVAL = 0.4
 
     def __init__(self, message) -> None:
         self.message = message
-        self.started = False
+        self.start_time = time.monotonic()
+        self.last_pct = -1
+        self.last_edit = 0.0
 
-    async def progress(self, _: int) -> None:
-        if self.started:
+    async def progress(self, pct: int) -> None:
+        pct = max(0, min(99, int(pct)))
+        now = time.monotonic()
+        if pct == self.last_pct:
             return
-        self.started = True
-        await self.message.edit_text("⬇️ Downloading…")
+        if pct < 99 and (now - self.last_edit) < self._MIN_EDIT_INTERVAL:
+            return
+        self.last_pct = pct
+        self.last_edit = now
+
+        elapsed = now - self.start_time
+        bar_len = 10
+        filled = pct * bar_len // 100
+        bar = "▓" * filled + "░" * (bar_len - filled)
+        eta_line = _format_eta_line(elapsed, pct)
+        text = f"⬇️ Downloading…\n{bar} {pct}%\n{eta_line}"
+        try:
+            await self.message.edit_text(text)
+        except Exception:
+            pass
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m {seconds % 60}s"
+
+
+def _format_eta_line(elapsed: float, pct: int) -> str:
+    if pct <= 0 or elapsed < 1:
+        return "⏱ calculating…"
+    eta_seconds = elapsed * (100 - pct) / pct
+    if eta_seconds <= 0:
+        return "⏱ almost done"
+    return f"⏱ {_format_duration(eta_seconds)} left"
 
 
 class _ProgressReporter:
     """Reports rendering progress to a Telegram message with step names and ETA."""
+
+    _MIN_EDIT_INTERVAL = 0.4
 
     def __init__(self, message, steps: list[str]) -> None:
         self.message = message
@@ -101,6 +138,7 @@ class _ProgressReporter:
         self.start_time = time.monotonic()
         self.step_idx = 0
         self.last_pct = -1
+        self.last_edit = 0.0
 
     def set_step(self, idx: int) -> None:
         self.step_idx = idx
@@ -114,25 +152,13 @@ class _ProgressReporter:
         overall = int(step_idx * step_weight + (pct * step_weight / 100.0))
         overall = min(99, overall)
 
+        now = time.monotonic()
         if overall == self.last_pct:
             return
+        if overall < 99 and (now - self.last_edit) < self._MIN_EDIT_INTERVAL:
+            return
         self.last_pct = overall
-
-        if overall > 0 and elapsed > 5:
-            eta_seconds = elapsed * (100 - overall) / overall
-            if eta_seconds > 60:
-                eta_str = f" (~{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s)"
-            elif eta_seconds > 0:
-                eta_str = f" (~{int(eta_seconds)}s)"
-            else:
-                eta_str = ""
-        else:
-            eta_str = ""
-
-        if elapsed < 60:
-            elapsed_str = f"{int(elapsed)}s"
-        else:
-            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+        self.last_edit = now
 
         bar_len = 10
         filled = overall * bar_len // 100
@@ -141,7 +167,7 @@ class _ProgressReporter:
         text = (
             f"🎬 Step {step_idx + 1}/{len(self.steps)}: {step_name}\n"
             f"{bar} {overall}%\n"
-            f"⏱ {elapsed_str}{eta_str}"
+            f"{_format_eta_line(elapsed, overall)}"
         )
         try:
             await self.message.edit_text(text)

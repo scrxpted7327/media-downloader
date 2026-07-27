@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -17,8 +16,6 @@ from .tools import prefer_ffmpeg_full
 prefer_ffmpeg_full()
 
 ProgressCallback = Callable[[int], Awaitable[None]]
-_FFPROGRESS = re.compile(rb"out_time_us=(\d+)")
-_FFPROGRESS_FRAME = re.compile(rb"frame=(\d+)")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -225,6 +222,9 @@ async def _run_ffmpeg_with_progress(
     cmd: list[str], timeout: int, label: str, total_duration_us: int | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> bytes:
+    if cmd and Path(cmd[0]).name.startswith("ffmpeg") and "-progress" not in cmd:
+        cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -233,16 +233,46 @@ async def _run_ffmpeg_with_progress(
         raise DownloadError(f"{label}: process failed") from exc
 
     last_pct = -1
-    stdout_lines: list[bytes] = []
     stderr_lines: list[bytes] = []
 
-    async def _read(stream, dest):
-        while line := await stream.readline():
-            dest.append(line)
+    async def _read_stderr() -> None:
+        assert process.stderr is not None
+        while line := await process.stderr.readline():
+            stderr_lines.append(line)
+
+    async def _read_progress() -> None:
+        nonlocal last_pct
+        assert process.stdout is not None
+        if progress_callback is None or not total_duration_us:
+            # Drain stdout so the process cannot block on a full pipe.
+            while await process.stdout.read(4096):
+                pass
+            return
+        buffer = b""
+        while True:
+            chunk = await process.stdout.read(256)
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"out_time_us="):
+                    continue
+                try:
+                    current_us = int(line.split(b"=", 1)[1])
+                except ValueError:
+                    continue
+                if total_duration_us <= 0:
+                    continue
+                pct = min(99, int(current_us * 100 // total_duration_us))
+                if pct > last_pct:
+                    last_pct = pct
+                    await progress_callback(pct)
 
     readers = (
-        asyncio.create_task(_read(process.stdout, stdout_lines)),
-        asyncio.create_task(_read(process.stderr, stderr_lines)),
+        asyncio.create_task(_read_progress()),
+        asyncio.create_task(_read_stderr()),
     )
 
     try:
@@ -259,18 +289,7 @@ async def _run_ffmpeg_with_progress(
         details = b"".join(stderr_lines).decode("utf-8", "replace").strip().splitlines()[-3:]
         raise DownloadError(f"{label}: {'; '.join(details)[:500]}")
 
-    stderr_text = b"".join(stderr_lines)
-
-    if progress_callback and total_duration_us:
-        for match in _FFPROGRESS.finditer(stderr_text):
-            current_us = int(match.group(1))
-            if total_duration_us > 0:
-                pct = min(99, int(current_us * 100 // total_duration_us))
-                if pct > last_pct:
-                    last_pct = pct
-                    await progress_callback(pct)
-
-    return b"".join(stdout_lines)
+    return b""
 
 
 def _get_duration_us(path: Path) -> int | None:
