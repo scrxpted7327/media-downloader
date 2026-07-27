@@ -164,7 +164,6 @@ def _authorized(update: Update, settings: Settings) -> bool:
 async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
     rows = [
         [InlineKeyboardButton("⬇️ Download Original", callback_data=f"download:orig:{job_id}")],
-        [InlineKeyboardButton("📲 Save to Gallery (iOS)", callback_data=f"download:gallery:{job_id}")],
         [InlineKeyboardButton("✂️ Edit", callback_data=f"download:edit:{job_id}"),
          InlineKeyboardButton("🔄 Reset", callback_data=f"download:reset:{job_id}")],
     ]
@@ -409,32 +408,29 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if action == "gallery":
-        await query.answer()
+        await query.answer("Save to Gallery has been removed.", show_alert=True)
+        return
+
+    if action == "edit":
         source_path = Path(job.file_path)
         if not source_path.is_file():
             await query.answer("Source file missing", show_alert=True)
             return
-        from .storage import get_or_create_user_settings
-        user_settings = await get_or_create_user_settings(db_path, current_user_id)
-        settings = await get_or_create_user_settings(db_path, current_user_id)
-        active_preset = None
-        if settings.preset_name:
-            from .storage import list_presets
-            presets = await list_presets(db_path, current_user_id)
-            active_preset = next((p for p in presets if p.name == settings.preset_name), None)
-        
-        intro = f"Save to Gallery (iOS) - job #{job_id}\n"
-        if active_preset:
-            intro += f"Current preset: {active_preset.name}\n"
-        else:
-            intro += f"Using default settings\n"
-        
-        await query.edit_message_text(
-            intro,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Save to Gallery", callback_data=f"gallery:confirm:{job_id}")],
-                [InlineKeyboardButton("← Back", callback_data=f"download:actions:{job_id}")]
-            ]),
+        await query.answer()
+        edit = await create_edit_job(db_path, job_id, current_user_id, preset_id=None)
+        dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
+        shutil.copy2(source_path, dest)
+        await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
+        context.user_data["settings_flow"] = {
+            "action": "editconfig",
+            "edit_id": edit.id,
+            "source_job_id": job_id,
+        }
+        await show_editconfig_menu(
+            update,
+            context,
+            edit.id,
+            intro=f"🎬 Edit job #{edit.id} created.\nCurrent settings are shown on each button.",
         )
         return
 
@@ -444,7 +440,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await db.execute("DELETE FROM edit_jobs WHERE source_job_id = ? AND user_id = ? AND status IN ('pending', 'rendered')", (job_id, current_user_id))
             await db.commit()
         flow = context.user_data.get("settings_flow")
-        if flow and flow.get("action") == "editconfig":
+        flow_action = flow.get("action") if isinstance(flow, dict) else getattr(flow, "action", None)
+        if flow_action == "editconfig":
             context.user_data.pop("settings_flow", None)
         await query.edit_message_text("Edit config reset for this download.")
         return
