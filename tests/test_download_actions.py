@@ -82,26 +82,6 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_gallery_action_is_gone(self):
-        from media_bot.__main__ import download_callback
-
-        async def run():
-            await init_db(self.db_path)
-            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
-            source = self.storage_dir / "source.mp4"
-            source.write_bytes(b"fake-video")
-            await update_job(self.db_path, job.id, file_path=str(source), status="uploaded")
-
-            update, query = _make_update(f"download:gallery:{job.id}")
-            context = _make_context(self.db_path, self.storage_dir)
-            await download_callback(update, context)
-
-            query.edit_message_text.assert_not_awaited()
-            query.answer.assert_awaited_once()
-            self.assertIn("removed", query.answer.await_args.args[0].lower())
-
-        asyncio.run(run())
-
     def test_secure_link_keyboard_has_no_gallery(self):
         from media_bot.__main__ import _send_secure_link
 

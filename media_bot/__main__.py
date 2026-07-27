@@ -20,8 +20,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-import platform
-
 from .config import Settings
 from .downloader import DownloadError, download_instagram, download_media, download_tiktok_slideshow, persist_download
 from .download_server import create_download_app
@@ -405,10 +403,6 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             settings.token_expiry_minutes * 60,
             data={"chat_id": msg.chat_id, "message_id": msg.message_id, "db_path": str(db_path), "msg_record_id": msg_record_id},
         )
-        return
-
-    if action == "gallery":
-        await query.answer("Save to Gallery has been removed.", show_alert=True)
         return
 
     if action == "edit":
