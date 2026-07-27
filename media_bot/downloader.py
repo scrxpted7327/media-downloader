@@ -132,6 +132,13 @@ async def download_media(
     if result is None:
         temporary.cleanup()
         raise DownloadError("downloader produced no uploadable file")
+    if result.suffix.lower() == ".webm":
+        LOGGER.info("Only .webm available; converting %s to .mp4", result.name)
+        try:
+            result = await _convert_to_mp4(result, timeout_seconds)
+        except DownloadError:
+            temporary.cleanup()
+            raise
     return temporary, result
 
 
@@ -320,7 +327,6 @@ async def download_instagram(
             raise DownloadError(
                 f"Instagram download exceeds the configured {max_filesize_mb} MB size limit"
             )
-        return temporary, result
     except DownloadError as exc:
         temporary.cleanup()
         err_text = str(exc).lower()
@@ -331,6 +337,15 @@ async def download_instagram(
     except Exception as exc:
         temporary.cleanup()
         raise DownloadError(f"Instagram download failed: {exc}") from exc
+
+    if result.suffix.lower() == ".webm":
+        LOGGER.info("Instagram returned .webm; converting %s to .mp4", result.name)
+        try:
+            result = await _convert_to_mp4(result, timeout_seconds)
+        except DownloadError:
+            temporary.cleanup()
+            raise
+    return temporary, result
 
 
 async def _download_instagram_ytdlp(
