@@ -40,6 +40,29 @@ OS package manager (`brew install ffmpeg`, `apt install ffmpeg`, etc.). The bot
 detects it and tells the operator when it is missing; it does not silently
 package or execute an unverified ffmpeg build.
 
+### Optional Ryzen Whisper worker
+
+To offload automatic caption transcription to a Ryzen machine, add these to
+`.env`:
+
+```sh
+WHISPER_SSH_HOST=user@ryzen-ip-or-hostname
+WHISPER_SSH_KEY=/path/to/ssh-key
+```
+
+`WHISPER_SSH_KEY` is optional and defaults to `~/.ssh/id_rsa`. On the Ryzen,
+install `faster-whisper` and configure key-based SSH access so
+`ssh user@ryzen date` completes without a password prompt:
+
+```sh
+pip install faster-whisper
+```
+
+When configured, the bot uses `ssh` in batch mode, streams the temporary WAV
+to standard input, and runs the transcription inline. No Whisper server or
+additional open port is required; the remote temporary WAV is deleted when the
+command finishes.
+
 ## Telegram setup
 
 Disable BotFather privacy mode if the bot must receive ordinary group messages.

@@ -4,8 +4,15 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from media_bot.editor import _image_difference, _get_video_dimensions, _segments_to_srt, render_edit
+from media_bot.editor import (
+    _image_difference,
+    _get_video_dimensions,
+    _segments_to_srt,
+    _transcribe_ssh,
+    render_edit,
+)
 from media_bot.downloader import DownloadError
 
 
@@ -130,6 +137,17 @@ class RenderEditIntegrationTests(unittest.TestCase):
             self.assertTrue(output.is_file(), "channel_banner on portrait produced no output")
         finally:
             tmpdir.cleanup()
+
+
+class RemoteWhisperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requires_ssh_host(self):
+        with (
+            patch.dict("os.environ", {"WHISPER_SSH_HOST": ""}, clear=False),
+            patch("media_bot.editor.asyncio.create_subprocess_exec") as create_process,
+        ):
+            with self.assertRaisesRegex(DownloadError, "WHISPER_SSH_HOST not set"):
+                await _transcribe_ssh(Path(__file__), None, 10)
+        create_process.assert_not_called()
 
 
 if __name__ == "__main__":
