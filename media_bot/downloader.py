@@ -97,6 +97,7 @@ async def download_media(
     command = [
         str(ytdlp), "--no-playlist", "--no-config", "--restrict-filenames", "--max-filesize", f"{max_filesize_mb}M",
         "--socket-timeout", "30", "--retries", "2", "--concurrent-fragments", "4", "--newline",
+        "--format", "bestvideo[ext!=webm]+bestaudio/best[ext!=webm]/best",
         "--output", str(directory / "%(title).120B-%(id)s.%(ext)s"),
         "--print", "after_move:filepath", "--", url,
     ]
@@ -151,6 +152,22 @@ async def _run_checked(command: list[str], timeout_seconds: int, error: str) -> 
         msg = "; ".join(detail)[:600]
         raise DownloadError(f"{error}: {msg} (cmd={cmd_preview})")
     return stdout, stderr
+
+
+async def _convert_to_mp4(path: Path, timeout_seconds: int) -> Path:
+    """Convert a .webm video file to .mp4 using ffmpeg."""
+    if shutil.which("ffmpeg") is None:
+        raise DownloadError(f"ffmpeg is required to convert {path.name}")
+    output = path.with_suffix(".mp4")
+    await _run_checked(
+        ["ffmpeg", "-y", "-i", str(path),
+         "-c:v", _detect_video_encoder(), "-c:a", "aac",
+         "-movflags", "+faststart", str(output)],
+        timeout_seconds,
+        f"failed to convert {path.name} to mp4",
+    )
+    path.unlink(missing_ok=True)
+    return output
 
 
 async def _media_duration(path: Path, timeout_seconds: int) -> float:
