@@ -9,21 +9,6 @@ from .storage import consume_download_token, get_job
 
 LOGGER = logging.getLogger(__name__)
 
-_CONTENT_TYPES = {
-    ".mp4": "video/mp4",
-    ".mov": "video/quicktime",
-    ".webm": "video/webm",
-    ".mkv": "video/x-matroska",
-    ".m4a": "audio/mp4",
-    ".mp3": "audio/mpeg",
-    ".zip": "application/zip",
-    ".srt": "application/x-subrip",
-}
-
-
-def _content_type_for(path: Path) -> str:
-    return _CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
-
 
 async def handle_download(request: web.Request) -> web.Response:
     token = request.match_info.get("token", "")
@@ -57,7 +42,7 @@ async def handle_download(request: web.Request) -> web.Response:
         "X-Content-Type-Options": "nosniff",
     }
     resp = web.FileResponse(file_path, headers=headers)
-    resp.content_type = _content_type_for(file_path)
+    resp.content_type = "application/octet-stream"
     return resp
 
 
