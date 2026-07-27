@@ -24,6 +24,7 @@ class DownloadError(RuntimeError):
 ProgressCallback = Callable[[int], Awaitable[None]]
 _PROGRESS_PATTERN = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _IMAGE_SUFFIXES = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
+_VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv"}
 LOGGER = logging.getLogger(__name__)
 
 _VIDEO_ENCODER: str | None = None
@@ -201,8 +202,12 @@ async def download_tiktok_slideshow(
     timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
-    """Download a TikTok photo post. Renders a video with audio when possible,
-    otherwise packages the images into a ZIP archive."""
+    """Download a TikTok post via gallery-dl.
+
+    Photo posts are rendered to an MP4 slideshow (or ZIP if audio/ffmpeg is
+    unavailable). Video posts — including yt-dlp fallbacks for short links —
+    return the downloaded video file directly.
+    """
     if not gallerydl.is_file() or not os.access(gallerydl, os.X_OK):
         raise DownloadError(f"gallery-dl is required for TikTok photo posts ({url[:80]})")
 
@@ -220,18 +225,29 @@ async def download_tiktok_slideshow(
             f"TikTok slide download failed for {url[:80]}",
         )
         images = sorted(path for path in directory.iterdir() if path.suffix.lower() in _IMAGE_SUFFIXES)
-        if not images:
-            raise DownloadError(f"TikTok post did not contain downloadable slides ({url[:80]})")
+        videos = [path for path in directory.iterdir() if path.suffix.lower() in _VIDEO_SUFFIXES]
 
-        audio = next((path for path in directory.iterdir() if path.name.startswith("audio_")), None)
-        if audio is not None and shutil.which("ffmpeg") is not None:
-            try:
-                return await _render_tiktok_video(directory, images, audio, max_filesize_mb, timeout_seconds, temporary)
-            except DownloadError:
-                LOGGER.warning("TikTok video render failed, falling back to ZIP for %s", url[:80])
+        if images:
+            audio = next((path for path in directory.iterdir() if path.name.startswith("audio_")), None)
+            if audio is not None and shutil.which("ffmpeg") is not None:
+                try:
+                    return await _render_tiktok_video(directory, images, audio, max_filesize_mb, timeout_seconds, temporary)
+                except DownloadError:
+                    LOGGER.warning("TikTok video render failed, falling back to ZIP for %s", url[:80])
 
-        LOGGER.info("Packaging TikTok slides as ZIP for %s", url[:80])
-        return await _package_tiktok_zip(directory, images, max_filesize_mb, temporary)
+            LOGGER.info("Packaging TikTok slides as ZIP for %s", url[:80])
+            return await _package_tiktok_zip(directory, images, max_filesize_mb, temporary)
+
+        if videos:
+            result = max(videos, key=lambda path: path.stat().st_size)
+            if result.stat().st_size > max_filesize_mb * 1024 * 1024:
+                raise DownloadError(f"TikTok download exceeds the configured {max_filesize_mb} MB size limit")
+            if result.suffix.lower() == ".webm":
+                LOGGER.info("TikTok gallery-dl returned .webm; converting %s to .mp4", result.name)
+                result = await _convert_to_mp4(result, timeout_seconds)
+            return temporary, result
+
+        raise DownloadError(f"TikTok post did not contain downloadable media ({url[:80]})")
     except Exception:
         temporary.cleanup()
         raise
@@ -309,7 +325,7 @@ async def download_instagram(
             timeout_seconds,
             "Instagram download failed or timed out",
         )
-        videos = [p for p in directory.iterdir() if p.suffix.lower() in {".mp4", ".mov", ".webm", ".mkv"}]
+        videos = [p for p in directory.iterdir() if p.suffix.lower() in _VIDEO_SUFFIXES]
         if videos:
             result = max(videos, key=lambda p: p.stat().st_size)
         else:

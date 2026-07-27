@@ -1,6 +1,10 @@
+import asyncio
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from media_bot.downloader import download_progress
+from media_bot.downloader import DownloadError, download_progress, download_tiktok_slideshow
 
 
 class DownloadProgressTests(unittest.TestCase):
@@ -9,6 +13,51 @@ class DownloadProgressTests(unittest.TestCase):
 
     def test_ignores_non_progress_output(self):
         self.assertIsNone(download_progress(b"[info] Extracting URL"))
+
+
+class TikTokGalleryDlFallbackTests(unittest.TestCase):
+    def test_accepts_video_when_gallery_dl_returns_mp4(self):
+        """yt-dlp failures fall back to gallery-dl, which may download a video — not slides."""
+
+        async def fake_run(cmd, timeout_seconds, error_prefix):
+            directory = Path(cmd[cmd.index("--directory") + 1])
+            (directory / "video_000.mp4").write_bytes(b"fake-tiktok-video")
+
+        gallerydl = Path(tempfile.gettempdir()) / "fake-gallery-dl"
+        gallerydl.write_text("#!/bin/sh\n")
+        gallerydl.chmod(0o755)
+
+        async def run():
+            with patch("media_bot.downloader._run_checked", new=AsyncMock(side_effect=fake_run)):
+                temporary, media = await download_tiktok_slideshow(
+                    gallerydl, "https://vt.tiktok.com/ZS4J4EmqV", max_filesize_mb=50, timeout_seconds=30,
+                )
+            try:
+                self.assertEqual(media.name, "video_000.mp4")
+                self.assertTrue(media.is_file())
+                self.assertEqual(media.read_bytes(), b"fake-tiktok-video")
+            finally:
+                temporary.cleanup()
+
+        asyncio.run(run())
+
+    def test_errors_when_gallery_dl_returns_neither_images_nor_video(self):
+        async def fake_run(cmd, timeout_seconds, error_prefix):
+            return None
+
+        gallerydl = Path(tempfile.gettempdir()) / "fake-gallery-dl"
+        gallerydl.write_text("#!/bin/sh\n")
+        gallerydl.chmod(0o755)
+
+        async def run():
+            with patch("media_bot.downloader._run_checked", new=AsyncMock(side_effect=fake_run)):
+                with self.assertRaises(DownloadError) as ctx:
+                    await download_tiktok_slideshow(
+                        gallerydl, "https://vt.tiktok.com/empty", max_filesize_mb=50, timeout_seconds=30,
+                    )
+            self.assertIn("downloadable media", str(ctx.exception))
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
