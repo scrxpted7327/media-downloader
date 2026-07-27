@@ -525,7 +525,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     tts_engine=preset.tts_engine,
                     banner_path=Path(preset.banner_path) if preset.banner_path else None,
                     banner_position=preset.banner_position or "bottom",
-                    banner_scale=preset.banner_scale or "fit",
+                    banner_scale=preset.banner_scale or "fill",
                     watermark_removal=preset.watermark_removal,
                     watermark_position=preset.watermark_position or "auto",
                     channel_banner=preset.channel_banner,
@@ -538,37 +538,59 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 await msg.edit_text(f"❌ Render failed: {exc}")
                 return
             await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-            token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
-            url = _build_download_url(settings, token)
-            dl_msg = await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=f"✅ Rendered with \"{preset.name}\" – one-time download ({settings.token_expiry_minutes} min):\n{url}",
-                reply_to_message_id=query.message.message_id,
-                disable_web_page_preview=True,
-            )
-            msg_record_id = await store_download_message(db_path, dl_msg.chat_id, dl_msg.message_id, settings.token_expiry_minutes)
-            context.job_queue.run_once(
-                _delete_expired_link,
-                settings.token_expiry_minutes * 60,
-                data={"chat_id": dl_msg.chat_id, "message_id": dl_msg.message_id, "db_path": str(db_path), "msg_record_id": msg_record_id},
-            )
-            if subtitles_path:
-                srt_token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
-                srt_url = _build_download_url(settings, srt_token)
-                srt_msg = await context.bot.send_message(
+            file_sent = False
+            try:
+                with out_path.open("rb") as f:
+                    await context.bot.send_document(
+                        chat_id=query.message.chat_id,
+                        document=f,
+                        caption=f"✅ Rendered with \"{preset.name}\"",
+                        reply_to_message_id=query.message.message_id,
+                    )
+                file_sent = True
+            except Exception:
+                pass
+            if not file_sent:
+                token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
+                url = _build_download_url(settings, token)
+                dl_msg = await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text=f"📄 Subtitles: {srt_url}",
+                    text=f"✅ Rendered with \"{preset.name}\" – one-time download ({settings.token_expiry_minutes} min):\n{url}",
                     reply_to_message_id=query.message.message_id,
                     disable_web_page_preview=True,
                 )
-                srt_record_id = await store_download_message(db_path, srt_msg.chat_id, srt_msg.message_id, settings.token_expiry_minutes)
+                msg_record_id = await store_download_message(db_path, dl_msg.chat_id, dl_msg.message_id, settings.token_expiry_minutes)
                 context.job_queue.run_once(
                     _delete_expired_link,
                     settings.token_expiry_minutes * 60,
-                    data={"chat_id": srt_msg.chat_id, "message_id": srt_msg.message_id, "db_path": str(db_path), "msg_record_id": srt_record_id},
+                    data={"chat_id": dl_msg.chat_id, "message_id": dl_msg.message_id, "db_path": str(db_path), "msg_record_id": msg_record_id},
                 )
+            if subtitles_path:
+                try:
+                    with Path(subtitles_path).open("rb") as f:
+                        await context.bot.send_document(
+                            chat_id=query.message.chat_id,
+                            document=f,
+                            caption="📄 Subtitles available.",
+                            reply_to_message_id=query.message.message_id,
+                        )
+                except Exception:
+                    srt_token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
+                    srt_url = _build_download_url(settings, srt_token)
+                    srt_msg = await context.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=f"📄 Subtitles: {srt_url}",
+                        reply_to_message_id=query.message.message_id,
+                        disable_web_page_preview=True,
+                    )
+                    srt_record_id = await store_download_message(db_path, srt_msg.chat_id, srt_msg.message_id, settings.token_expiry_minutes)
+                    context.job_queue.run_once(
+                        _delete_expired_link,
+                        settings.token_expiry_minutes * 60,
+                        data={"chat_id": srt_msg.chat_id, "message_id": srt_msg.message_id, "db_path": str(db_path), "msg_record_id": srt_record_id},
+                    )
             try:
-                await msg.edit_text(f"✅ Rendered with \"{preset.name}\" — download link sent above.")
+                await msg.edit_text(f"✅ Rendered with \"{preset.name}\" — file sent above." if file_sent else f"✅ Rendered with \"{preset.name}\" — download link sent above.")
             except Exception:
                 pass
 
@@ -912,7 +934,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         tts_eng = edit.tts_engine if edit.tts_engine is not None else (preset.tts_engine if preset else None)
         b_path = edit.banner_path if edit.banner_path is not None else (preset.banner_path if preset else None)
         b_pos = edit.banner_position if edit.banner_position is not None else (preset.banner_position or "bottom" if preset else "bottom")
-        b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fit" if preset else "fit")
+        b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fill" if preset else "fill")
         wm_removal = edit.watermark_removal
         wm_pos = edit.watermark_position if edit.watermark_position is not None else (preset.watermark_position or "auto" if preset else "auto")
         ch_banner = edit.channel_banner
@@ -961,11 +983,17 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         await msg.edit_text(f"❌ Render failed: {exc}")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-    with out_path.open("rb") as f:
-        await update.effective_message.reply_document(document=f, caption=f"✅ Render complete. Job #{edit.id} ready.")
+    try:
+        with out_path.open("rb") as f:
+            await update.effective_message.reply_document(document=f, caption=f"✅ Render complete. Job #{edit.id} ready.")
+    except Exception as exc:
+        await update.effective_message.reply_text(f"✅ Render complete. Job #{edit.id} ready.\n⚠️ Could not send file: {exc}")
     if subtitles_path:
-        with Path(subtitles_path).open("rb") as f:
-            await update.effective_message.reply_document(document=f, caption="📄 Subtitles available.")
+        try:
+            with Path(subtitles_path).open("rb") as f:
+                await update.effective_message.reply_document(document=f, caption="📄 Subtitles available.")
+        except Exception as exc:
+            await update.effective_message.reply_text(f"📄 Subtitles available.\n⚠️ Could not send file: {exc}")
 
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

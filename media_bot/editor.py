@@ -646,7 +646,7 @@ async def render_banner(
     output_path: Path,
     banner_path: Path,
     position: str = "bottom",
-    scale: str = "fit",
+    scale: str = "fill",
     timeout_seconds: int = 600,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
@@ -1023,7 +1023,7 @@ async def render_edit(
     tts_engine: str | None = None,
     banner_path: Path | None = None,
     banner_position: str = "bottom",
-    banner_scale: str = "fit",
+    banner_scale: str = "fill",
     watermark_removal: bool = False,
     watermark_position: str = "auto",
     channel_banner: bool = False,

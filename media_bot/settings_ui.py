@@ -80,7 +80,7 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
     ],
     "tts_engine": [("🔊 edge-tts", "edge-tts"), ("🗣️ espeak-ng", "espeak-ng"), ("🤖 Auto", "auto")],
     "banner_position": [("⬆️ Top", "top"), ("⬇️ Bottom", "bottom"), ("🖼️ Overlay", "overlay")],
-    "banner_scale": [("📐 Fit", "fit"), ("↔️ Stretch", "stretch"), ("⬜ Fill", "fill")],
+    "banner_scale": [("⬜ Fill", "fill"), ("📐 Fit", "fit"), ("↔️ Stretch", "stretch")],
     "watermark_position": [
         ("🪄 Auto", "auto"),
         ("↖️ Top-left", "top-left"),
@@ -709,7 +709,7 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     flow: FlowState = context.user_data.get("settings_flow")
     if flow is None or not update.message or not update.message.photo:
         return False
-    if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner"):
+    if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD):
         return False
     user = update.effective_user
     if user is None:
@@ -733,6 +733,14 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
         flow.data["banner_path"] = str(dest)
         flow.action = _State.PRESET_CREATE_BANNER_MENU
         await update.message.reply_text("Banner saved!", reply_markup=_banner_menu_keyboard("preset_create:banner"))
+        return True
+
+    if flow.action == _State.PRESET_EDIT_FIELD and flow.data.get("field_name") == "banner_path":
+        preset_id = flow.data.get("preset_id")
+        if preset_id is not None:
+            await _apply_preset_edit(update, context, preset_id, "banner_path", str(dest))
+        else:
+            await update.message.reply_text("Could not determine which preset to update.")
         return True
 
     return False
@@ -829,9 +837,23 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     except ValueError:
                         await update.message.reply_text("Enter a number between 0.5 and 2.0")
                         return True
-            if field_name == "banner_path" and value is not None and not value.startswith("http"):
-                await update.message.reply_text("Send a URL for the banner image, or /skip to clear")
-                return True
+            if field_name == "banner_path" and value is not None:
+                if value.startswith("http"):
+                    import urllib.request
+                    storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
+                    banners_dir = storage_dir / "banners"
+                    banners_dir.mkdir(parents=True, exist_ok=True)
+                    banner_dest = banners_dir / f"banner_{user.id}_{preset_id}.png"
+                    try:
+                        await update.message.reply_text("Downloading banner image...")
+                        urllib.request.urlretrieve(value, banner_dest)
+                        value = str(banner_dest)
+                    except Exception as exc:
+                        await update.message.reply_text(f"Failed to download banner: {exc}")
+                        return True
+                elif not Path(value).is_file():
+                    await update.message.reply_text("Banner image file not found. Send a URL, a valid local path, or /skip to clear.")
+                    return True
             await _apply_preset_edit(update, context, preset_id, field_name, value)
             return True
 
