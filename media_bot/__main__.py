@@ -260,9 +260,14 @@ def _authorized(update: Update, settings: Settings) -> bool:
 
 
 async def _download_actions_keyboard(
-    job_id: int, db_path: Path, user_id: int
+    job_id: int,
+    db_path: Path,
+    user_id: int,
+    pool_owner_id: int | None = None,
 ) -> InlineKeyboardMarkup:
-    saved = await get_saved_source_pool_item(db_path, user_id, job_id)
+    saved = await get_saved_source_pool_item(
+        db_path, pool_owner_id if pool_owner_id is not None else user_id, job_id
+    )
     rows = [
         [InlineKeyboardButton("⬇️ Download Original", callback_data=f"download:orig:{job_id}")],
         [InlineKeyboardButton("✂️ Edit", callback_data=f"download:edit:{job_id}"),
@@ -312,7 +317,12 @@ def _render_pool_keyboard(edit_id: int, *, saved: bool) -> InlineKeyboardMarkup:
 
 
 async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
-    keyboard = await _download_actions_keyboard(job_id, db_path, user_id)
+    pool_owner_id = _pool_owner_for_chat(
+        getattr(status_message, "chat", None), user_id
+    )
+    keyboard = await _download_actions_keyboard(
+        job_id, db_path, user_id, pool_owner_id
+    )
     job = await get_job(db_path, job_id)
     details = []
     if job and job.title:
@@ -341,6 +351,16 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
 def _build_download_url(settings: Settings, token: str) -> str:
     domain = settings.download_domain or "localhost"
     return f"https://{domain}/download/{token}"
+
+
+def _pool_owner_for_chat(chat, fallback_user_id: int) -> int:
+    if (
+        chat is not None
+        and getattr(chat, "type", None) in {"group", "supergroup", "channel"}
+        and isinstance(getattr(chat, "id", None), int)
+    ):
+        return chat.id
+    return fallback_user_id
 
 
 async def _delete_expired_link(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -515,18 +535,21 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     current_user_id = query.from_user.id
+    pool_owner_id = _pool_owner_for_chat(
+        getattr(query.message, "chat", None), current_user_id
+    )
 
     if action in {"editsave", "editunsaveconfirm", "editunsave", "editunsavecancel"}:
         edit = await get_edit_job(db_path, job_id)
         if edit is None or edit.user_id != current_user_id or not edit.file_path:
             await query.answer("Rendered edit not found", show_alert=True)
             return
-        saved = await get_saved_edit_pool_item(db_path, current_user_id, edit.id)
+        saved = await get_saved_edit_pool_item(db_path, pool_owner_id, edit.id)
         if action == "editsave":
             if saved is None:
                 saved = await create_pool_item(
                     db_path,
-                    current_user_id,
+                    pool_owner_id,
                     edit.file_path,
                     source_job_id=edit.source_job_id,
                     edit_job_id=edit.id,
@@ -555,7 +578,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         if action == "editunsave":
             if saved is not None:
-                await delete_pool_item(db_path, saved.id, current_user_id)
+                await delete_pool_item(db_path, saved.id, pool_owner_id)
             await query.answer("Removed from pool")
             await query.edit_message_reply_markup(
                 reply_markup=_render_pool_keyboard(edit.id, saved=False)
@@ -573,11 +596,11 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if action == "poolsave":
-        saved = await get_saved_source_pool_item(db_path, current_user_id, job.id)
+        saved = await get_saved_source_pool_item(db_path, pool_owner_id, job.id)
         if saved is None:
             await create_pool_item(
                 db_path,
-                current_user_id,
+                pool_owner_id,
                 job.file_path,
                 source_job_id=job.id,
                 file_size=job.file_size,
@@ -586,7 +609,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
         await query.answer("Original saved to pool")
         await query.edit_message_reply_markup(
-            reply_markup=await _download_actions_keyboard(job.id, db_path, current_user_id)
+            reply_markup=await _download_actions_keyboard(
+                job.id, db_path, current_user_id, pool_owner_id
+            )
         )
         return
 
@@ -607,12 +632,14 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if action == "poolremove":
-        saved = await get_saved_source_pool_item(db_path, current_user_id, job.id)
+        saved = await get_saved_source_pool_item(db_path, pool_owner_id, job.id)
         if saved is not None:
-            await delete_pool_item(db_path, saved.id, current_user_id)
+            await delete_pool_item(db_path, saved.id, pool_owner_id)
         await query.answer("Original removed from pool")
         await query.edit_message_reply_markup(
-            reply_markup=await _download_actions_keyboard(job.id, db_path, current_user_id)
+            reply_markup=await _download_actions_keyboard(
+                job.id, db_path, current_user_id, pool_owner_id
+            )
         )
         return
 
@@ -639,7 +666,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "actions":
         await query.answer()
         await query.edit_message_reply_markup(
-            reply_markup=await _download_actions_keyboard(job_id, db_path, current_user_id)
+            reply_markup=await _download_actions_keyboard(
+                job_id, db_path, current_user_id, pool_owner_id
+            )
         )
         return
 

@@ -19,6 +19,7 @@ from media_bot.storage import (
     get_edit_job,
     init_db,
     list_presets,
+    list_pool_items,
     update_edit_job,
     update_job,
 )
@@ -155,6 +156,35 @@ class DownloadEditActionTests(unittest.TestCase):
                 confirm_markup.inline_keyboard[0][0].text,
                 "⚠️ Confirm Unsave",
             )
+
+        asyncio.run(run())
+
+    def test_group_pool_saves_to_shared_chat_scope(self):
+        from media_bot.__main__ import download_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, -100)
+            source = self.storage_dir / "source.mp4"
+            source.write_bytes(b"video")
+            await update_job(
+                self.db_path,
+                job.id,
+                file_path=str(source),
+                file_size=source.stat().st_size,
+                status="uploaded",
+            )
+            update, query = _make_update(f"download:poolsave:{job.id}")
+            shared_chat = SimpleNamespace(id=-100, type="supergroup")
+            update.effective_chat = shared_chat
+            query.message.chat = shared_chat
+            query.edit_message_reply_markup = AsyncMock()
+            context = _make_context(self.db_path, self.storage_dir)
+
+            await download_callback(update, context)
+
+            self.assertEqual(len(await list_pool_items(self.db_path, -100)), 1)
+            self.assertEqual(len(await list_pool_items(self.db_path, 1)), 0)
 
         asyncio.run(run())
 
