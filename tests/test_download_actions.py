@@ -10,6 +10,7 @@ from media_bot.settings_ui import (
     _State,
     _handle_preset_create_callback,
     build_editconfig_keyboard,
+    settings_photo_handler,
 )
 from media_bot.storage import (
     create_edit_job,
@@ -197,6 +198,45 @@ class DownloadEditActionTests(unittest.TestCase):
             self.assertEqual(presets[0].name, "test")
             self.assertTrue(presets[0].channel_banner)
             self.assertEqual(flow.action, _State.PRESET_LIST)
+
+        asyncio.run(run())
+
+    def test_banner_upload_accepts_an_image_sent_as_a_document(self):
+        async def run():
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = FlowState(
+                action=_State.PRESET_CREATE_BANNER,
+            )
+            telegram_file = MagicMock()
+            telegram_file.download_to_drive = AsyncMock()
+            document = SimpleNamespace(
+                file_name="uploaded-banner.png",
+                file_size=2_100_000,
+                mime_type="image/png",
+                get_file=AsyncMock(return_value=telegram_file),
+            )
+            message = MagicMock()
+            message.photo = []
+            message.document = document
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.message = message
+            update.effective_user = SimpleNamespace(id=1)
+
+            handled = await settings_photo_handler(update, context)
+
+            self.assertTrue(handled)
+            destination = telegram_file.download_to_drive.await_args.args[0]
+            self.assertEqual(destination, self.storage_dir / "banners" / "banner_1.png")
+            self.assertEqual(
+                context.user_data["settings_flow"].data["banner_path"],
+                str(destination),
+            )
+            self.assertEqual(
+                context.user_data["settings_flow"].action,
+                _State.PRESET_CREATE_BANNER_MENU,
+            )
+            message.reply_text.assert_awaited_once()
 
         asyncio.run(run())
 
