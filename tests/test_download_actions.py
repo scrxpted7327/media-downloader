@@ -5,8 +5,22 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from media_bot.settings_ui import build_editconfig_keyboard
-from media_bot.storage import create_edit_job, create_job, get_edit_job, init_db, update_job
+from media_bot.settings_ui import (
+    FlowState,
+    _State,
+    _handle_preset_create_callback,
+    build_editconfig_keyboard,
+)
+from media_bot.storage import (
+    create_edit_job,
+    create_job,
+    create_preset,
+    get_edit_job,
+    init_db,
+    list_presets,
+    update_edit_job,
+    update_job,
+)
 
 
 def _make_update(callback_data: str, user_id: int = 1):
@@ -160,6 +174,61 @@ class DownloadEditActionTests(unittest.TestCase):
             markup = query.edit_message_text.await_args.kwargs["reply_markup"]
             labels = [button.text for row in markup.inline_keyboard for button in row]
             self.assertIn("✅ Auto Captions", labels)
+
+        asyncio.run(run())
+
+    def test_channel_banner_buttons_finalize_preset_creation(self):
+        async def run():
+            await init_db(self.db_path)
+            update, query = _make_update(
+                f"preset_create:yes:{_State.PRESET_CREATE_CHANNEL_BANNER}"
+            )
+            context = _make_context(self.db_path, self.storage_dir)
+            flow = FlowState(
+                action=_State.PRESET_CREATE_CHANNEL_BANNER,
+                data={"name": "test", "caption_color": "white"},
+            )
+            context.user_data["settings_flow"] = flow
+
+            await _handle_preset_create_callback(update, context, flow, query)
+
+            presets = await list_presets(self.db_path, 1)
+            self.assertEqual(len(presets), 1)
+            self.assertEqual(presets[0].name, "test")
+            self.assertTrue(presets[0].channel_banner)
+            self.assertEqual(flow.action, _State.PRESET_LIST)
+
+        asyncio.run(run())
+
+    def test_edit_config_can_overwrite_existing_preset(self):
+        from media_bot.settings_ui import handle_editconfig_callback
+
+        async def run():
+            await init_db(self.db_path)
+            preset = await create_preset(
+                self.db_path,
+                1,
+                "Existing",
+                caption_color="white",
+                auto_captions=False,
+            )
+            edit = await create_edit_job(self.db_path, source_job_id=42, user_id=1)
+            await update_edit_job(
+                self.db_path,
+                edit.id,
+                caption_color="#800080",
+                auto_captions=True,
+            )
+            update, _ = _make_update(
+                f"editcfg:{edit.id}:save_preset:{preset.id}"
+            )
+            context = _make_context(self.db_path, self.storage_dir)
+
+            await handle_editconfig_callback(update, context)
+
+            updated = (await list_presets(self.db_path, 1))[0]
+            self.assertEqual(updated.caption_color, "#800080")
+            self.assertTrue(updated.auto_captions)
 
         asyncio.run(run())
 
