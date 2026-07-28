@@ -34,11 +34,14 @@ from media_bot.storage import (
     get_job,
     get_or_create_classification,
     get_pool_item,
+    get_saved_edit_pool_item,
+    get_saved_source_pool_item,
     get_preset_by_share_code,
     get_workflow,
     init_db,
     list_classifications,
     list_pool_items,
+    list_saved_edits_for_source,
     list_pool_tags,
     list_presets,
     list_source_jobs_for_user,
@@ -286,6 +289,42 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(updated.title, "new title")
             items = await list_pool_items(self.db_path, 1)
             self.assertEqual(len(items), 1)
+
+        asyncio.run(run())
+
+    def test_pool_groups_original_with_saved_edits(self):
+        import asyncio
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            original = await create_pool_item(
+                self.db_path,
+                1,
+                "/tmp/original.mp4",
+                source_job_id=job.id,
+                title="Original",
+            )
+            saved_edit = await create_pool_item(
+                self.db_path,
+                1,
+                "/tmp/edit.mp4",
+                source_job_id=job.id,
+                edit_job_id=edit.id,
+                title="Edit",
+            )
+
+            self.assertEqual(
+                (await get_saved_source_pool_item(self.db_path, 1, job.id)).id,
+                original.id,
+            )
+            self.assertEqual(
+                (await get_saved_edit_pool_item(self.db_path, 1, edit.id)).id,
+                saved_edit.id,
+            )
+            grouped = await list_saved_edits_for_source(self.db_path, 1, job.id)
+            self.assertEqual([item.id for item in grouped], [saved_edit.id])
 
         asyncio.run(run())
 

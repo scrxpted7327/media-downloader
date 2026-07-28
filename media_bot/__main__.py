@@ -65,9 +65,13 @@ from .storage import (
     create_download_token,
     create_edit_job,
     create_job,
+    create_pool_item,
     create_preset,
+    delete_pool_item,
     get_edit_job,
     get_job,
+    get_saved_edit_pool_item,
+    get_saved_source_pool_item,
     init_db,
     list_all_jobs,
     list_presets,
@@ -170,7 +174,13 @@ def _retry_seconds(value) -> float:
     return value.total_seconds() if hasattr(value, "total_seconds") else float(value)
 
 
-async def _send_document_with_retry(message, path: Path, caption: str, timeout: int) -> None:
+async def _send_document_with_retry(
+    message,
+    path: Path,
+    caption: str,
+    timeout: int,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     """Send a document, honoring Telegram's requested flood-control delay."""
     for attempt in range(2):
         try:
@@ -178,6 +188,7 @@ async def _send_document_with_retry(message, path: Path, caption: str, timeout: 
                 await message.reply_document(
                     document=document,
                     caption=caption,
+                    reply_markup=reply_markup,
                     read_timeout=timeout,
                     write_timeout=timeout,
                     connect_timeout=timeout,
@@ -248,11 +259,22 @@ def _authorized(update: Update, settings: Settings) -> bool:
     return bool(user and user.id in settings.allowed_user_ids) or chat.id in settings.allowed_chat_ids
 
 
-async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
+async def _download_actions_keyboard(
+    job_id: int, db_path: Path, user_id: int
+) -> InlineKeyboardMarkup:
+    saved = await get_saved_source_pool_item(db_path, user_id, job_id)
     rows = [
         [InlineKeyboardButton("⬇️ Download Original", callback_data=f"download:orig:{job_id}")],
         [InlineKeyboardButton("✂️ Edit", callback_data=f"download:edit:{job_id}"),
          InlineKeyboardButton("🔄 Reset", callback_data=f"download:reset:{job_id}")],
+        [InlineKeyboardButton(
+            "🗑️ Remove Original from Pool" if saved else "💾 Save Original to Pool",
+            callback_data=(
+                f"download:poolremoveconfirm:{job_id}"
+                if saved
+                else f"download:poolsave:{job_id}"
+            ),
+        )],
     ]
     from .storage import get_or_create_user_settings, list_presets
     presets = await list_presets(db_path, user_id)
@@ -273,7 +295,24 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
             f"📦 More presets ({len(ordered) - 3})",
             callback_data=f"download:presets:{job_id}",
         )])
-    keyboard = InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(rows)
+
+
+def _render_pool_keyboard(edit_id: int, *, saved: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "🗑️ Unsave from Pool" if saved else "💾 Save to Pool",
+            callback_data=(
+                f"download:editunsaveconfirm:{edit_id}"
+                if saved
+                else f"download:editsave:{edit_id}"
+            ),
+        )
+    ]])
+
+
+async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
+    keyboard = await _download_actions_keyboard(job_id, db_path, user_id)
     job = await get_job(db_path, job_id)
     details = []
     if job and job.title:
@@ -475,12 +514,107 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer("Invalid job", show_alert=True)
         return
 
+    current_user_id = query.from_user.id
+
+    if action in {"editsave", "editunsaveconfirm", "editunsave", "editunsavecancel"}:
+        edit = await get_edit_job(db_path, job_id)
+        if edit is None or edit.user_id != current_user_id or not edit.file_path:
+            await query.answer("Rendered edit not found", show_alert=True)
+            return
+        saved = await get_saved_edit_pool_item(db_path, current_user_id, edit.id)
+        if action == "editsave":
+            if saved is None:
+                saved = await create_pool_item(
+                    db_path,
+                    current_user_id,
+                    edit.file_path,
+                    source_job_id=edit.source_job_id,
+                    edit_job_id=edit.id,
+                    file_size=edit.file_size,
+                    title=f"Edit #{edit.id}",
+                )
+            await query.answer("Saved to pool")
+            await query.edit_message_reply_markup(
+                reply_markup=_render_pool_keyboard(edit.id, saved=True)
+            )
+            return
+        if action == "editunsaveconfirm":
+            await query.answer()
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "⚠️ Confirm Unsave",
+                        callback_data=f"download:editunsave:{edit.id}",
+                    ),
+                    InlineKeyboardButton(
+                        "Cancel",
+                        callback_data=f"download:editunsavecancel:{edit.id}",
+                    ),
+                ]])
+            )
+            return
+        if action == "editunsave":
+            if saved is not None:
+                await delete_pool_item(db_path, saved.id, current_user_id)
+            await query.answer("Removed from pool")
+            await query.edit_message_reply_markup(
+                reply_markup=_render_pool_keyboard(edit.id, saved=False)
+            )
+            return
+        await query.answer("Kept saved")
+        await query.edit_message_reply_markup(
+            reply_markup=_render_pool_keyboard(edit.id, saved=saved is not None)
+        )
+        return
+
     job = await get_job(db_path, job_id)
     if job is None or job.file_path is None:
         await query.answer("File not found", show_alert=True)
         return
 
-    current_user_id = query.from_user.id
+    if action == "poolsave":
+        saved = await get_saved_source_pool_item(db_path, current_user_id, job.id)
+        if saved is None:
+            await create_pool_item(
+                db_path,
+                current_user_id,
+                job.file_path,
+                source_job_id=job.id,
+                file_size=job.file_size,
+                thumbnail_path=job.thumbnail_path,
+                title=job.title or f"Original #{job.id}",
+            )
+        await query.answer("Original saved to pool")
+        await query.edit_message_reply_markup(
+            reply_markup=await _download_actions_keyboard(job.id, db_path, current_user_id)
+        )
+        return
+
+    if action == "poolremoveconfirm":
+        await query.answer()
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "⚠️ Confirm Remove",
+                    callback_data=f"download:poolremove:{job.id}",
+                ),
+                InlineKeyboardButton(
+                    "Cancel",
+                    callback_data=f"download:actions:{job.id}",
+                ),
+            ]])
+        )
+        return
+
+    if action == "poolremove":
+        saved = await get_saved_source_pool_item(db_path, current_user_id, job.id)
+        if saved is not None:
+            await delete_pool_item(db_path, saved.id, current_user_id)
+        await query.answer("Original removed from pool")
+        await query.edit_message_reply_markup(
+            reply_markup=await _download_actions_keyboard(job.id, db_path, current_user_id)
+        )
+        return
 
     if action == "presets":
         await query.answer()
@@ -504,7 +638,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "actions":
         await query.answer()
-        await _send_secure_link(query.message, job_id, db_path, current_user_id)
+        await query.edit_message_reply_markup(
+            reply_markup=await _download_actions_keyboard(job_id, db_path, current_user_id)
+        )
         return
 
     if action == "orig":
@@ -640,6 +776,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         document=f,
                         caption=f"✅ Rendered with \"{preset.name}\"",
                         reply_to_message_id=query.message.message_id,
+                        reply_markup=_render_pool_keyboard(edit.id, saved=False),
                     )
                 file_sent = True
             except Exception:
@@ -1136,10 +1273,12 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             out_path,
             f"✅ Render complete. Job #{edit.id} ready.",
             settings.upload_timeout_seconds,
+            _render_pool_keyboard(edit.id, saved=False),
         )
     except Exception as exc:
         await update.effective_message.reply_text(
-            f"✅ Render complete. Job #{edit.id} ready.\n⚠️ Could not send file: {exc}"
+            f"✅ Render complete. Job #{edit.id} ready.\n⚠️ Could not send file: {exc}",
+            reply_markup=_render_pool_keyboard(edit.id, saved=False),
         )
     if subtitles_path:
         try:
