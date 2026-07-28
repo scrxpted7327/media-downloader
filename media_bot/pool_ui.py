@@ -49,6 +49,15 @@ async def _answer_callback(query, text: str | None = None, *, show_alert: bool =
         raise
 
 
+def _pool_owner_id(update: Update) -> int | None:
+    """Use the chat as the pool owner outside private conversations."""
+    chat = update.effective_chat
+    if chat is not None and getattr(chat, "type", "private") != "private":
+        return chat.id
+    user = update.effective_user
+    return user.id if user is not None else None
+
+
 class _State:
     MENU = "pool_menu"
     POOL_LIST = "pool_list"
@@ -173,8 +182,8 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pool_item_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
         item = await get_pool_item(db_path, pool_item_id)
-        user = update.effective_user
-        if item is None or user is None or item.user_id != user.id:
+        owner_id = _pool_owner_id(update)
+        if item is None or owner_id is None or item.user_id != owner_id:
             await _answer_callback(query, "Pool item not found", show_alert=True)
             return
         path = Path(item.file_path)
@@ -201,10 +210,10 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pool_item_id = int(parts[2])
         classification_id = int(parts[3])
         db_path: Path = context.application.bot_data["db_path"]
-        user = update.effective_user
+        owner_id = _pool_owner_id(update)
         item = await get_pool_item(db_path, pool_item_id)
-        if user and item and item.user_id == user.id:
-            tag = await add_pool_tag(db_path, pool_item_id, classification_id, user.id)
+        if owner_id is not None and item and item.user_id == owner_id:
+            tag = await add_pool_tag(db_path, pool_item_id, classification_id, owner_id)
             if tag:
                 await _answer_callback(query, "Tagged")
             else:
@@ -221,12 +230,12 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pool_item_id = int(parts[2])
         classification_id = int(parts[3])
         db_path: Path = context.application.bot_data["db_path"]
-        user = update.effective_user
+        owner_id = _pool_owner_id(update)
         item = await get_pool_item(db_path, pool_item_id)
         removed = bool(
-            user
+            owner_id is not None
             and item
-            and item.user_id == user.id
+            and item.user_id == owner_id
             and await remove_pool_tag(db_path, pool_item_id, classification_id)
         )
         await _answer_callback(query, "Removed" if removed else "Not found")
@@ -239,12 +248,12 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pool_item_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
         storage_dir: Path = context.application.bot_data["storage_dir"]
-        user = update.effective_user
+        owner_id = _pool_owner_id(update)
         result = (
             await delete_durable_pool_item(
-                db_path, storage_dir, pool_item_id, user.id,
+                db_path, storage_dir, pool_item_id, owner_id,
             )
-            if user else None
+            if owner_id is not None else None
         )
         if result and result.records_deleted:
             await _answer_callback(query, "Deleted")
@@ -264,9 +273,9 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         wf_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
         wf = await get_workflow(db_path, wf_id)
-        user = update.effective_user
-        if wf and user and wf.user_id == user.id:
-            await update_workflow(db_path, wf_id, user.id, enabled=not wf.enabled)
+        owner_id = _pool_owner_id(update)
+        if wf and owner_id is not None and wf.user_id == owner_id:
+            await update_workflow(db_path, wf_id, owner_id, enabled=not wf.enabled)
             await _answer_callback(query, "Updated")
         else:
             await _answer_callback(query, "Workflow not found", show_alert=True)
@@ -276,8 +285,8 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if query.data.startswith("workflow:delete:"):
         wf_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
-        user = update.effective_user
-        if user and await delete_workflow(db_path, wf_id, user.id):
+        owner_id = _pool_owner_id(update)
+        if owner_id is not None and await delete_workflow(db_path, wf_id, owner_id):
             await _answer_callback(query, "Deleted")
         else:
             await _answer_callback(query, "Failed", show_alert=True)
@@ -370,11 +379,13 @@ async def _show_add_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     flow: FlowState = context.user_data["pool_flow"]
     db_path: Path = context.application.bot_data["db_path"]
-    user = update.effective_user
-    if user is None:
+    owner_id = _pool_owner_id(update)
+    if owner_id is None:
         return
     filter_id = flow.data.get("filter_classification_id")
-    items = await list_pool_items(db_path, user.id, classification_id=filter_id, limit=50)
+    items = await list_pool_items(
+        db_path, owner_id, classification_id=filter_id, limit=50
+    )
     total = len(items)
     start = flow.page * _PAGE_SIZE
     page = items[start:start + _PAGE_SIZE]
@@ -413,9 +424,9 @@ async def _show_pool_item(
     update: Update, context: ContextTypes.DEFAULT_TYPE, pool_item_id: int
 ) -> None:
     db_path: Path = context.application.bot_data["db_path"]
-    user = update.effective_user
+    owner_id = _pool_owner_id(update)
     item = await get_pool_item(db_path, pool_item_id)
-    if item is None or user is None or item.user_id != user.id:
+    if item is None or owner_id is None or item.user_id != owner_id:
         await _edit_or_send(
             update,
             "Pool item not found.",
@@ -428,7 +439,7 @@ async def _show_pool_item(
     related = []
     if item.source_job_id is not None:
         related = await list_saved_edits_for_source(
-            db_path, user.id, item.source_job_id
+            db_path, owner_id, item.source_job_id
         )
 
     rows = [[
@@ -476,9 +487,9 @@ async def _show_classify_select(update: Update, context: ContextTypes.DEFAULT_TY
         ]))
         return
 
-    user = update.effective_user
+    owner_id = _pool_owner_id(update)
     item = await get_pool_item(db_path, pool_item_id)
-    if item is None or user is None or item.user_id != user.id:
+    if item is None or owner_id is None or item.user_id != owner_id:
         await _edit_or_send(update, "Pool item not found.", InlineKeyboardMarkup([
             [InlineKeyboardButton("← Back", callback_data="pool:list")],
         ]))
@@ -512,10 +523,10 @@ async def _show_classify_select(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def _show_workflow_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db_path: Path = context.application.bot_data["db_path"]
-    user = update.effective_user
-    if user is None:
+    owner_id = _pool_owner_id(update)
+    if owner_id is None:
         return
-    workflows = await list_workflows(db_path, user.id)
+    workflows = await list_workflows(db_path, owner_id)
     rows = []
     for wf in workflows:
         status = "ON" if wf.enabled else "OFF"
@@ -547,6 +558,9 @@ async def _add_pool_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user = update.effective_user
     if user is None:
         return
+    owner_id = _pool_owner_id(update)
+    if owner_id is None:
+        return
     flow: FlowState = context.user_data["pool_flow"]
     source_job_id = flow.data.get("source_job_id")
     file_path = flow.data.get("file_path")
@@ -568,7 +582,7 @@ async def _add_pool_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
     pool_item = await create_durable_pool_item(
         db_path,
         context.application.bot_data["storage_dir"],
-        user.id,
+        owner_id,
         Path(source.file_path),
         source_job_id=source_job_id,
         title=title,
@@ -580,13 +594,13 @@ async def _add_pool_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 
 async def _finalize_workflow_create(update: Update, context: ContextTypes.DEFAULT_TYPE, db_path: Path) -> None:
-    user = update.effective_user
-    if user is None:
+    owner_id = _pool_owner_id(update)
+    if owner_id is None:
         return
     flow: FlowState = context.user_data["pool_flow"]
     wf = await create_workflow(
         db_path,
-        user.id,
+        owner_id,
         flow.data["name"],
         flow.data["action_type"],
         trigger_classification_id=flow.data.get("trigger_classification_id"),
