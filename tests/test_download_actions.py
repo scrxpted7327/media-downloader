@@ -119,10 +119,11 @@ class DownloadEditActionTests(unittest.TestCase):
             self.assertFalse(any(label.startswith("📝 Voice Text") for label in labels))
             self.assertFalse(any(label.startswith("⏩ Voice Speed") for label in labels))
             self.assertTrue(any(label.startswith("🎤 Voice Settings [") for label in labels))
-            self.assertIn("[yes]", labels)
-            self.assertIn("✅ [no]", labels)
+            self.assertIn("❌ Auto Captions", labels)
+            self.assertIn("❌ Remove Watermark", labels)
+            self.assertIn("❌ Channel Banner", labels)
             self.assertIn(f"editcfg:{edit.id}:set:auto_captions:yes", callbacks)
-            self.assertIn(f"editcfg:{edit.id}:set:watermark_removal:no", callbacks)
+            self.assertIn(f"editcfg:{edit.id}:set:watermark_removal:yes", callbacks)
             self.assertIn(f"editcfg:{edit.id}:set:channel_banner:yes", callbacks)
 
         asyncio.run(run())
@@ -139,6 +140,26 @@ class DownloadEditActionTests(unittest.TestCase):
             result = await handle_editconfig_callback(update, context)
 
             self.assertEqual(result, ("download", 42))
+
+        asyncio.run(run())
+
+    def test_edit_toggle_updates_and_refreshes_in_one_callback(self):
+        from media_bot.settings_ui import handle_editconfig_callback
+
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=42, user_id=1)
+            update, query = _make_update(f"editcfg:{edit.id}:set:auto_captions:yes")
+            context = _make_context(self.db_path, self.storage_dir)
+
+            await handle_editconfig_callback(update, context)
+
+            updated = await get_edit_job(self.db_path, edit.id)
+            self.assertTrue(updated.auto_captions)
+            query.edit_message_text.assert_awaited()
+            markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+            labels = [button.text for row in markup.inline_keyboard for button in row]
+            self.assertIn("✅ Auto Captions", labels)
 
         asyncio.run(run())
 

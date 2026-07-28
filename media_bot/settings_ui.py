@@ -9,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, PhotoSize, Upda
 from telegram.ext import ContextTypes
 
 from .colors import COLOR_HUES, color_emoji, color_label, shade_options
+from .menu import Menu
 from .storage import (
     EditJob,
     JobRecord,
@@ -248,9 +249,9 @@ def _build_config_rows(
     values: dict[str, Any],
     *,
     field_prefix: str,
+    toggle_prefix: str,
     include_watermark_position: bool = False,
 ) -> list[list[InlineKeyboardButton]]:
-    auto = _fmt_current(values.get("auto_captions"))
     cap_text = _fmt_current(values.get("caption_text"))
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
@@ -258,11 +259,7 @@ def _build_config_rows(
     v_name = _fmt_current(values.get("voice_over_voice") or "default")
     v_quality = _fmt_current(values.get("voice_quality") or "basic")
     b_path = _fmt_current(values.get("banner_path"))
-    wm = _fmt_current(values.get("watermark_removal"))
-    ch = _fmt_current(values.get("channel_banner"))
-
     rows = [
-        [InlineKeyboardButton(f"📝 Auto Captions [{auto}]", callback_data=f"{field_prefix}:auto_captions")],
         [InlineKeyboardButton(f"💬 Caption Text [{cap_text}]", callback_data=f"{field_prefix}:caption_text")],
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
@@ -272,7 +269,6 @@ def _build_config_rows(
             callback_data=f"{field_prefix}:voice_menu",
         )],
         [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
-        [InlineKeyboardButton(f"🚫 Remove Watermark [{wm}]", callback_data=f"{field_prefix}:watermark_removal")],
     ]
     if include_watermark_position:
         wm_pos = _fmt_current(values.get("watermark_position"))
@@ -280,7 +276,19 @@ def _build_config_rows(
             f"🧭 Watermark Position [{wm_pos}]",
             callback_data=f"{field_prefix}:watermark_position",
         )])
-    rows.append([InlineKeyboardButton(f"📺 Channel Banner [{ch}]", callback_data=f"{field_prefix}:channel_banner")])
+    toggles = Menu()
+    for label, field in (
+        ("Auto Captions", "auto_captions"),
+        ("Remove Watermark", "watermark_removal"),
+        ("Channel Banner", "channel_banner"),
+    ):
+        enabled = bool(values.get(field))
+        toggles.toggle(
+            label,
+            enabled,
+            f"{toggle_prefix}:{field}:{'no' if enabled else 'yes'}",
+        )
+    rows.extend(toggles.rows)
     return rows
 
 
@@ -928,7 +936,12 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     active_label = "⭐ Active preset" if is_active else "☆ Set as Active"
 
     values = _config_snapshot(preset)
-    rows = _build_config_rows(values, field_prefix=f"preset:field:{preset.id}", include_watermark_position=True)
+    rows = _build_config_rows(
+        values,
+        field_prefix=f"preset:field:{preset.id}",
+        toggle_prefix=f"preset:set:{preset.id}",
+        include_watermark_position=True,
+    )
     rows.append([InlineKeyboardButton(f"{active_label}", callback_data=f"preset:active:{preset.id}")])
     rows.append([InlineKeyboardButton("🔗 Share", callback_data=f"preset:share:{preset.id}")])
     rows.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"preset:delete:{preset.id}")])
@@ -1271,29 +1284,21 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
             if val is None:
                 values[key] = preset_vals.get(key)
     prefix = f"editcfg:{edit.id}"
-    rows = _build_config_rows(values, field_prefix=prefix, include_watermark_position=True)
+    rows = _build_config_rows(
+        values,
+        field_prefix=prefix,
+        toggle_prefix=f"{prefix}:set",
+        include_watermark_position=True,
+    )
     rows = [
         row for row in rows
         if not row[0].callback_data.endswith(":caption_text")
-        and not any(row[0].callback_data.endswith(f":{field}") for field in _BOOL_FIELDS)
     ]
-    boolean_rows = [
-        ("📝 Auto Captions", "auto_captions"),
-        ("🚫 Remove Watermark", "watermark_removal"),
-        ("📺 Channel Banner", "channel_banner"),
-    ]
-    for label, field in boolean_rows:
-        current = bool(values.get(field))
-        yes_label = "✅ [yes]" if current else "[yes]"
-        no_label = "✅ [no]" if not current else "[no]"
-        rows.append([
-            InlineKeyboardButton(label, callback_data=f"{prefix}:menu"),
-            InlineKeyboardButton(yes_label, callback_data=f"{prefix}:set:{field}:yes"),
-            InlineKeyboardButton(no_label, callback_data=f"{prefix}:set:{field}:no"),
-        ])
-    rows.append([InlineKeyboardButton("🎬 Render now", callback_data=f"{prefix}:render")])
-    rows.append([InlineKeyboardButton("← Back to Download", callback_data=f"{prefix}:download")])
-    return InlineKeyboardMarkup(rows)
+    menu = Menu()
+    menu.rows.extend(rows)
+    menu.action("🎬 Render now", f"{prefix}:render")
+    menu.back(f"{prefix}:download", "← Back to Download")
+    return menu.build()
 
 
 async def show_editconfig_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int, *, intro: str | None = None) -> None:
