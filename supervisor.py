@@ -9,6 +9,7 @@ import re
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +23,34 @@ ERRORS_DIR = Path("runtime/errors")
 FIX_SCRIPTS_DIR = Path("runtime/fix_scripts")
 RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
+EVENTS_PATH = Path("runtime/events.jsonl")
+SUPERVISOR_LOG = Path("runtime/supervisor.log")
+
+
+def append_event(kind: str, message: str, **context) -> None:
+    EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        "message": message[:5000],
+        "source": "supervisor",
+        **context,
+    }
+    with EVENTS_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, default=str) + "\n")
+
+
+async def _capture_stream(stream, name: str, output: deque[str]) -> None:
+    if stream is None:
+        return
+    SUPERVISOR_LOG.parent.mkdir(parents=True, exist_ok=True)
+    while line := await stream.readline():
+        text = line.decode("utf-8", "replace").rstrip()
+        output.append(text)
+        with SUPERVISOR_LOG.open("a", encoding="utf-8") as log:
+            log.write(f"{datetime.now(timezone.utc).isoformat()} {name}: {text}\n")
+        if name == "stderr" or "error" in text.lower() or "failed" in text.lower():
+            append_event("process_output", text, stream=name)
 
 
 def has_traceback(text: str) -> bool:
@@ -104,7 +133,7 @@ async def invoke_opencode_fix(error_id: str, traceback_section: str, workspace: 
     script.write_text(
         "#!/usr/bin/env bash\nset -e\n"
         f"cd {cd}\n"
-        f"opencode --prompt {q}\n"
+        f"opencode run {q}\n"
     )
     script.chmod(0o755)
     return str(script)
@@ -134,29 +163,53 @@ async def supervise(cwd: Path) -> None:
 
     while True:
         LOGGER.info("Starting bot: %s", " ".join(bot_args))
-        proc = await asyncio.create_subprocess_exec(
-            *bot_args,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        append_event("launch_attempt", "Starting bot", command=bot_args, cwd=str(cwd))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *bot_args,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as exc:
+            error_id = f"launch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+            detail = f"{exc.__class__.__name__}: {exc}"
+            await write_error_file(error_id, detail, "launch_failure")
+            append_event("launch_failure", detail, error_id=error_id)
+            LOGGER.exception("Could not launch bot")
+            await asyncio.sleep(RESTART_DELAY)
+            continue
         start_time = time.monotonic()
+        stdout_lines: deque[str] = deque(maxlen=2000)
+        stderr_lines: deque[str] = deque(maxlen=2000)
+        readers = (
+            asyncio.create_task(_capture_stream(proc.stdout, "stdout", stdout_lines)),
+            asyncio.create_task(_capture_stream(proc.stderr, "stderr", stderr_lines)),
+        )
 
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=86400 * 7
-            )
+            await asyncio.wait_for(proc.wait(), timeout=86400 * 7)
         except asyncio.TimeoutError:
             LOGGER.info("Bot running for 7 days, restarting...")
             proc.kill()
             await proc.wait()
+            await asyncio.gather(*readers, return_exceptions=True)
             crash_count = 0
             continue
+        await asyncio.gather(*readers, return_exceptions=True)
 
         duration = time.monotonic() - start_time
         exit_code = proc.returncode or 0
-        stdout_text = stdout_bytes.decode("utf-8", "replace") if stdout_bytes else ""
-        stderr_text = stderr_bytes.decode("utf-8", "replace") if stderr_bytes else ""
+        stdout_text = "\n".join(stdout_lines)
+        stderr_text = "\n".join(stderr_lines)
+        append_event(
+            "process_exit",
+            f"Bot exited with code {exit_code}",
+            exit_code=exit_code,
+            duration_seconds=round(duration, 3),
+            stdout_tail=stdout_text[-5000:],
+            stderr_tail=stderr_text[-10000:],
+        )
         LOGGER.info("Bot exited (code=%s, ran=%.1fs)", exit_code, duration)
 
         if exit_code == 0:

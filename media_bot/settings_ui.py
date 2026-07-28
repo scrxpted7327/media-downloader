@@ -1261,8 +1261,13 @@ async def _start_temp_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def _edit_message(query, text: str, reply_markup=None) -> None:
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
-    except Exception:
-        pass
+        return
+    except Exception as text_error:
+        try:
+            await query.edit_message_caption(caption=text, reply_markup=reply_markup)
+            return
+        except Exception:
+            LOGGER.warning("Could not edit menu message: %s", text_error)
 
 
 async def _edit_or_send(update: Update, text: str, reply_markup=None) -> None:

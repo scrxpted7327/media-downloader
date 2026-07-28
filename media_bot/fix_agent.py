@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -124,7 +125,18 @@ async def _fix_dependency(error_message: str) -> str | None:
     return None
 
 
-async def invoke_opencode_fix(error_info: dict, workspace: Path) -> str | None:
+def validate_model(model: str) -> str:
+    model = model.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._+-]+/[A-Za-z0-9._:/@+-]+", model):
+        raise ValueError("model must use provider/model format")
+    return model
+
+
+async def invoke_opencode_fix(
+    error_info: dict,
+    workspace: Path,
+    model: str | None = None,
+) -> str | None:
     error_id = error_info.get("id", int(time.time()))
     error_message = error_info.get("message", "")
     traceback = error_info.get("traceback", "")
@@ -142,14 +154,31 @@ async def invoke_opencode_fix(error_info: dict, workspace: Path) -> str | None:
 
     fix_script = FIX_SCRIPTS_DIR / f"fix_{error_id}.sh"
     FIX_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+    model_arg = f" --model {shlex_quote(validate_model(model))}" if model else ""
     fix_script.write_text(
         "#!/usr/bin/env bash\n"
         f"set -e\n"
         f"cd {shlex_quote(str(workspace))}\n"
-        f"opencode --prompt {shlex_quote(prompt)}\n",
+        f"opencode run{model_arg} {shlex_quote(prompt)}\n",
     )
     fix_script.chmod(0o755)
     return str(fix_script)
+
+
+async def run_fix_script(script_path: str, timeout: int = 900) -> tuple[int, str]:
+    process = await asyncio.create_subprocess_exec(
+        "/usr/bin/env", "bash", script_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        return -1, "OpenCode repair timed out"
+    output = (stdout + stderr).decode("utf-8", "replace")
+    return process.returncode or 0, output
 
 
 def shlex_quote(s: str) -> str:

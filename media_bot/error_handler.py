@@ -11,6 +11,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from .fix_agent import ERRORS_DIR, categorize_error
+from .diagnostics import append_event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +58,14 @@ async def error_handler(update: Update | None, context: ContextTypes.DEFAULT_TYP
             pass
 
     write_error_log(error_id, error_msg, tb_str, update_data)
+    append_event(
+        "error",
+        error_msg,
+        error_id=error_id,
+        user_id=update_data.get("effective_user") if update_data else None,
+        chat_id=update_data.get("effective_chat") if update_data else None,
+        traceback=tb_str[:5000],
+    )
     LOGGER.error("Error logged: %s — %s", error_id, error_msg)
 
     try:
