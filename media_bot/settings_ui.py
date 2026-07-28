@@ -9,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, PhotoSize, Upda
 from telegram.ext import ContextTypes
 
 from .colors import COLOR_HUES, color_emoji, color_label, shade_options
+from .menu import Menu
 from .storage import (
     EditJob,
     JobRecord,
@@ -24,6 +25,7 @@ from .storage import (
     list_source_jobs_for_user,
     list_user_jobs,
     share_preset,
+    stage_edit_source,
     update_edit_job,
     update_preset,
     update_user_settings,
@@ -208,11 +210,25 @@ def _voice_summary(values: dict[str, Any]) -> str:
     return " ".join(parts) if parts else "none"
 
 
+def _tts_engine_overview(engine: str) -> str:
+    descriptions = {
+        "edge-tts": "Edge TTS uses natural Microsoft neural voices and requires network access.",
+        "espeak-ng": "eSpeak NG is local and reliable, but sounds more synthetic.",
+        "auto": "Auto prefers Edge TTS and falls back to eSpeak NG when needed.",
+    }
+    detail = descriptions.get(engine, "The configured speech engine will generate narration audio.")
+    return (
+        f"🎤 Voice settings\n\n"
+        f"Current TTS engine: {engine}\n{detail}\n\n"
+        "AI visual narration is not available yet, so manual Voice Text is deprecated."
+    )
+
+
 def _voice_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{back_data}:voice_over_voice")],
-        [InlineKeyboardButton("📝 Voice Text", callback_data=f"{back_data}:voice_text")],
         [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{back_data}:voice_quality")],
+        [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{back_data}:voice_speed")],
         [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{back_data}:tts_engine")],
         [InlineKeyboardButton("✅ Done", callback_data=f"{back_data}:done")],
     ]
@@ -233,32 +249,26 @@ def _build_config_rows(
     values: dict[str, Any],
     *,
     field_prefix: str,
+    toggle_prefix: str,
     include_watermark_position: bool = False,
 ) -> list[list[InlineKeyboardButton]]:
-    auto = _fmt_current(values.get("auto_captions"))
     cap_text = _fmt_current(values.get("caption_text"))
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
     pos = _fmt_current(values.get("caption_position"))
-    v_text = _fmt_current(values.get("voice_text"))
-    v_name = _fmt_current(values.get("voice_over_voice"))
-    v_speed = _fmt_current(values.get("voice_speed"))
+    v_name = _fmt_current(values.get("voice_over_voice") or "default")
+    v_quality = _fmt_current(values.get("voice_quality") or "basic")
     b_path = _fmt_current(values.get("banner_path"))
-    wm = _fmt_current(values.get("watermark_removal"))
-    ch = _fmt_current(values.get("channel_banner"))
-
     rows = [
-        [InlineKeyboardButton(f"📝 Auto Captions [{auto}]", callback_data=f"{field_prefix}:auto_captions")],
         [InlineKeyboardButton(f"💬 Caption Text [{cap_text}]", callback_data=f"{field_prefix}:caption_text")],
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
-        [InlineKeyboardButton(f"🎤 Voice Name [{v_name}]", callback_data=f"{field_prefix}:voice_over_voice")],
-        [InlineKeyboardButton(f"📝 Voice Text [{v_text}]", callback_data=f"{field_prefix}:voice_text")],
-        [InlineKeyboardButton(f"⏩ Voice Speed [{v_speed}x]", callback_data=f"{field_prefix}:voice_speed")],
-        [InlineKeyboardButton(f"🎤 Voice Settings…", callback_data=f"{field_prefix}:voice_menu")],
+        [InlineKeyboardButton(
+            f"🎤 Voice Settings [{v_name} {v_quality}]",
+            callback_data=f"{field_prefix}:voice_menu",
+        )],
         [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
-        [InlineKeyboardButton(f"🚫 Remove Watermark [{wm}]", callback_data=f"{field_prefix}:watermark_removal")],
     ]
     if include_watermark_position:
         wm_pos = _fmt_current(values.get("watermark_position"))
@@ -266,7 +276,19 @@ def _build_config_rows(
             f"🧭 Watermark Position [{wm_pos}]",
             callback_data=f"{field_prefix}:watermark_position",
         )])
-    rows.append([InlineKeyboardButton(f"📺 Channel Banner [{ch}]", callback_data=f"{field_prefix}:channel_banner")])
+    toggles = Menu()
+    for label, field in (
+        ("Auto Captions", "auto_captions"),
+        ("Remove Watermark", "watermark_removal"),
+        ("Channel Banner", "channel_banner"),
+    ):
+        enabled = bool(values.get(field))
+        toggles.toggle(
+            label,
+            enabled,
+            f"{toggle_prefix}:{field}:{'no' if enabled else 'yes'}",
+        )
+    rows.extend(toggles.rows)
     return rows
 
 
@@ -600,14 +622,24 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         preset_id = int(parts[2])
         field_name = parts[3]
         if field_name == "voice_menu":
+            preset = await _get_preset(
+                context.application.bot_data["db_path"],
+                query.from_user.id,
+                preset_id,
+            )
+            engine = (preset.tts_engine if preset else None) or "auto"
             rows = [
                 [InlineKeyboardButton("🎤 Voice Name", callback_data=f"preset:field:{preset_id}:voice_over_voice")],
-                [InlineKeyboardButton("📝 Voice Text", callback_data=f"preset:field:{preset_id}:voice_text")],
                 [InlineKeyboardButton("✨ Voice Quality", callback_data=f"preset:field:{preset_id}:voice_quality")],
+                [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"preset:field:{preset_id}:voice_speed")],
                 [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"preset:field:{preset_id}:tts_engine")],
                 [InlineKeyboardButton("✅ Done", callback_data=f"preset:menu:{preset_id}")],
             ]
-            await _edit_message(query, "Voice settings:", InlineKeyboardMarkup(rows))
+            await _edit_message(
+                query,
+                _tts_engine_overview(engine),
+                InlineKeyboardMarkup(rows),
+            )
             return
         if field_name == "banner_menu":
             rows = [
@@ -926,7 +958,12 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     active_label = "⭐ Active preset" if is_active else "☆ Set as Active"
 
     values = _config_snapshot(preset)
-    rows = _build_config_rows(values, field_prefix=f"preset:field:{preset.id}", include_watermark_position=True)
+    rows = _build_config_rows(
+        values,
+        field_prefix=f"preset:field:{preset.id}",
+        toggle_prefix=f"preset:set:{preset.id}",
+        include_watermark_position=True,
+    )
     rows.append([InlineKeyboardButton(f"{active_label}", callback_data=f"preset:active:{preset.id}")])
     rows.append([InlineKeyboardButton("🔗 Share", callback_data=f"preset:share:{preset.id}")])
     rows.append([InlineKeyboardButton("🗑️ Delete", callback_data=f"preset:delete:{preset.id}")])
@@ -1175,9 +1212,8 @@ async def _start_edit_process(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     edit = await create_edit_job(db_path, source_job_id, user.id, preset_id)
     dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
-    import shutil
-    shutil.copy2(source_path, dest)
-    await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
+    file_size = await stage_edit_source(source_path, dest)
+    await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=file_size)
     await update.callback_query.answer("Edit job created")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏊 Add to Pool", callback_data=f"edit:pool:{edit.id}")],
@@ -1206,9 +1242,8 @@ async def _start_temp_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     edit = await create_edit_job(db_path, source_job_id, user.id, preset_id=None)
     dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
-    import shutil
-    shutil.copy2(source_path, dest)
-    await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
+    file_size = await stage_edit_source(source_path, dest)
+    await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=file_size)
     await update.callback_query.answer("Edit job created")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🏊 Add to Pool", callback_data=f"edit:pool:{edit.id}")],
@@ -1271,10 +1306,21 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
             if val is None:
                 values[key] = preset_vals.get(key)
     prefix = f"editcfg:{edit.id}"
-    rows = _build_config_rows(values, field_prefix=prefix, include_watermark_position=True)
-    rows.append([InlineKeyboardButton("🎬 Render now", callback_data=f"{prefix}:render")])
-    rows.append([InlineKeyboardButton("🏠 Menu", callback_data=f"{prefix}:menu")])
-    return InlineKeyboardMarkup(rows)
+    rows = _build_config_rows(
+        values,
+        field_prefix=prefix,
+        toggle_prefix=f"{prefix}:set",
+        include_watermark_position=True,
+    )
+    rows = [
+        row for row in rows
+        if not row[0].callback_data.endswith(":caption_text")
+    ]
+    menu = Menu()
+    menu.rows.extend(rows)
+    menu.action("🎬 Render now", f"{prefix}:render")
+    menu.back(f"{prefix}:download", "← Back to Download")
+    return menu.build()
 
 
 async def show_editconfig_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int, *, intro: str | None = None) -> None:
@@ -1357,6 +1403,12 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         await show_editconfig_menu(update, context, edit_id)
         return None
 
+    if rest == "download":
+        edit = await get_edit_job(db_path, edit_id)
+        if edit is not None:
+            return ("download", edit.source_job_id)
+        return None
+
     if rest == "render":
         return ("render", edit_id)
 
@@ -1387,12 +1439,14 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             flow["field_name"] = "voice_menu"
         rows = [
             [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{prefix}:voice_menu:voice_over_voice")],
-            [InlineKeyboardButton("📝 Voice Text", callback_data=f"{prefix}:voice_menu:voice_text")],
             [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{prefix}:voice_menu:voice_quality")],
+            [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{prefix}:voice_menu:voice_speed")],
             [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{prefix}:voice_menu:tts_engine")],
             [InlineKeyboardButton("✅ Done", callback_data=f"{prefix}:menu")],
         ]
-        await _edit_message(query, "Voice settings:", InlineKeyboardMarkup(rows))
+        edit = await get_edit_job(db_path, edit_id)
+        engine = (edit.tts_engine if edit else None) or "auto"
+        await _edit_message(query, _tts_engine_overview(engine), InlineKeyboardMarkup(rows))
         return None
 
     if rest.startswith("voice_menu:"):

@@ -60,6 +60,7 @@ class EtaFormatTests(unittest.TestCase):
     def test_format_eta_line(self):
         self.assertEqual(_format_eta_line(0.5, 10), "⏱ calculating…")
         self.assertIn("left", _format_eta_line(10, 50))
+        self.assertEqual(_format_eta_line(10, 99), "⏱ almost done")
         self.assertEqual(_format_eta_line(10, 100), "⏱ almost done")
 
 
