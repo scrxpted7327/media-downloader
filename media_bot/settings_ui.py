@@ -1421,13 +1421,20 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     user = update.effective_user
     if user is None:
         return
+    chat = update.effective_chat
+    pool_owner_id = (
+        chat.id
+        if chat is not None
+        and getattr(chat, "type", None) in {"group", "supergroup", "channel"}
+        else user.id
+    )
     edit = await get_edit_job(db_path, edit_id)
     if edit is None or edit.file_path is None:
         await update.callback_query.answer("Edit not found", show_alert=True)
         return
     pool_item = await create_pool_item(
         db_path,
-        user.id,
+        pool_owner_id,
         edit.file_path,
         source_job_id=edit.source_job_id,
         edit_job_id=edit.id,
