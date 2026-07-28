@@ -25,6 +25,7 @@ from .storage import (
     list_classifications,
     list_pool_items,
     list_pool_tags,
+    list_saved_edits_for_source,
     list_source_jobs_for_user,
     list_workflows,
     remove_pool_tag,
@@ -147,6 +148,32 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if query.data.startswith("pool:addpage:"):
         flow.page = int(query.data.split(":")[-1])
         await _show_add_pick(update, context)
+        return
+
+    if query.data.startswith("pool:item:"):
+        pool_item_id = int(query.data.split(":")[-1])
+        flow.data["pool_item_id"] = pool_item_id
+        await _show_pool_item(update, context, pool_item_id)
+        return
+
+    if query.data.startswith("pool:send:"):
+        pool_item_id = int(query.data.split(":")[-1])
+        db_path: Path = context.application.bot_data["db_path"]
+        item = await get_pool_item(db_path, pool_item_id)
+        user = update.effective_user
+        if item is None or user is None or item.user_id != user.id:
+            await query.answer("Pool item not found", show_alert=True)
+            return
+        path = Path(item.file_path)
+        if not path.is_file():
+            await query.answer("Saved file is missing", show_alert=True)
+            return
+        await query.answer("Sending…")
+        with path.open("rb") as document:
+            await query.message.reply_document(
+                document=document,
+                caption=item.title or f"Pool item #{item.id}",
+            )
         return
 
     if query.data.startswith("pool:classify:"):
@@ -326,7 +353,7 @@ async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     for item in page:
         label = f"#{item.id} {item.title or item.file_path[-30:]}"
         rows.append([
-            InlineKeyboardButton(label, callback_data=f"pool:classify:{item.id}"),
+            InlineKeyboardButton(label, callback_data=f"pool:item:{item.id}"),
             InlineKeyboardButton("🗑️ Delete", callback_data=f"pool:delete:{item.id}"),
         ])
 
@@ -350,6 +377,57 @@ async def _show_pool_list(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if total == 0:
         text = "Pool is empty. Use Add to Pool or /settings → Edit Existing Video."
     await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
+
+
+async def _show_pool_item(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, pool_item_id: int
+) -> None:
+    db_path: Path = context.application.bot_data["db_path"]
+    user = update.effective_user
+    item = await get_pool_item(db_path, pool_item_id)
+    if item is None or user is None or item.user_id != user.id:
+        await _edit_or_send(
+            update,
+            "Pool item not found.",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("← Back", callback_data="pool:list")
+            ]]),
+        )
+        return
+
+    related = []
+    if item.source_job_id is not None:
+        related = await list_saved_edits_for_source(
+            db_path, user.id, item.source_job_id
+        )
+
+    rows = [[
+        InlineKeyboardButton(
+            "⬇️ Original" if item.edit_job_id is None else "⬇️ Download",
+            callback_data=f"pool:send:{item.id}",
+        )
+    ]]
+    for saved_edit in related:
+        if saved_edit.id == item.id:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"⬇️ {saved_edit.title or f'Edit #{saved_edit.edit_job_id}'}",
+            callback_data=f"pool:send:{saved_edit.id}",
+        )])
+    rows.append([
+        InlineKeyboardButton(
+            "🏷️ Classifications", callback_data=f"pool:classify:{item.id}"
+        ),
+        InlineKeyboardButton("🗑️ Remove", callback_data=f"pool:delete:{item.id}"),
+    ])
+    rows.append([InlineKeyboardButton("← Back", callback_data="pool:list")])
+    count = len([related_item for related_item in related if related_item.id != item.id])
+    await _edit_or_send(
+        update,
+        f"🏊 {item.title or f'Pool item #{item.id}'}\n"
+        f"Saved edits included: {count}",
+        InlineKeyboardMarkup(rows),
+    )
 
 
 async def _show_classify_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

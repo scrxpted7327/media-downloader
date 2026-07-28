@@ -116,6 +116,45 @@ class DownloadEditActionTests(unittest.TestCase):
             self.assertNotIn("📲 Save to Gallery (iOS)", labels)
             self.assertIn("✂️ Edit", labels)
             self.assertIn("⬇️ Download Original", labels)
+            self.assertIn("💾 Save Original to Pool", labels)
+
+        asyncio.run(run())
+
+    def test_rendered_edit_pool_button_toggles_with_confirmation(self):
+        from media_bot.__main__ import download_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            rendered = self.storage_dir / "edit.mp4"
+            rendered.write_bytes(b"rendered")
+            await update_edit_job(
+                self.db_path,
+                edit.id,
+                file_path=str(rendered),
+                file_size=rendered.stat().st_size,
+                status="rendered",
+            )
+            context = _make_context(self.db_path, self.storage_dir)
+
+            update, query = _make_update(f"download:editsave:{edit.id}")
+            query.edit_message_reply_markup = AsyncMock()
+            await download_callback(update, context)
+            saved_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                saved_markup.inline_keyboard[0][0].text,
+                "🗑️ Unsave from Pool",
+            )
+
+            update, query = _make_update(f"download:editunsaveconfirm:{edit.id}")
+            query.edit_message_reply_markup = AsyncMock()
+            await download_callback(update, context)
+            confirm_markup = query.edit_message_reply_markup.await_args.kwargs["reply_markup"]
+            self.assertEqual(
+                confirm_markup.inline_keyboard[0][0].text,
+                "⚠️ Confirm Unsave",
+            )
 
         asyncio.run(run())
 

@@ -1425,7 +1425,15 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if edit is None or edit.file_path is None:
         await update.callback_query.answer("Edit not found", show_alert=True)
         return
-    pool_item = await create_pool_item(db_path, user.id, edit.file_path, source_job_id=edit.source_job_id, title=None)
+    pool_item = await create_pool_item(
+        db_path,
+        user.id,
+        edit.file_path,
+        source_job_id=edit.source_job_id,
+        edit_job_id=edit.id,
+        file_size=edit.file_size,
+        title=f"Edit #{edit.id}",
+    )
     await update.callback_query.answer("Added to pool")
     await _edit_or_send(update, f"Edit job #{edit_id} added to pool as item #{pool_item.id}.", None)
 

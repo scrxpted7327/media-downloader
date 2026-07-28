@@ -125,6 +125,7 @@ class PoolItem:
     id: int
     user_id: int
     source_job_id: int | None
+    edit_job_id: int | None
     file_path: str
     file_size: int | None
     thumbnail_path: str | None
@@ -261,6 +262,7 @@ async def init_db(db_path: Path) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 source_job_id INTEGER REFERENCES jobs(id),
+                edit_job_id INTEGER REFERENCES edit_jobs(id),
                 file_path TEXT NOT NULL,
                 file_size INTEGER,
                 thumbnail_path TEXT,
@@ -357,6 +359,9 @@ async def init_db(db_path: Path) -> None:
                 ("watermark_position", "TEXT"),
                 ("channel_banner", "INTEGER NOT NULL DEFAULT 0"),
                 ("subtitles_path", "TEXT"),
+            ]),
+            ("pool_items", [
+                ("edit_job_id", "INTEGER REFERENCES edit_jobs(id)"),
             ]),
         ]:
             for col, ctype in _cols:
@@ -663,18 +668,82 @@ async def list_source_jobs_for_user(db_path: Path, user_id: int, limit: int = 20
         return [_row_to_job(row) for row in rows]
 
 
-async def create_pool_item(db_path: Path, user_id: int, file_path: str, source_job_id: int | None = None, title: str | None = None) -> PoolItem:
+async def create_pool_item(
+    db_path: Path,
+    user_id: int,
+    file_path: str,
+    source_job_id: int | None = None,
+    title: str | None = None,
+    *,
+    edit_job_id: int | None = None,
+    file_size: int | None = None,
+    thumbnail_path: str | None = None,
+) -> PoolItem:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "INSERT INTO pool_items (user_id, source_job_id, file_path, title) VALUES (?, ?, ?, ?)",
-            (user_id, source_job_id, file_path, title),
+            "INSERT INTO pool_items "
+            "(user_id, source_job_id, edit_job_id, file_path, file_size, thumbnail_path, title) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                source_job_id,
+                edit_job_id,
+                file_path,
+                file_size,
+                thumbnail_path,
+                title,
+            ),
         )
         await db.commit()
         pool_id = cursor.lastrowid
         async with db.execute("SELECT * FROM pool_items WHERE id = ?", (pool_id,)) as cur:
             row = await cur.fetchone()
         return _row_to_pool_item(row)
+
+
+async def get_saved_source_pool_item(
+    db_path: Path, user_id: int, source_job_id: int
+) -> PoolItem | None:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM pool_items "
+            "WHERE user_id = ? AND source_job_id = ? AND edit_job_id IS NULL "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user_id, source_job_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_pool_item(row) if row else None
+
+
+async def get_saved_edit_pool_item(
+    db_path: Path, user_id: int, edit_job_id: int
+) -> PoolItem | None:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM pool_items WHERE user_id = ? AND edit_job_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user_id, edit_job_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_pool_item(row) if row else None
+
+
+async def list_saved_edits_for_source(
+    db_path: Path, user_id: int, source_job_id: int
+) -> list[PoolItem]:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM pool_items "
+            "WHERE user_id = ? AND source_job_id = ? AND edit_job_id IS NOT NULL "
+            "ORDER BY created_at DESC",
+            (user_id, source_job_id),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_pool_item(row) for row in rows]
 
 
 async def get_pool_item(db_path: Path, pool_item_id: int) -> PoolItem | None:
@@ -1123,6 +1192,7 @@ def _row_to_pool_item(row: aiosqlite.Row) -> PoolItem:
         id=row["id"],
         user_id=row["user_id"],
         source_job_id=row["source_job_id"],
+        edit_job_id=row["edit_job_id"],
         file_path=row["file_path"],
         file_size=row["file_size"],
         thumbnail_path=row["thumbnail_path"],
