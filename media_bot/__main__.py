@@ -49,6 +49,7 @@ from .fix_agent import (
 )
 from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url, is_tiktok_url
 from .settings_ui import (
+    _effective_edit_snapshot,
     handle_editconfig_callback,
     settings_callback,
     settings_command,
@@ -64,10 +65,12 @@ from .storage import (
     create_download_token,
     create_edit_job,
     create_job,
+    create_preset,
     get_edit_job,
     get_job,
     init_db,
     list_all_jobs,
+    list_presets,
     list_source_jobs_for_user,
     list_user_jobs,
     mark_download_message_deleted,
@@ -787,6 +790,18 @@ async def settings_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
     return await settings_text_handler(update, context)
 
 
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route /skip through whichever text-input flow is currently active."""
+    if await settings_text_entry(update, context):
+        return
+    if await pool_text_entry(update, context):
+        return
+    if await editconfig_text(update, context):
+        return
+    if update.effective_message:
+        await update.effective_message.reply_text("There is no active input to skip.")
+
+
 async def pool_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     settings: Settings = context.application.bot_data["settings"]
     if not _authorized(update, settings):
@@ -947,6 +962,37 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if field in ("voice_menu", "banner_menu"):
         return False
     text = update.message.text.strip()
+    if field == "save_preset_name":
+        if text.lower() == "/skip":
+            flow.pop("field_name", None)
+            await show_editconfig_menu(update, context, edit_id)
+            return True
+        edit = await get_edit_job(context.application.bot_data["db_path"], edit_id)
+        if edit is None:
+            await update.message.reply_text("Edit job not found.")
+            return True
+        existing = await list_presets(context.application.bot_data["db_path"], edit.user_id)
+        if any(preset.name.casefold() == text.casefold() for preset in existing):
+            await update.message.reply_text(
+                "That preset name already exists. Choose it from Save Config to Preset to overwrite it."
+            )
+            return True
+        preset = await create_preset(
+            context.application.bot_data["db_path"],
+            edit.user_id,
+            text,
+            **_effective_edit_snapshot(
+                edit,
+                next(
+                    (preset for preset in existing if preset.id == edit.preset_id),
+                    None,
+                ),
+            ),
+        )
+        flow.pop("field_name", None)
+        await update.message.reply_text(f"✅ Preset “{preset.name}” created from this edit configuration.")
+        await show_editconfig_menu(update, context, edit_id)
+        return True
     value = None if text.lower() == "/skip" else text
     if field == "auto_captions":
         if text.lower() in ("yes", "y", "on", "true", "1"):
@@ -1395,6 +1441,7 @@ def main() -> None:
     application.add_handler(CommandHandler("fix", fix_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("skip", skip_command))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^settings:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^preset:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^edit:"))

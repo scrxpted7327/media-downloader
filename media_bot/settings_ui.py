@@ -194,6 +194,16 @@ def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
     }
 
 
+def _effective_edit_snapshot(edit: EditJob, preset: Preset | None = None) -> dict[str, Any]:
+    values = _config_snapshot(edit)
+    if preset is not None:
+        preset_values = _config_snapshot(preset)
+        for key, value in values.items():
+            if value is None:
+                values[key] = preset_values.get(key)
+    return values
+
+
 def _voice_summary(values: dict[str, Any]) -> str:
     parts = []
     v = values.get("voice_over_voice")
@@ -243,6 +253,22 @@ def _banner_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("✅ Done", callback_data=f"{back_data}:done")],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+def _text_input_keyboard(back_data: str, skip_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("← Back", callback_data=back_data),
+        InlineKeyboardButton("⏭ Skip", callback_data=skip_data),
+    ]])
+
+
+_BANNER_INSTRUCTIONS = (
+    "Banner image:\n"
+    "• Send a photo to upload it\n"
+    "• Paste a direct http(s) image URL\n"
+    "• Type `profile` to reuse your profile banner\n"
+    "• Tap Skip to leave the banner empty"
+)
 
 
 def _build_config_rows(
@@ -335,7 +361,7 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
     elif action == _State.PRESET_CREATE_VOICE_MENU:
         await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
     elif action == _State.PRESET_CREATE_VOICE:
-        await _edit_message(query, "Send voice-over voice name (or /skip for none):")
+        await _show_voice_selector(query, "preset_create", flow, back_data="preset_create:voice:back")
     elif action == _State.PRESET_CREATE_VOICE_TEXT:
         await _edit_message(query, "Voice-over text to speak (or /skip for none):")
     elif action == _State.PRESET_CREATE_VOICE_QUALITY:
@@ -350,7 +376,11 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
     elif action == _State.PRESET_CREATE_BANNER_MENU:
         await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
     elif action == _State.PRESET_CREATE_BANNER:
-        await _edit_message(query, "Add a banner/watermark? Send a photo, paste an image URL, or /skip:")
+        await _edit_message(
+            query,
+            _BANNER_INSTRUCTIONS,
+            _text_input_keyboard("preset_create:back", "preset_create:skip"),
+        )
     elif action == _State.PRESET_CREATE_BANNER_POS:
         await _show_options(update, context, action, "Banner position:", "banner_position",
             *_FIELD_CHOICES["banner_position"])
@@ -387,6 +417,36 @@ _CREATE_PREV_STEP: dict[str, str | None] = {
 
 async def _handle_preset_create_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: FlowState, query) -> None:
     data = query.data
+    if data == "preset_create:skip":
+        if flow.action == _State.PRESET_CREATE_VOICE:
+            flow.data.pop("voice_over_voice", None)
+            flow.action = _State.PRESET_CREATE_VOICE_MENU
+            await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
+        elif flow.action == _State.PRESET_CREATE_BANNER:
+            flow.data.pop("banner_path", None)
+            flow.data.pop("banner_url", None)
+            flow.action = _State.PRESET_CREATE_BANNER_MENU
+            await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
+        return
+
+    if data.startswith("preset_create:set:"):
+        parts = data.split(":", 3)
+        if len(parts) == 4:
+            field_name, raw_value = parts[2], parts[3]
+            flow.data[field_name] = _coerce_choice_value(field_name, raw_value)
+            flow.action = _State.PRESET_CREATE_VOICE_MENU
+            await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
+        return
+
+    if data == "preset_create:voice_over_voice_custom":
+        flow.action = _State.PRESET_CREATE_VOICE
+        await _edit_message(
+            query,
+            "Send a custom voice name.",
+            _text_input_keyboard("preset_create:voice:back", "preset_create:skip"),
+        )
+        return
+
     if data in ("preset_create:back", "preset_create:cancel"):
         if data == "preset_create:cancel" or _CREATE_PREV_STEP.get(flow.action) is None:
             await _edit_message(query, "Cancelled preset creation.")
@@ -453,6 +513,11 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
         return
 
+    if data == "preset_create:voice:back":
+        flow.action = _State.PRESET_CREATE_VOICE_MENU
+        await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
+        return
+
     if data == "preset_create:banner:done":
         flow.data.setdefault("watermark_removal", True)
         flow.data.setdefault("watermark_position", "auto")
@@ -465,7 +530,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         inner = data.split(":", 2)[-1]
         if inner == "voice_over_voice":
             flow.action = _State.PRESET_CREATE_VOICE
-            await _edit_message(query, "Send voice-over voice name (or /skip for none):")
+            await _show_voice_selector(query, "preset_create", flow, back_data="preset_create:voice:back")
         elif inner == "voice_text":
             flow.action = _State.PRESET_CREATE_VOICE_TEXT
             await _edit_message(query, "Voice-over text to speak (or /skip for none):")
@@ -487,7 +552,11 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         inner = data.split(":", 2)[-1]
         if inner == "banner_path":
             flow.action = _State.PRESET_CREATE_BANNER
-            await _edit_message(query, "Add a banner/watermark? Send a photo, paste an image URL, or /skip:")
+            await _edit_message(
+                query,
+                _BANNER_INSTRUCTIONS,
+                _text_input_keyboard("preset_create:back", "preset_create:skip"),
+            )
         elif inner == "banner_position":
             flow.action = _State.PRESET_CREATE_BANNER_POS
             await _show_options(update, context, flow.action, "Banner position:", "banner_position",
@@ -576,12 +645,20 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if query.data == "settings:create_preset":
         flow.action = _State.PRESET_CREATE_NAME
         flow.data.clear()
-        await _edit_message(query, "Send the preset name (e.g. \"default\"):")
+        await _edit_message(
+            query,
+            "Send the preset name (for example “default”).",
+            _text_input_keyboard("settings:menu", "settings:menu"),
+        )
         return
 
     if query.data == "settings:profile_banner":
         flow.action = "set_profile_banner"
-        await _edit_message(query, "Send a photo to use as your profile banner:")
+        await _edit_message(
+            query,
+            "Send a photo to use as your profile banner.",
+            _text_input_keyboard("settings:menu", "settings:menu"),
+        )
         return
 
     if query.data == "settings:stats":
@@ -679,6 +756,18 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         raw_value = parts[4]
         value = _coerce_choice_value(field_name, raw_value)
         await _apply_preset_edit_callback(update, context, preset_id, field_name, value)
+        return
+
+    if query.data.startswith("preset:skip:"):
+        parts = query.data.split(":", 3)
+        if len(parts) == 4:
+            await _apply_preset_edit_callback(
+                update,
+                context,
+                int(parts[2]),
+                parts[3],
+                None,
+            )
         return
 
     if query.data.startswith("preset:active:"):
@@ -993,6 +1082,14 @@ async def _start_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
         return
 
+    if field_name == "banner_path":
+        await _edit_message(
+            query,
+            _BANNER_INSTRUCTIONS,
+            _text_input_keyboard(back_data, f"preset:skip:{preset_id}:banner_path"),
+        )
+        return
+
     if field_name in _FIELD_CHOICES:
         pretty = field_name.replace("_", " ").title()
         await _edit_message(
@@ -1005,8 +1102,8 @@ async def _start_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     pretty = field_name.replace("_", " ").title()
     await _edit_message(
         query,
-        f"Send new value for {pretty} (or /skip to clear):",
-        InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=back_data)]]),
+        f"Send a new value for {pretty}, or tap Skip to clear it.",
+        _text_input_keyboard(back_data, f"preset:skip:{preset_id}:{field_name}"),
     )
 
 
@@ -1092,7 +1189,7 @@ async def _finalize_preset_create(update: Update, context: ContextTypes.DEFAULT_
 
     banner_url = flow.data.pop("banner_url", None)
     if banner_url:
-        await update.message.reply_text("Downloading banner image...")
+        await _edit_or_send(update, "Downloading banner image...")
         import urllib.request
         storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
         banner_dest = storage_dir / f"banner_{user.id}_{flow.data['name']}.png"
@@ -1101,11 +1198,13 @@ async def _finalize_preset_create(update: Update, context: ContextTypes.DEFAULT_
             flow.data["banner_path"] = str(banner_dest)
         except Exception as exc:
             LOGGER.warning("Banner download failed: %s", exc)
-            await update.message.reply_text(f"Banner download failed: {exc}. Preset created without banner.")
+            await _edit_or_send(update, f"Banner download failed: {exc}. Preset created without banner.")
 
-    preset = await create_preset(db_path, user.id, flow.data["name"], **flow.data)
+    preset_values = dict(flow.data)
+    preset_name = preset_values.pop("name")
+    preset = await create_preset(db_path, user.id, preset_name, **preset_values)
     flow.action = _State.PRESET_LIST
-    await update.message.reply_text(f"Preset \"{preset.name}\" created.")
+    await _edit_or_send(update, f"Preset \"{preset.name}\" created.")
     await _show_preset_list(update, context)
 
 
@@ -1304,12 +1403,7 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> InlineKeyboardMarkup:
-    values = _config_snapshot(edit)
-    if preset is not None:
-        preset_vals = _config_snapshot(preset)
-        for key, val in list(values.items()):
-            if val is None:
-                values[key] = preset_vals.get(key)
+    values = _effective_edit_snapshot(edit, preset)
     prefix = f"editcfg:{edit.id}"
     rows = _build_config_rows(
         values,
@@ -1323,6 +1417,7 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
     ]
     menu = Menu()
     menu.rows.extend(rows)
+    menu.action("💾 Save Config to Preset", f"{prefix}:save_preset")
     menu.action("🎬 Render now", f"{prefix}:render")
     menu.back(f"{prefix}:download", "← Back to Download")
     return menu.build()
@@ -1417,6 +1512,83 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     if rest == "render":
         return ("render", edit_id)
 
+    if rest.startswith("skip:"):
+        field_name = rest.split(":", 1)[1]
+        if field_name == "save_preset_name":
+            if isinstance(flow, dict):
+                flow.pop("field_name", None)
+            await show_editconfig_menu(update, context, edit_id)
+            return None
+        await update_edit_job(db_path, edit_id, **{field_name: None})
+        if isinstance(flow, dict):
+            flow.pop("field_name", None)
+        await show_editconfig_menu(update, context, edit_id)
+        return None
+
+    if rest == "save_preset":
+        edit = await get_edit_job(db_path, edit_id)
+        if edit is None:
+            await _edit_message(query, "Edit job not found.")
+            return None
+        presets = await list_presets(db_path, edit.user_id)
+        menu = Menu()
+        for preset in presets:
+            menu.action(
+                f"💾 {preset.name}",
+                f"{prefix}:save_preset:{preset.id}",
+            )
+        menu.action("➕ Create New Preset", f"{prefix}:save_preset:new")
+        menu.back(f"{prefix}:menu")
+        await _edit_message(
+            query,
+            "Save this edit configuration:\nChoose a preset to overwrite, or create a new one.",
+            menu.build(),
+        )
+        return None
+
+    if rest.startswith("save_preset:"):
+        target = rest.split(":", 1)[1]
+        edit = await get_edit_job(db_path, edit_id)
+        if edit is None:
+            await _edit_message(query, "Edit job not found.")
+            return None
+        if target == "new":
+            if isinstance(flow, dict):
+                flow["field_name"] = "save_preset_name"
+            await _edit_message(
+                query,
+                "Send a name for the new preset.",
+                _text_input_keyboard(
+                    f"{prefix}:save_preset",
+                    f"{prefix}:skip:save_preset_name",
+                ),
+            )
+            return None
+        try:
+            preset_id = int(target)
+        except ValueError:
+            return None
+        source_preset = (
+            await _get_preset(db_path, edit.user_id, edit.preset_id)
+            if edit.preset_id else None
+        )
+        updated = await update_preset(
+            db_path,
+            preset_id,
+            edit.user_id,
+            **_effective_edit_snapshot(edit, source_preset),
+        )
+        if updated is None:
+            await query.answer("Preset not found", show_alert=True)
+        else:
+            await show_editconfig_menu(
+                update,
+                context,
+                edit_id,
+                intro=f"✅ Saved edit configuration to preset “{updated.name}”.",
+            )
+        return None
+
     if rest.startswith("hue:"):
         hue = rest.split(":", 1)[-1]
         await _edit_message(
@@ -1472,8 +1644,11 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             pretty = field_name.replace("_", " ").title()
             await _edit_message(
                 query,
-                f"Send new value for {pretty} (or /skip to clear):",
-                InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:voice_menu")]]),
+                f"Send a new value for {pretty}, or tap Skip to clear it.",
+                _text_input_keyboard(
+                    f"{prefix}:voice_menu",
+                    f"{prefix}:skip:{field_name}",
+                ),
             )
         return None
 
@@ -1493,7 +1668,16 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         field_name = rest.split(":", 1)[-1]
         if isinstance(flow, dict):
             flow["field_name"] = field_name
-        if field_name in _FIELD_CHOICES:
+        if field_name == "banner_path":
+            await _edit_message(
+                query,
+                _BANNER_INSTRUCTIONS,
+                _text_input_keyboard(
+                    f"{prefix}:banner_menu",
+                    f"{prefix}:skip:banner_path",
+                ),
+            )
+        elif field_name in _FIELD_CHOICES:
             pretty = field_name.replace("_", " ").title()
             await _edit_message(
                 query,
@@ -1504,8 +1688,11 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             pretty = field_name.replace("_", " ").title()
             await _edit_message(
                 query,
-                f"Send new value for {pretty} (or /skip to clear):",
-                InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:banner_menu")]]),
+                f"Send a new value for {pretty}, or tap Skip to clear it.",
+                _text_input_keyboard(
+                    f"{prefix}:banner_menu",
+                    f"{prefix}:skip:{field_name}",
+                ),
             )
         return None
 
@@ -1530,8 +1717,11 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             flow["field_name"] = "voice_over_voice"
         await _edit_message(
             query,
-            "Send a voice name (e.g. en-US-AriaNeural) or /skip to keep current:",
-            InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:voice_over_voice")]]),
+            "Send a voice name (for example en-US-AriaNeural), or tap Skip to clear it.",
+            _text_input_keyboard(
+                f"{prefix}:voice_over_voice",
+                f"{prefix}:skip:voice_over_voice",
+            ),
         )
         return None
 
@@ -1547,7 +1737,7 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     pretty = field.replace("_", " ").title()
     await _edit_message(
         query,
-        f"Send new value for {pretty} (or /skip to clear):",
-        InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data=f"{prefix}:menu")]]),
+        f"Send a new value for {pretty}, or tap Skip to clear it.",
+        _text_input_keyboard(f"{prefix}:menu", f"{prefix}:skip:{field}"),
     )
     return None
