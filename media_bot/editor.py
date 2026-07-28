@@ -317,8 +317,16 @@ tmp.close()
 try:
     from faster_whisper import WhisperModel
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(tmp.name, beam_size=1)
-    result = [{"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text.strip()} for s in segments]
+    segments, info = model.transcribe(tmp.name, beam_size=1, word_timestamps=True)
+    result = [{
+        "start": round(s.start, 3),
+        "end": round(s.end, 3),
+        "text": s.text.strip(),
+        "words": [
+            {"start": round(w.start, 3), "end": round(w.end, 3), "word": w.word.strip()}
+            for w in (s.words or [])
+        ],
+    } for s in segments]
     print(json.dumps({"segments": result, "language": info.language, "duration": info.duration}))
 except Exception as e:
     print(json.dumps({"error": str(e)}), file=sys.stderr)
@@ -393,13 +401,23 @@ async def transcribe_audio(
             loop = asyncio.get_running_loop()
             segments_gen, info = await loop.run_in_executor(
                 None,
-                lambda: model.transcribe(str(wav_path), beam_size=1, language=language),
+                lambda: model.transcribe(
+                    str(wav_path),
+                    beam_size=1,
+                    language=language,
+                    word_timestamps=True,
+                ),
             )
             segments = await loop.run_in_executor(None, lambda: list(segments_gen))
-        result = [
-            {"start": round(seg.start, 3), "end": round(seg.end, 3), "text": seg.text.strip()}
-            for seg in segments
-        ]
+        result = [{
+            "start": round(seg.start, 3),
+            "end": round(seg.end, 3),
+            "text": seg.text.strip(),
+            "words": [
+                {"start": round(word.start, 3), "end": round(word.end, 3), "word": word.word.strip()}
+                for word in (seg.words or [])
+            ],
+        } for seg in segments]
         LOGGER.info(
             "Transcription complete: %d segments, language %s", len(result), info.language,
         )
@@ -412,9 +430,44 @@ async def transcribe_audio(
         tmpdir.cleanup()
 
 
+def _caption_chunks(segments: list[dict], words_per_caption: int = 2) -> list[dict]:
+    """Turn Whisper segments into short, accurately timed caption beats."""
+    chunks: list[dict] = []
+    for segment in segments:
+        timed_words = [
+            word for word in segment.get("words", [])
+            if word.get("word") and word.get("start") is not None and word.get("end") is not None
+        ]
+        if timed_words:
+            for offset in range(0, len(timed_words), words_per_caption):
+                group = timed_words[offset:offset + words_per_caption]
+                chunks.append({
+                    "start": float(group[0]["start"]),
+                    "end": float(group[-1]["end"]),
+                    "text": " ".join(str(word["word"]).strip() for word in group),
+                })
+            continue
+
+        words = str(segment.get("text", "")).split()
+        if not words:
+            continue
+        start = float(segment["start"])
+        end = max(start, float(segment["end"]))
+        duration = end - start
+        groups = [words[offset:offset + words_per_caption] for offset in range(0, len(words), words_per_caption)]
+        weights = [max(1, sum(len(word) for word in group)) for group in groups]
+        total_weight = sum(weights)
+        cursor = start
+        for index, (group, weight) in enumerate(zip(groups, weights)):
+            chunk_end = end if index == len(groups) - 1 else cursor + duration * weight / total_weight
+            chunks.append({"start": cursor, "end": chunk_end, "text": " ".join(group)})
+            cursor = chunk_end
+    return chunks
+
+
 def _segments_to_srt(segments: list[dict]) -> str:
     lines = []
-    for i, seg in enumerate(segments, 1):
+    for i, seg in enumerate(_caption_chunks(segments), 1):
         start_h = int(seg["start"] // 3600)
         start_m = int((seg["start"] % 3600) // 60)
         start_s = seg["start"] % 60
