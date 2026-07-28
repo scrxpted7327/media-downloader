@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
@@ -25,6 +26,21 @@ RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
 EVENTS_PATH = Path("runtime/events.jsonl")
 SUPERVISOR_LOG = Path("runtime/supervisor.log")
+_LOCK_HANDLE = None
+
+
+def acquire_supervisor_lock() -> None:
+    """Exit when another supervisor already owns this project."""
+    global _LOCK_HANDLE
+    lock_path = Path("runtime/supervisor.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _LOCK_HANDLE = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(_LOCK_HANDLE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("another supervisor is already running")
+    _LOCK_HANDLE.write(str(os.getpid()))
+    _LOCK_HANDLE.flush()
 
 
 def append_event(kind: str, message: str, **context) -> None:
@@ -257,6 +273,7 @@ def _q(s: str) -> str:
 
 def main() -> None:
     cwd = Path.cwd()
+    acquire_supervisor_lock()
     LOGGER.info("Supervisor starting in %s", cwd)
     asyncio.run(supervise(cwd))
 

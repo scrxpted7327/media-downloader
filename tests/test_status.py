@@ -1,8 +1,19 @@
 import asyncio
 import time
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
-from media_bot.__main__ import DownloadReporter, _ProgressReporter, _format_eta_line
+from telegram.error import RetryAfter
+
+from media_bot.__main__ import (
+    DownloadReporter,
+    _ProgressReporter,
+    _format_eta_line,
+    _safe_status_edit,
+    _send_document_with_retry,
+)
 
 
 class FakeMessage:
@@ -62,6 +73,25 @@ class EtaFormatTests(unittest.TestCase):
         self.assertIn("left", _format_eta_line(10, 50))
         self.assertEqual(_format_eta_line(10, 99), "⏱ almost done")
         self.assertEqual(_format_eta_line(10, 100), "⏱ almost done")
+
+    def test_rate_limited_status_edit_does_not_raise(self):
+        message = FakeMessage()
+        message.edit_text = AsyncMock(side_effect=RetryAfter(27))
+        self.assertFalse(asyncio.run(_safe_status_edit(message, "Uploading…")))
+
+    def test_document_send_retries_after_flood_control(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "video.mp4"
+                path.write_bytes(b"video")
+                message = AsyncMock()
+                message.reply_document.side_effect = [RetryAfter(2), None]
+                with patch("media_bot.__main__.asyncio.sleep", new=AsyncMock()) as sleep:
+                    await _send_document_with_retry(message, path, "Ready", 60)
+                self.assertEqual(message.reply_document.await_count, 2)
+                sleep.assert_awaited_once_with(3.0)
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
