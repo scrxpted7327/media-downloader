@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from media_bot.editor import (
+    _caption_chunks,
     _image_difference,
     _get_video_dimensions,
     _segments_to_srt,
@@ -44,6 +45,41 @@ class SegmentsToSrtTests(unittest.TestCase):
         ]
         srt = _segments_to_srt(segments)
         self.assertEqual(srt.count("-->"), 2)
+
+    def test_splits_long_segments_into_one_or_two_word_beats(self):
+        segments = [{
+            "start": 0.0,
+            "end": 5.0,
+            "text": "One two three four five",
+        }]
+        chunks = _caption_chunks(segments)
+
+        self.assertEqual(
+            [chunk["text"] for chunk in chunks],
+            ["One two", "three four", "five"],
+        )
+        self.assertTrue(all(len(chunk["text"].split()) <= 2 for chunk in chunks))
+        self.assertEqual(chunks[0]["start"], 0.0)
+        self.assertEqual(chunks[-1]["end"], 5.0)
+
+    def test_uses_whisper_word_timestamps(self):
+        segments = [{
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Timed words stay accurate",
+            "words": [
+                {"start": 0.2, "end": 0.8, "word": "Timed"},
+                {"start": 0.9, "end": 1.4, "word": "words"},
+                {"start": 2.0, "end": 2.5, "word": "stay"},
+                {"start": 2.6, "end": 3.2, "word": "accurate"},
+            ],
+        }]
+        chunks = _caption_chunks(segments)
+
+        self.assertEqual(chunks, [
+            {"start": 0.2, "end": 1.4, "text": "Timed words"},
+            {"start": 2.0, "end": 3.2, "text": "stay accurate"},
+        ])
 
 
 def _create_test_video(path: Path, duration: int = 3) -> None:
