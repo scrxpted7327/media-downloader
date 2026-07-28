@@ -105,7 +105,7 @@ HELP_TEXT = (
 class DownloadReporter:
     """Show download progress with an ETA based on transferred percent."""
 
-    _MIN_EDIT_INTERVAL = 0.4
+    _MIN_EDIT_INTERVAL = 2.5
 
     def __init__(self, message) -> None:
         self.message = message
@@ -118,7 +118,7 @@ class DownloadReporter:
         now = time.monotonic()
         if pct == self.last_pct:
             return
-        if pct < 99 and (now - self.last_edit) < self._MIN_EDIT_INTERVAL:
+        if self.last_edit and (now - self.last_edit) < self._MIN_EDIT_INTERVAL:
             return
         self.last_pct = pct
         self.last_edit = now
@@ -151,10 +151,46 @@ def _format_eta_line(elapsed: float, pct: int) -> str:
     return f"⏱ {_format_duration(eta_seconds)} left"
 
 
+async def _safe_status_edit(message, text: str) -> bool:
+    """Best-effort cosmetic edit that never interrupts delivery."""
+    try:
+        await message.edit_text(text)
+        return True
+    except RetryAfter as exc:
+        LOGGER.warning("Status edit rate-limited for %ss; continuing delivery", exc.retry_after)
+    except Exception as exc:
+        LOGGER.warning("Status edit failed; continuing delivery: %s", exc)
+    return False
+
+
+def _retry_seconds(value) -> float:
+    return value.total_seconds() if hasattr(value, "total_seconds") else float(value)
+
+
+async def _send_document_with_retry(message, path: Path, caption: str, timeout: int) -> None:
+    """Send a document, honoring Telegram's requested flood-control delay."""
+    for attempt in range(2):
+        try:
+            with path.open("rb") as document:
+                await message.reply_document(
+                    document=document,
+                    caption=caption,
+                    read_timeout=timeout,
+                    write_timeout=timeout,
+                    connect_timeout=timeout,
+                    pool_timeout=timeout,
+                )
+            return
+        except RetryAfter as exc:
+            if attempt:
+                raise
+            await asyncio.sleep(_retry_seconds(exc.retry_after) + 1)
+
+
 class _ProgressReporter:
     """Reports rendering progress to a Telegram message with step names and ETA."""
 
-    _MIN_EDIT_INTERVAL = 0.4
+    _MIN_EDIT_INTERVAL = 2.5
 
     def __init__(self, message, steps: list[str]) -> None:
         self.message = message
@@ -179,7 +215,7 @@ class _ProgressReporter:
         now = time.monotonic()
         if overall == self.last_pct:
             return
-        if overall < 99 and (now - self.last_edit) < self._MIN_EDIT_INTERVAL:
+        if self.last_edit and (now - self.last_edit) < self._MIN_EDIT_INTERVAL:
             return
         self.last_pct = overall
         self.last_edit = now
@@ -1047,37 +1083,31 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         await msg.edit_text(f"❌ Render failed: {exc}")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-    await msg.edit_text(f"✅ Render complete. Uploading job #{edit.id}…")
+    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…")
     try:
-        with out_path.open("rb") as f:
-            await update.effective_message.reply_document(
-                document=f,
-                caption=f"✅ Render complete. Job #{edit.id} ready.",
-                read_timeout=settings.upload_timeout_seconds,
-                write_timeout=settings.upload_timeout_seconds,
-                connect_timeout=settings.upload_timeout_seconds,
-                pool_timeout=settings.upload_timeout_seconds,
-            )
+        await _send_document_with_retry(
+            update.effective_message,
+            out_path,
+            f"✅ Render complete. Job #{edit.id} ready.",
+            settings.upload_timeout_seconds,
+        )
     except Exception as exc:
         await update.effective_message.reply_text(
             f"✅ Render complete. Job #{edit.id} ready.\n⚠️ Could not send file: {exc}"
         )
     if subtitles_path:
         try:
-            with Path(subtitles_path).open("rb") as f:
-                await update.effective_message.reply_document(
-                    document=f,
-                    caption="📄 Subtitles available.",
-                    read_timeout=settings.upload_timeout_seconds,
-                    write_timeout=settings.upload_timeout_seconds,
-                    connect_timeout=settings.upload_timeout_seconds,
-                    pool_timeout=settings.upload_timeout_seconds,
-                )
+            await _send_document_with_retry(
+                update.effective_message,
+                Path(subtitles_path),
+                "📄 Subtitles available.",
+                settings.upload_timeout_seconds,
+            )
         except Exception as exc:
             await update.effective_message.reply_text(
                 f"📄 Subtitles available.\n⚠️ Could not send file: {exc}"
             )
-    await msg.edit_text(f"✅ Job #{edit.id} uploaded.")
+    await _safe_status_edit(msg, f"✅ Job #{edit.id} delivery finished.")
 
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
