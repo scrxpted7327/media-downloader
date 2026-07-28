@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
 import secrets
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,6 +24,9 @@ class JobRecord:
     file_size: int | None
     local_api_used: bool
     status_message_id: int | None
+    title: str | None
+    source_caption: str | None
+    thumbnail_path: str | None
     created_at: datetime
     updated_at: datetime
     error_message: str | None
@@ -329,6 +335,9 @@ async def init_db(db_path: Path) -> None:
             ]),
             ("jobs", [
                 ("status_message_id", "INTEGER"),
+                ("title", "TEXT"),
+                ("source_caption", "TEXT"),
+                ("thumbnail_path", "TEXT"),
             ]),
             ("edit_jobs", [
                 ("caption_text", "TEXT"),
@@ -598,6 +607,19 @@ async def create_edit_job(db_path: Path, source_job_id: int, user_id: int, prese
         async with db.execute("SELECT * FROM edit_jobs WHERE id = ?", (edit_id,)) as cur:
             row = await cur.fetchone()
         return _row_to_edit_job(row)
+
+
+async def stage_edit_source(source: Path, destination: Path) -> int:
+    """Stage an edit input without blocking the bot's event loop."""
+    def _stage() -> int:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+        return destination.stat().st_size
+
+    return await asyncio.to_thread(_stage)
 
 
 async def update_edit_job(db_path: Path, edit_id: int, **kwargs) -> EditJob | None:
@@ -976,7 +998,8 @@ async def cleanup_old_jobs(db_path: Path, storage_dir: Path, retention_days: int
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, file_path FROM jobs WHERE status IN ('uploaded', 'deleted') AND created_at < ?",
+            "SELECT id, file_path, thumbnail_path FROM jobs "
+            "WHERE status IN ('uploaded', 'deleted') AND created_at < ?",
             (cutoff.isoformat(),),
         ) as cur:
             rows = await cur.fetchall()
@@ -985,6 +1008,8 @@ async def cleanup_old_jobs(db_path: Path, storage_dir: Path, retention_days: int
                 path = Path(row["file_path"])
                 if path.is_file():
                     path.unlink(missing_ok=True)
+            if "thumbnail_path" in row.keys() and row["thumbnail_path"]:
+                Path(row["thumbnail_path"]).unlink(missing_ok=True)
             await db.execute("DELETE FROM jobs WHERE id = ?", (row["id"],))
         await db.commit()
     return len(rows)
@@ -1001,6 +1026,9 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         file_size=row["file_size"],
         local_api_used=bool(row["local_api_used"]),
         status_message_id=_safe_int(row, "status_message_id"),
+        title=row["title"],
+        source_caption=row["source_caption"],
+        thumbnail_path=row["thumbnail_path"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         error_message=row["error_message"],

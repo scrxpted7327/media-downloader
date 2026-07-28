@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -99,6 +100,7 @@ async def download_media(
         str(ytdlp), "--no-playlist", "--no-config", "--restrict-filenames", "--max-filesize", f"{max_filesize_mb}M",
         "--socket-timeout", "30", "--retries", "2", "--concurrent-fragments", "4", "--newline",
         "--format", "bestvideo[ext!=webm]+bestaudio/best[ext!=webm]/best",
+        "--write-info-json", "--write-thumbnail",
         "--output", str(directory / "%(title).120B-%(id)s.%(ext)s"),
         "--print", "after_move:filepath", "--", url,
     ]
@@ -141,6 +143,45 @@ async def download_media(
             temporary.cleanup()
             raise
     return temporary, result
+
+
+def read_source_metadata(directory: Path) -> tuple[str | None, str | None]:
+    """Read title and source caption from a yt-dlp sidecar when available."""
+    info_path = next(directory.glob("*.info.json"), None) or next(directory.glob("*.json"), None)
+    if info_path is None:
+        return None, None
+    try:
+        data = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    title = str(data.get("title") or "").strip() or None
+    caption = str(
+        data.get("description")
+        or data.get("caption")
+        or data.get("content")
+        or data.get("text")
+        or ""
+    ).strip() or None
+    return title, caption
+
+
+async def create_thumbnail(media_path: Path, destination: Path) -> Path | None:
+    """Create a representative JPEG frame for video media."""
+    if media_path.suffix.lower() not in _VIDEO_SUFFIXES or shutil.which("ffmpeg") is None:
+        return None
+    try:
+        await _run_checked(
+            [
+                "ffmpeg", "-y", "-ss", "1", "-i", str(media_path),
+                "-frames:v", "1", "-vf", "scale=640:-2", str(destination),
+            ],
+            60,
+            "thumbnail extraction failed",
+        )
+    except DownloadError:
+        LOGGER.warning("Could not create thumbnail for %s", media_path.name)
+        return None
+    return destination if destination.is_file() else None
 
 
 async def _run_checked(command: list[str], timeout_seconds: int, error: str) -> tuple[bytes, bytes]:
@@ -219,7 +260,7 @@ async def download_tiktok_slideshow(
         await _run_checked(
             [
                 str(gallerydl), "--config-ignore", "--no-colors", "--directory", str(directory),
-                "--filename", "{type}_{num:03}.{extension}", url,
+                "--write-metadata", "--filename", "{type}_{num:03}.{extension}", url,
             ],
             timeout_seconds,
             f"TikTok slide download failed for {url[:80]}",
@@ -320,7 +361,7 @@ async def download_instagram(
         await _run_checked(
             [
                 str(gallerydl), "--config-ignore", "--no-colors", "--directory", str(directory),
-                "--filename", "{title}_{num:03}.{extension}", url,
+                "--write-metadata", "--filename", "{title}_{num:03}.{extension}", url,
             ],
             timeout_seconds,
             "Instagram download failed or timed out",
@@ -331,7 +372,7 @@ async def download_instagram(
         else:
             all_files = sorted(
                 path for path in directory.iterdir()
-                if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+                if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".avif", ".json"}
             )
             if not all_files:
                 raise DownloadError(

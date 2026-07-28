@@ -46,6 +46,7 @@ from media_bot.storage import (
     list_workflows,
     remove_pool_tag,
     share_preset,
+    stage_edit_source,
     update_edit_job,
     update_job,
     update_pool_item,
@@ -341,6 +342,20 @@ class StorageTests(unittest.TestCase):
             self.assertTrue(deleted)
             wfs = await list_workflows(self.db_path, 1)
             self.assertEqual(len(wfs), 0)
+
+        asyncio.run(run())
+
+    def test_stage_edit_source(self):
+        async def run():
+            root = Path(self.tmpdir.name)
+            source = root / "source.mp4"
+            destination = root / "edits" / "edit.mp4"
+            source.write_bytes(b"video-data")
+
+            size = await stage_edit_source(source, destination)
+
+            self.assertEqual(size, 10)
+            self.assertEqual(destination.read_bytes(), b"video-data")
 
         asyncio.run(run())
 

@@ -21,7 +21,15 @@ from telegram.ext import (
     filters,
 )
 from .config import Settings
-from .downloader import DownloadError, download_instagram, download_media, download_tiktok_slideshow, persist_download
+from .downloader import (
+    DownloadError,
+    create_thumbnail,
+    download_instagram,
+    download_media,
+    download_tiktok_slideshow,
+    persist_download,
+    read_source_metadata,
+)
 from .download_server import create_download_app
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
@@ -50,6 +58,7 @@ from .storage import (
     list_source_jobs_for_user,
     list_user_jobs,
     mark_download_message_deleted,
+    stage_edit_source,
     store_download_message,
     update_edit_job,
     update_job,
@@ -122,7 +131,7 @@ def _format_eta_line(elapsed: float, pct: int) -> str:
     if pct <= 0 or elapsed < 1:
         return "⏱ calculating…"
     eta_seconds = elapsed * (100 - pct) / pct
-    if eta_seconds <= 0:
+    if eta_seconds < 1:
         return "⏱ almost done"
     return f"⏱ {_format_duration(eta_seconds)} left"
 
@@ -196,26 +205,44 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
     settings = await get_or_create_user_settings(db_path, user_id)
     active_name = settings.preset_name
     active = next((p for p in presets if active_name and p.name == active_name), None)
-    others = [p for p in presets if active is None or p.id != active.id]
-    if active is not None:
+    ordered = ([active] if active is not None else []) + [
+        p for p in presets if active is None or p.id != active.id
+    ]
+    for preset in ordered[:3]:
+        mark = "⭐ " if active is not None and preset.id == active.id else ""
         rows.append([InlineKeyboardButton(
-            f"⭐ 📥 Download {active.name}",
-            callback_data=f"download:preset:{job_id}:{active.id}",
+            f"{mark}📥 Download {preset.name}",
+            callback_data=f"download:preset:{job_id}:{preset.id}",
         )])
-    if others:
-        if len(others) <= 2:
-            for p in others:
-                rows.append([InlineKeyboardButton(
-                    f"📥 Download {p.name}",
-                    callback_data=f"download:preset:{job_id}:{p.id}",
-                )])
-        else:
-            rows.append([InlineKeyboardButton(
-                f"📦 More presets ({len(others)})",
-                callback_data=f"download:presets:{job_id}",
-            )])
+    if len(ordered) > 3:
+        rows.append([InlineKeyboardButton(
+            f"📦 More presets ({len(ordered) - 3})",
+            callback_data=f"download:presets:{job_id}",
+        )])
     keyboard = InlineKeyboardMarkup(rows)
-    await status_message.edit_text("✅ Download complete. Choose an action:", reply_markup=keyboard)
+    job = await get_job(db_path, job_id)
+    details = []
+    if job and job.title:
+        details.append(job.title[:200])
+    if job and job.source_caption:
+        caption = " ".join(job.source_caption.split())
+        details.append(caption[:300] + ("…" if len(caption) > 300 else ""))
+    suffix = "\n\n" + "\n".join(details) if details else ""
+    text = f"✅ Download complete. Choose an action:{suffix}"
+    thumbnail = Path(job.thumbnail_path) if job and job.thumbnail_path else None
+    if thumbnail is not None and thumbnail.is_file():
+        with thumbnail.open("rb") as photo:
+            await status_message.reply_photo(
+                photo=photo,
+                caption=text,
+                reply_markup=keyboard,
+            )
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+    else:
+        await status_message.edit_text(text, reply_markup=keyboard)
 
 
 def _build_download_url(settings: Settings, token: str) -> str:
@@ -336,9 +363,22 @@ async def _process_single_url(
                     )
                 else:
                     raise
+        title, source_caption = read_source_metadata(media.parent)
         await status.edit_text("💾 Saving…")
         persisted = await persist_download(media, job.id, storage_dir)
-        await update_job(db_path, job.id, file_path=str(persisted), file_size=persisted.stat().st_size)
+        thumbnail = await create_thumbnail(
+            persisted,
+            storage_dir / f"{job.id}-thumbnail.jpg",
+        )
+        await update_job(
+            db_path,
+            job.id,
+            file_path=str(persisted),
+            file_size=persisted.stat().st_size,
+            title=title,
+            source_caption=source_caption,
+            thumbnail_path=str(thumbnail) if thumbnail else None,
+        )
         await _send_secure_link(status, job.id, db_path, user_id)
         await update_job(db_path, job.id, status="uploaded", local_api_used=bool(settings.local_api_url))
         return f"#{job.id}: OK"
@@ -439,8 +479,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.answer()
         edit = await create_edit_job(db_path, job_id, current_user_id, preset_id=None)
         dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
-        shutil.copy2(source_path, dest)
-        await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=dest.stat().st_size)
+        file_size = await stage_edit_source(source_path, dest)
+        await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=file_size)
         context.user_data["settings_flow"] = {
             "action": "editconfig",
             "edit_id": edit.id,
@@ -480,10 +520,10 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         edit = await create_edit_job(db_path, job_id, current_user_id, preset_id)
         dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
-        shutil.copy2(source_path, dest)
+        file_size = await stage_edit_source(source_path, dest)
         await update_edit_job(
             db_path, edit.id,
-            file_path=str(dest), file_size=dest.stat().st_size,
+            file_path=str(dest), file_size=file_size,
             auto_captions=preset.auto_captions,
             watermark_removal=preset.watermark_removal,
             channel_banner=preset.channel_banner,
@@ -812,6 +852,15 @@ async def editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     result = await handle_editconfig_callback(update, context)
     if isinstance(result, tuple) and result[0] == "render":
         asyncio.create_task(_render_edit_job(update, context, result[1]))
+    elif isinstance(result, tuple) and result[0] == "download":
+        query = update.callback_query
+        if query is not None:
+            await _send_secure_link(
+                query.message,
+                result[1],
+                context.application.bot_data["db_path"],
+                query.from_user.id,
+            )
 
 
 async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -961,11 +1010,27 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         await msg.edit_text(f"❌ Render failed: {exc}")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
+    await msg.edit_text(f"✅ Render complete. Uploading job #{edit.id}…")
     with out_path.open("rb") as f:
-        await update.effective_message.reply_document(document=f, caption=f"✅ Render complete. Job #{edit.id} ready.")
+        await update.effective_message.reply_document(
+            document=f,
+            caption=f"✅ Render complete. Job #{edit.id} ready.",
+            read_timeout=settings.upload_timeout_seconds,
+            write_timeout=settings.upload_timeout_seconds,
+            connect_timeout=settings.upload_timeout_seconds,
+            pool_timeout=settings.upload_timeout_seconds,
+        )
     if subtitles_path:
         with Path(subtitles_path).open("rb") as f:
-            await update.effective_message.reply_document(document=f, caption="📄 Subtitles available.")
+            await update.effective_message.reply_document(
+                document=f,
+                caption="📄 Subtitles available.",
+                read_timeout=settings.upload_timeout_seconds,
+                write_timeout=settings.upload_timeout_seconds,
+                connect_timeout=settings.upload_timeout_seconds,
+                pool_timeout=settings.upload_timeout_seconds,
+            )
+    await msg.edit_text(f"✅ Job #{edit.id} uploaded.")
 
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

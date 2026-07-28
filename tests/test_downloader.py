@@ -1,10 +1,16 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from media_bot.downloader import DownloadError, download_progress, download_tiktok_slideshow
+from media_bot.downloader import (
+    DownloadError,
+    download_progress,
+    download_tiktok_slideshow,
+    read_source_metadata,
+)
 
 
 class DownloadProgressTests(unittest.TestCase):
@@ -13,6 +19,15 @@ class DownloadProgressTests(unittest.TestCase):
 
     def test_ignores_non_progress_output(self):
         self.assertIsNone(download_progress(b"[info] Extracting URL"))
+
+    def test_reads_source_caption_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.info.json"
+            path.write_text(json.dumps({"title": "Clip title", "description": "Source caption"}))
+            self.assertEqual(
+                read_source_metadata(Path(tmp)),
+                ("Clip title", "Source caption"),
+            )
 
 
 class TikTokGalleryDlFallbackTests(unittest.TestCase):

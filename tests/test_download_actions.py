@@ -5,7 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from media_bot.storage import create_job, get_edit_job, init_db, update_job
+from media_bot.settings_ui import build_editconfig_keyboard
+from media_bot.storage import create_edit_job, create_job, get_edit_job, init_db, update_job
 
 
 def _make_update(callback_data: str, user_id: int = 1):
@@ -100,6 +101,44 @@ class DownloadEditActionTests(unittest.TestCase):
             self.assertNotIn("📲 Save to Gallery (iOS)", labels)
             self.assertIn("✂️ Edit", labels)
             self.assertIn("⬇️ Download Original", labels)
+
+        asyncio.run(run())
+
+    def test_edit_menu_has_inline_toggles_and_no_caption_text(self):
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+
+            markup = build_editconfig_keyboard(edit)
+            buttons = [button for row in markup.inline_keyboard for button in row]
+            labels = [button.text for button in buttons]
+            callbacks = [button.callback_data for button in buttons]
+
+            self.assertFalse(any("Caption Text" in label for label in labels))
+            self.assertFalse(any(label.startswith("🎤 Voice Name") for label in labels))
+            self.assertFalse(any(label.startswith("📝 Voice Text") for label in labels))
+            self.assertFalse(any(label.startswith("⏩ Voice Speed") for label in labels))
+            self.assertTrue(any(label.startswith("🎤 Voice Settings [") for label in labels))
+            self.assertIn("[yes]", labels)
+            self.assertIn("✅ [no]", labels)
+            self.assertIn(f"editcfg:{edit.id}:set:auto_captions:yes", callbacks)
+            self.assertIn(f"editcfg:{edit.id}:set:watermark_removal:no", callbacks)
+            self.assertIn(f"editcfg:{edit.id}:set:channel_banner:yes", callbacks)
+
+        asyncio.run(run())
+
+    def test_edit_menu_returns_to_source_download(self):
+        from media_bot.settings_ui import handle_editconfig_callback
+
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=42, user_id=1)
+            update, _ = _make_update(f"editcfg:{edit.id}:download")
+            context = _make_context(self.db_path, self.storage_dir)
+
+            result = await handle_editconfig_callback(update, context)
+
+            self.assertEqual(result, ("download", 42))
 
         asyncio.run(run())
 
