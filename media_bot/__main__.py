@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -18,6 +20,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from .config import Settings
@@ -31,9 +34,19 @@ from .downloader import (
     read_source_metadata,
 )
 from .download_server import create_download_app
+from .diagnostics import append_event, install_event_logging, recent_events
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
-from .fix_agent import ERRORS_DIR, FIX_SCRIPTS_DIR, apply_known_fix, categorize_error, invoke_opencode_fix, load_error_log
+from .fix_agent import (
+    ERRORS_DIR,
+    FIX_SCRIPTS_DIR,
+    apply_known_fix,
+    categorize_error,
+    invoke_opencode_fix,
+    load_error_log,
+    run_fix_script,
+    validate_model,
+)
 from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url, is_tiktok_url
 from .settings_ui import (
     handle_editconfig_callback,
@@ -68,6 +81,7 @@ from .tools import prefer_ffmpeg_full, provision_ytdlp
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 LOGGER = logging.getLogger(__name__)
+install_event_logging()
 
 HELP_TEXT = (
     "Commands:\n"
@@ -80,8 +94,9 @@ HELP_TEXT = (
     "/delete <job_id> - delete a downloaded file\n"
     "/cleanup - delete bot status messages from recent jobs\n"
     "/voices - list available TTS voices\n"
-    "/fix - attempt auto-fix for bot errors\n"
+    "/fix [provider/model] - run the AI repair agent for bot errors\n"
     "/status - bot error status and health\n\n"
+    "/report <issue> - send recent activity and errors to the AI repair agent\n\n"
     "Send a YouTube, Instagram, TikTok, or Facebook link anywhere in a message. "
     "The bot downloads the first supported link it finds and provides a secure download link."
 )
@@ -1073,8 +1088,19 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     if user is None:
         return
+    model = context.args[0] if context.args else None
+    if len(context.args) > 1:
+        await message.reply_text("Usage: /fix [provider/model]")
+        return
+    if model:
+        try:
+            model = validate_model(model)
+        except ValueError as exc:
+            await message.reply_text(f"Invalid model: {exc}\nUsage: /fix [provider/model]")
+            return
 
-    await message.reply_text("🔍 Scanning for errors to fix...")
+    model_text = f" using {model}" if model else ""
+    await message.reply_text(f"🔍 Scanning for errors to fix{model_text}...")
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     error_files = sorted(ERRORS_DIR.glob("*.json"))
     pending = [ef for ef in error_files if not ef.name.startswith(("fixed_", "failed_", "unfixed_"))]
@@ -1090,15 +1116,28 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         category = categorize_error(error_info.get("message", ""))
         error_info["category"] = category
         fix_result = await apply_known_fix(error_info, settings.tools_dir)
-        if fix_result is None:
+        if category == "unknown":
+            workspace = Path.cwd()
+            script_path = await invoke_opencode_fix(error_info, workspace, model=model)
+            if script_path:
+                code, output = await run_fix_script(script_path)
+                append_event(
+                    "fix_agent",
+                    output[-5000:],
+                    error_id=error_info.get("id"),
+                    model=model,
+                    exit_code=code,
+                    user_id=user.id,
+                )
+                if code == 0:
+                    report_lines.append(f"🤖 Fixed with OpenCode{model_text}: {error_info.get('message', '')[:80]}")
+                    ef.replace(ERRORS_DIR / f"fixed_{ef.name}")
+                else:
+                    report_lines.append(f"⚠️ OpenCode failed (exit {code}): {output[-200:]}")
+                    ef.replace(ERRORS_DIR / f"failed_{ef.name}")
+        elif fix_result is None:
             report_lines.append(f"✅ Fixed [{category}]: {error_info.get('message', '')[:80]}")
             ef.replace(ERRORS_DIR / f"fixed_{ef.name}")
-        elif category == "unknown":
-            from .fix_agent import invoke_opencode_fix
-            workspace = Path.cwd()
-            script_path = await invoke_opencode_fix(error_info, workspace)
-            report_lines.append(f"🤖 Unknown [{category}]: fix script created at {script_path}")
-            ef.replace(ERRORS_DIR / f"unfixed_{ef.name}")
         else:
             report_lines.append(f"⚠️ Fix failed [{category}]: {fix_result[:200]}")
             ef.replace(ERRORS_DIR / f"failed_{ef.name}")
@@ -1131,6 +1170,93 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "/status - this status report",
     ]
     await message.reply_text("\n".join(lines))
+
+
+async def audit_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.effective_message
+    append_event(
+        "update",
+        (message.text or message.caption or "")[:500] if message else "",
+        update_id=update.update_id,
+        user_id=user.id if user else None,
+        chat_id=chat.id if chat else None,
+        callback_data=update.callback_query.data if update.callback_query else None,
+    )
+
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or not _authorized(update, settings):
+        return
+    issue = " ".join(context.args).strip()
+    if not issue:
+        await message.reply_text("Usage: /report <what went wrong>")
+        return
+
+    events = recent_events(user_id=user.id, limit=100)
+    report_id = f"report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{user.id}"
+    report = {
+        "id": report_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": "user_report",
+        "user_id": user.id,
+        "chat_id": update.effective_chat.id if update.effective_chat else None,
+        "issue": issue,
+        "recent_events": events,
+    }
+    ERRORS_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = ERRORS_DIR / f"{report_id}.json"
+    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    append_event("user_report", issue, report_id=report_id, user_id=user.id)
+
+    error_info = {
+        "id": report_id,
+        "message": issue,
+        "category": categorize_error(issue),
+        "traceback": json.dumps(events, indent=2, default=str),
+    }
+    script_path = await invoke_opencode_fix(error_info, Path.cwd())
+    if not script_path:
+        await message.reply_text(f"⚠️ Report {report_id} saved, but the AI handoff could not be created.")
+        return
+
+    await message.reply_text(
+        f"🤖 Report {report_id} saved with {len(events)} recent events and handed to the AI agent."
+    )
+
+    async def _run_report_agent() -> None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "/usr/bin/env", "bash", script_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=900)
+            output = (stdout + stderr).decode("utf-8", "replace")
+            append_event(
+                "report_agent",
+                output[-5000:],
+                report_id=report_id,
+                exit_code=process.returncode,
+                user_id=user.id,
+            )
+            result = "completed" if process.returncode == 0 else f"failed (exit {process.returncode})"
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                text=f"🤖 AI report {report_id} {result}.",
+            )
+        except Exception as exc:
+            append_event("report_agent_error", str(exc), report_id=report_id, user_id=user.id)
+            await context.bot.send_message(
+                chat_id=message.chat_id,
+                text=f"⚠️ AI report {report_id} failed: {exc}",
+            )
+
+    asyncio.create_task(_run_report_agent())
 
 
 async def _start_auto_fix(application: Application) -> None:
@@ -1230,6 +1356,7 @@ def main() -> None:
     application.bot_data["db_path"] = db_path
     application.bot_data["storage_dir"] = storage_dir
 
+    application.add_handler(TypeHandler(Update, audit_update, block=False), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("voices", voices_command))
@@ -1237,6 +1364,7 @@ def main() -> None:
     application.add_handler(CommandHandler("pool", pool_command_entry))
     application.add_handler(CommandHandler("fix", fix_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^settings:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^preset:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^edit:"))
