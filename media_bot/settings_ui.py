@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, PhotoSize, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from .colors import COLOR_HUES, color_emoji, color_label, shade_options
@@ -34,6 +34,8 @@ from .storage import (
 LOGGER = logging.getLogger(__name__)
 
 _PAGE_SIZE = 6
+_BANNER_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+_MAX_BANNER_IMAGE_BYTES = 20 * 1024 * 1024
 
 
 class _State:
@@ -828,10 +830,37 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     flow: FlowState = context.user_data.get("settings_flow")
-    if flow is None or not update.message or not update.message.photo:
+    if flow is None or not update.message:
         return False
     if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD):
         return False
+    if (
+        flow.action == _State.PRESET_EDIT_FIELD
+        and flow.data.get("field_name") != "banner_path"
+    ):
+        return False
+
+    message = update.message
+    upload = message.photo[-1] if message.photo else message.document
+    if upload is None:
+        return False
+
+    suffix = ".jpg"
+    if message.document is not None:
+        suffix = Path(message.document.file_name or "").suffix.lower()
+        mime_type = (message.document.mime_type or "").lower()
+        if suffix not in _BANNER_IMAGE_EXTENSIONS or not mime_type.startswith("image/"):
+            await message.reply_text(
+                "That file is not a supported banner image. Send a JPG, PNG, or WebP image."
+            )
+            return True
+        if (
+            message.document.file_size is not None
+            and message.document.file_size > _MAX_BANNER_IMAGE_BYTES
+        ):
+            await message.reply_text("That banner is too large. Send an image under 20 MB.")
+            return True
+
     user = update.effective_user
     if user is None:
         return False
@@ -839,21 +868,20 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     banners_dir = storage_dir / "banners"
     banners_dir.mkdir(parents=True, exist_ok=True)
 
-    photo: PhotoSize = update.message.photo[-1]
-    file = await photo.get_file()
-    dest = banners_dir / f"banner_{user.id}.png"
+    file = await upload.get_file()
+    dest = banners_dir / f"banner_{user.id}{suffix}"
     await file.download_to_drive(dest)
 
     if flow.action == "set_profile_banner":
         flow.action = _State.MENU
-        await update.message.reply_text("Profile banner saved!")
+        await message.reply_text("Profile banner saved!")
         await _show_menu(update, context)
         return True
 
     if flow.action == _State.PRESET_CREATE_BANNER:
         flow.data["banner_path"] = str(dest)
         flow.action = _State.PRESET_CREATE_BANNER_MENU
-        await update.message.reply_text("Banner saved!", reply_markup=_banner_menu_keyboard("preset_create:banner"))
+        await message.reply_text("Banner saved!", reply_markup=_banner_menu_keyboard("preset_create:banner"))
         return True
 
     if flow.action == _State.PRESET_EDIT_FIELD and flow.data.get("field_name") == "banner_path":
@@ -861,7 +889,7 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
         if preset_id is not None:
             await _apply_preset_edit(update, context, preset_id, "banner_path", str(dest))
         else:
-            await update.message.reply_text("Could not determine which preset to update.")
+            await message.reply_text("Could not determine which preset to update.")
         return True
 
     return False
