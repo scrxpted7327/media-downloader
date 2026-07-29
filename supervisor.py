@@ -10,6 +10,8 @@ import re
 import signal
 import sys
 import time
+import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,12 +23,78 @@ logging.basicConfig(
 LOGGER = logging.getLogger("supervisor")
 
 ERRORS_DIR = Path("runtime/errors")
-FIX_SCRIPTS_DIR = Path("runtime/fix_scripts")
 RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
 EVENTS_PATH = Path("runtime/events.jsonl")
 SUPERVISOR_LOG = Path("runtime/supervisor.log")
 _LOCK_HANDLE = None
+_ERROR_LOG_PATTERN = re.compile(r"Error logged: (err_[A-Za-z0-9_]+)")
+
+
+def load_dotenv() -> None:
+    env_path = Path(".env")
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _notification_chat_id() -> str | None:
+    explicit = os.getenv("TELEGRAM_ERROR_CHAT_ID", "").strip()
+    if explicit:
+        return explicit
+    for name in ("TELEGRAM_ALLOWED_CHAT_IDS", "TELEGRAM_ALLOWED_USER_IDS"):
+        first = next((item.strip() for item in os.getenv(name, "").split(",") if item.strip()), None)
+        if first:
+            return first
+    return None
+
+
+def _send_telegram_message(text: str) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = _notification_chat_id()
+    if not token or not chat_id:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN and an error destination must be configured")
+    api_base = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip().rstrip("/") or "https://api.telegram.org"
+    request = urllib.request.Request(
+        f"{api_base}/bot{token}/sendMessage",
+        data=urllib.parse.urlencode({"chat_id": chat_id, "text": text[:4096]}).encode(),
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        if response.status >= 400:
+            raise RuntimeError(f"Telegram returned HTTP {response.status}")
+
+
+async def notify_error(error_id: str, path: Path | None = None) -> bool:
+    path = path or ERRORS_DIR / f"{error_id}.json"
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+        message = str(info.get("message") or "Unknown bot error")
+        category = str(info.get("category") or "unknown")
+        traceback_text = str(info.get("traceback") or info.get("stderr") or "")
+        update = info.get("update") or {}
+        report = (
+            "⚠️ Bot error reported by supervisor\n"
+            f"Category: {category}\n"
+            f"Error: {message[:700]}\n"
+            f"ID: {error_id}"
+        )
+        if update.get("effective_chat"):
+            report += f"\nChat: {update['effective_chat']}"
+        if traceback_text:
+            report += f"\n\nTraceback:\n{traceback_text[-2800:]}"
+        await asyncio.to_thread(_send_telegram_message, report)
+        append_event("error_report_sent", message, error_id=error_id)
+        return True
+    except Exception as exc:
+        LOGGER.error("Could not send supervisor error report %s: %s", error_id, exc)
+        append_event("error_report_failed", str(exc), error_id=error_id)
+        return False
 
 
 def acquire_supervisor_lock() -> None:
@@ -67,6 +135,9 @@ async def _capture_stream(stream, name: str, output: deque[str]) -> None:
             log.write(f"{datetime.now(timezone.utc).isoformat()} {name}: {text}\n")
         if name == "stderr" or "error" in text.lower() or "failed" in text.lower():
             append_event("process_output", text, stream=name)
+        match = _ERROR_LOG_PATTERN.search(text)
+        if match:
+            await notify_error(match.group(1))
 
 
 def has_traceback(text: str) -> bool:
@@ -119,59 +190,6 @@ async def write_error_file(error_id: str, stderr: str, category: str) -> Path:
     return path
 
 
-def apply_known_fix(category: str, stderr: str) -> str | None:
-    if category == "port_conflict":
-        return "kill the existing process or change DOWNLOAD_PORT in .env"
-    if category == "dependency":
-        m = re.search(r"no module named\s+'?(\w+(?:[.-]\w+)*)'?", stderr, re.IGNORECASE)
-        if m:
-            return f"pip install {m.group(1)}"
-        m = re.search(r"ModuleNotFoundError: No module named '(\w+)'", stderr)
-        if m:
-            return f"pip install {m.group(1)}"
-        return "install missing dependencies"
-    if category == "disk":
-        return "free disk space"
-    return None
-
-
-async def invoke_opencode_fix(error_id: str, traceback_section: str, workspace: Path) -> str | None:
-    prompt = (
-        f"The media-downloader Telegram bot at {workspace} crashed with this error:\n\n"
-        f"{traceback_section[:3000]}\n\n"
-        f"Analyze the error in the context of the codebase and apply a fix. "
-        f"After fixing, verify syntax with `python3 -c \"import py_compile; py_compile.compile('media_bot/__main__.py', doraise=True); print('OK')\"`."
-    )
-    script = FIX_SCRIPTS_DIR / f"fix_{error_id}.sh"
-    FIX_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    cd = _q(str(workspace))
-    q = _q(prompt)
-    script.write_text(
-        "#!/usr/bin/env bash\nset -e\n"
-        f"cd {cd}\n"
-        f"opencode run {q}\n"
-    )
-    script.chmod(0o755)
-    return str(script)
-
-
-async def run_fix_script(script_path: str, timeout: int = 300) -> tuple[int, str]:
-    proc = await asyncio.create_subprocess_exec(
-        "/usr/bin/env", "bash", script_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        return -1, "fix script timed out"
-    out = stdout.decode("utf-8", "replace")
-    err = stderr.decode("utf-8", "replace")
-    return proc.returncode or 0, out + err
-
-
 async def supervise(cwd: Path) -> None:
     bot_args = [sys.executable, "-m", "media_bot"]
     crash_count = 0
@@ -190,9 +208,10 @@ async def supervise(cwd: Path) -> None:
         except Exception as exc:
             error_id = f"launch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
             detail = f"{exc.__class__.__name__}: {exc}"
-            await write_error_file(error_id, detail, "launch_failure")
+            error_path = await write_error_file(error_id, detail, "launch_failure")
             append_event("launch_failure", detail, error_id=error_id)
             LOGGER.exception("Could not launch bot")
+            await notify_error(error_id, error_path)
             await asyncio.sleep(RESTART_DELAY)
             continue
         start_time = time.monotonic()
@@ -246,20 +265,9 @@ async def supervise(cwd: Path) -> None:
         if has_error_output:
             category = classify_error(stderr_text)
             error_id = f"crash_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-            await write_error_file(error_id, stderr_text, category)
+            error_path = await write_error_file(error_id, stderr_text, category)
             LOGGER.error("Crash #%d [%s]: %s…", crash_count, category, stderr_text[:250])
-
-            known = apply_known_fix(category, stderr_text)
-            if known:
-                LOGGER.info("Known fix for [%s]: %s", category, known)
-            elif category in ("code_error", "crash", "runtime"):
-                LOGGER.info("Invoking opencode to fix crash #%d...", crash_count)
-                script = await invoke_opencode_fix(error_id, stderr_text, cwd)
-                if script:
-                    LOGGER.info("Running fix script: %s", script)
-                    code, output = await run_fix_script(script)
-                    LOGGER.info("Fix script exited code=%d: %s", code, output[:300])
-                await asyncio.sleep(2)
+            await notify_error(error_id, error_path)
         else:
             LOGGER.info("No actionable error output (exit=%d), restarting...", exit_code)
 
@@ -267,12 +275,9 @@ async def supervise(cwd: Path) -> None:
         await asyncio.sleep(delay)
 
 
-def _q(s: str) -> str:
-    return "'" + s.replace("'", "'\\''") + "'"
-
-
 def main() -> None:
     cwd = Path.cwd()
+    load_dotenv()
     acquire_supervisor_lock()
     LOGGER.info("Supervisor starting in %s", cwd)
     asyncio.run(supervise(cwd))

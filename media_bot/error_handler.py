@@ -67,36 +67,3 @@ async def error_handler(update: Update | None, context: ContextTypes.DEFAULT_TYP
         traceback=tb_str[:5000],
     )
     LOGGER.error("Error logged: %s — %s", error_id, error_msg)
-
-    try:
-        user = update.effective_user if update else None
-        chat = update.effective_chat if update else None
-        bot = context.bot
-
-        admin_chat_id = None
-        settings = context.application.bot_data.get("settings") if context.application else None
-        if settings and settings.allowed_user_ids:
-            admin_chat_id = next(iter(settings.allowed_user_ids))
-        elif settings and settings.allowed_chat_ids:
-            admin_chat_id = next(iter(settings.allowed_chat_ids))
-        elif user:
-            admin_chat_id = user.id
-        elif chat:
-            admin_chat_id = chat.id
-
-        if admin_chat_id:
-            category = categorize_error(error_msg)
-            report = (
-                f"⚠️ Bot error\n"
-                f"Category: {category}\n"
-                f"Error: {error_msg[:300]}\n"
-                f"ID: {error_id}"
-            )
-            if update and update.effective_message:
-                report += f"\nChat: {update.effective_message.chat_id}"
-            try:
-                await bot.send_message(chat_id=admin_chat_id, text=report)
-            except Exception as e:
-                LOGGER.warning("Failed to send error report: %s", e)
-    except Exception:
-        LOGGER.exception("Error in error handler")
