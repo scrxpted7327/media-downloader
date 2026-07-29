@@ -111,7 +111,8 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         job_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
         job = await get_job(db_path, job_id)
-        if job is None or job.file_path is None:
+        user = update.effective_user
+        if job is None or job.file_path is None or user is None or job.user_id != user.id:
             await _answer_callback(query, "Source not found", show_alert=True)
             return
         flow.action = _State.POOL_ADD_NAME
@@ -203,7 +204,8 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         classification_id = int(parts[3])
         db_path: Path = context.application.bot_data["db_path"]
         user = update.effective_user
-        if user:
+        item = await get_pool_item(db_path, pool_item_id)
+        if user and item and item.user_id == user.id:
             tag = await add_pool_tag(db_path, pool_item_id, classification_id, user.id)
             if tag:
                 await _answer_callback(query, "Tagged")
@@ -221,7 +223,14 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pool_item_id = int(parts[2])
         classification_id = int(parts[3])
         db_path: Path = context.application.bot_data["db_path"]
-        removed = await remove_pool_tag(db_path, pool_item_id, classification_id)
+        user = update.effective_user
+        item = await get_pool_item(db_path, pool_item_id)
+        removed = bool(
+            user
+            and item
+            and item.user_id == user.id
+            and await remove_pool_tag(db_path, pool_item_id, classification_id)
+        )
         await _answer_callback(query, "Removed" if removed else "Not found")
         flow.action = _State.CLASSIFY_SELECT
         flow.data["pool_item_id"] = pool_item_id
@@ -250,9 +259,12 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         wf_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
         wf = await get_workflow(db_path, wf_id)
-        if wf:
-            await update_workflow(db_path, wf_id, wf.user_id, enabled=not wf.enabled)
+        user = update.effective_user
+        if wf and user and wf.user_id == user.id:
+            await update_workflow(db_path, wf_id, user.id, enabled=not wf.enabled)
             await _answer_callback(query, "Updated")
+        else:
+            await _answer_callback(query, "Workflow not found", show_alert=True)
         await _show_workflow_list(update, context)
         return
 
@@ -460,6 +472,14 @@ async def _show_classify_select(update: Update, context: ContextTypes.DEFAULT_TY
         ]))
         return
 
+    user = update.effective_user
+    item = await get_pool_item(db_path, pool_item_id)
+    if item is None or user is None or item.user_id != user.id:
+        await _edit_or_send(update, "Pool item not found.", InlineKeyboardMarkup([
+            [InlineKeyboardButton("← Back", callback_data="pool:list")],
+        ]))
+        return
+
     tags = await list_pool_tags(db_path, pool_item_id)
     tagged_ids = {t.classification_id for t in tags}
     classifications = await list_classifications(db_path)
@@ -564,8 +584,9 @@ async def _finalize_workflow_create(update: Update, context: ContextTypes.DEFAUL
 async def _edit_message(query, text: str, reply_markup=None) -> None:
     try:
         await query.edit_message_text(text, reply_markup=reply_markup)
-    except Exception:
-        pass
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 async def _edit_or_send(update: Update, text: str, reply_markup=None) -> None:
