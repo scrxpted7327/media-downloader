@@ -120,6 +120,46 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_download_preset_uses_shared_render_pipeline(self):
+        from media_bot.__main__ import download_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
+            source = self.storage_dir / "source.mp4"
+            source.write_bytes(b"fake-video")
+            await update_job(self.db_path, job.id, file_path=str(source), status="uploaded")
+            preset = await create_preset(
+                self.db_path, 1, "clean", watermark_removal=True,
+                watermark_position="auto",
+            )
+            update, query = _make_update(f"download:preset:{job.id}:{preset.id}")
+            context = _make_context(self.db_path, self.storage_dir)
+            scheduled = []
+
+            def capture(coro):
+                scheduled.append(coro)
+                coro.close()
+
+            with patch("media_bot.__main__.asyncio.create_task", side_effect=capture):
+                await download_callback(update, context)
+
+            self.assertEqual(len(scheduled), 1)
+            edit_id = max(item.id for item in await _list_edits(self.db_path))
+            edit = await get_edit_job(self.db_path, edit_id)
+            self.assertEqual(edit.preset_id, preset.id)
+            self.assertTrue(edit.watermark_removal)
+            query.edit_message_text.assert_awaited_once()
+
+        async def _list_edits(db_path):
+            import aiosqlite
+            from media_bot.storage import get_edit_job
+            async with aiosqlite.connect(db_path) as db:
+                rows = await (await db.execute("SELECT id FROM edit_jobs")).fetchall()
+            return [await get_edit_job(db_path, row[0]) for row in rows]
+
+        asyncio.run(run())
+
     def test_rendered_edit_pool_button_toggles_with_confirmation(self):
         from media_bot.__main__ import download_callback
 
