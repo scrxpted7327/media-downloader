@@ -19,6 +19,7 @@ LAMA_MODEL_URL = "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.
 LAMA_MODEL_SHA256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6"
 AUTO_ACCEPT_CONFIDENCE = 0.78
 SAMPLE_COUNT = 28
+LAMA_KEYFRAME_FPS = 2.0
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,13 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
         pad = max(2, round(min(sw, sh) * .01))
         x1, y1 = max(0, x - pad), max(0, y - pad)
         x2, y2 = min(sw, x + w + pad), min(sh, y + h + pad)
-        persistence = float(persistence_map[y:y + h, x:x + w].mean())
+        component_persistence = persistence_map[y:y + h, x:x + w]
+        # Morphology intentionally expands thin text strokes into one removable
+        # region. Measuring the expanded background would dilute a genuinely
+        # persistent logo (especially a small pill-shaped username), so score
+        # only the edge pixels that formed the component.
+        persistent_core = component_persistence[component_persistence >= .58]
+        persistence = float(persistent_core.mean()) if persistent_core.size else 0.0
         region_std = float(temporal_std[y1:y2, x1:x2].mean())
         # Static scenery has low variance but generally lacks a compact persistent
         # edge cluster; variance only supplies a modest scene-independence term.
@@ -236,11 +243,34 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    keyframe_interval = max(1, round(fps / LAMA_KEYFRAME_FPS))
     with tempfile.TemporaryDirectory(prefix="media-bot-lama-") as tmp:
         silent = Path(tmp) / "silent.mp4"
         writer = cv2.VideoWriter(str(silent), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         previous_gray = None
-        previous_result = None
+        anchor_gray = None
+        anchor_result = None
+        frame_index = 0
+        region_mask = np.zeros((height, width), np.uint8)
+        for candidate in candidates:
+            inset_x = round(candidate.width * .06)
+            inset_y = round(candidate.height * .06)
+            left, top = candidate.x + inset_x, candidate.y + inset_y
+            right = candidate.x + candidate.width - inset_x
+            bottom = candidate.y + candidate.height - inset_y
+            radius = max(2, min((bottom - top) // 2, (right - left) // 6))
+            cv2.rectangle(region_mask, (left + radius, top), (right - radius, bottom), 255, -1)
+            cv2.rectangle(region_mask, (left, top + radius), (right, bottom - radius), 255, -1)
+            for center in (
+                (left + radius, top + radius),
+                (right - radius, top + radius),
+                (left + radius, bottom - radius),
+                (right - radius, bottom - radius),
+            ):
+                cv2.circle(region_mask, center, radius, 255, -1)
+        region_alpha = (
+            cv2.GaussianBlur(region_mask, (0, 0), 3).astype(np.float32) / 255
+        )[..., None]
         while True:
             if time.monotonic() - started > timeout_seconds:
                 raise TimeoutError("LaMa watermark removal timed out")
@@ -249,21 +279,61 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
                 break
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             scene_cut = previous_gray is not None and float(cv2.absdiff(gray, previous_gray).mean()) > 32
-            for candidate in candidates:
-                frame = _inpaint_candidate(frame, candidate, session, inputs, cv2)
-            if previous_result is not None and previous_gray is not None and not scene_cut:
-                flow = cv2.calcOpticalFlowFarneback(previous_gray, gray, None, .5, 3, 15, 3, 5, 1.2, 0)
-                gx, gy = np.meshgrid(np.arange(width), np.arange(height))
-                warped = cv2.remap(previous_result, (gx + flow[..., 0]).astype(np.float32),
-                                   (gy + flow[..., 1]).astype(np.float32), cv2.INTER_LINEAR)
-                mask = np.zeros((height, width), np.uint8)
+            is_keyframe = (
+                anchor_result is None
+                or scene_cut
+                or frame_index % keyframe_interval == 0
+            )
+            if is_keyframe:
                 for candidate in candidates:
-                    cv2.rectangle(mask, (candidate.x, candidate.y),
-                                  (candidate.x + candidate.width, candidate.y + candidate.height), 255, -1)
-                alpha = (cv2.GaussianBlur(mask, (0, 0), 3).astype(np.float32) / 255 * .18)[..., None]
-                frame = (frame * (1 - alpha) + warped * alpha).astype(np.uint8)
+                    frame = _inpaint_candidate(frame, candidate, session, inputs, cv2)
+                anchor_gray, anchor_result = gray.copy(), frame.copy()
+            elif anchor_result is not None and anchor_gray is not None:
+                flow = cv2.calcOpticalFlowFarneback(anchor_gray, gray, None, .5, 3, 15, 3, 5, 1.2, 0)
+                gx, gy = np.meshgrid(np.arange(width), np.arange(height))
+                # remap expects current-output -> previous-source coordinates;
+                # Farneback returns previous -> current displacement.
+                warped = cv2.remap(
+                    anchor_result,
+                    (gx - flow[..., 0]).astype(np.float32),
+                    (gy - flow[..., 1]).astype(np.float32),
+                    cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_REFLECT,
+                )
+                ring = cv2.dilate(
+                    region_mask, np.ones((31, 31), np.uint8), iterations=1,
+                )
+                ring = (ring > 0) & (region_mask == 0)
+                if np.any(ring):
+                    matched = warped.astype(np.float32)
+                    current_float = frame.astype(np.float32)
+                    for channel in range(3):
+                        source_values = matched[..., channel][ring]
+                        target_values = current_float[..., channel][ring]
+                        source_std = max(1.0, float(source_values.std()))
+                        target_std = max(1.0, float(target_values.std()))
+                        matched[..., channel] = (
+                            (matched[..., channel] - float(source_values.mean()))
+                            * min(2.0, target_std / source_std)
+                            + float(target_values.mean())
+                        )
+                    warped = np.clip(matched, 0, 255).astype(np.uint8)
+                fresh = cv2.inpaint(
+                    frame,
+                    cv2.dilate(region_mask, np.ones((5, 5), np.uint8)),
+                    5,
+                    cv2.INPAINT_TELEA,
+                )
+                stabilized = (
+                    fresh.astype(np.float32) * .92
+                    + warped.astype(np.float32) * .08
+                )
+                frame = (
+                    frame * (1 - region_alpha) + stabilized * region_alpha
+                ).astype(np.uint8)
             writer.write(frame)
-            previous_gray, previous_result = gray, frame.copy()
+            previous_gray = gray
+            frame_index += 1
         capture.release()
         writer.release()
         if not silent.is_file() or silent.stat().st_size == 0:
@@ -285,11 +355,19 @@ def _inpaint_candidate(frame, candidate, session, inputs, cv2):
     crop = frame[y1:y2, x1:x2]
     resized = cv2.resize(crop, (512, 512), interpolation=cv2.INTER_AREA)
     mask = np.zeros((512, 512), np.float32)
-    mx1 = round((candidate.x - x1) / (x2 - x1) * 512)
-    my1 = round((candidate.y - y1) / (y2 - y1) * 512)
-    mx2 = round((candidate.x + candidate.width - x1) / (x2 - x1) * 512)
-    my2 = round((candidate.y + candidate.height - y1) / (y2 - y1) * 512)
-    cv2.rectangle(mask, (mx1, my1), (mx2, my2), 1, -1)
+    inset_x = round(candidate.width * .06)
+    inset_y = round(candidate.height * .06)
+    mx1 = round((candidate.x + inset_x - x1) / (x2 - x1) * 512)
+    my1 = round((candidate.y + inset_y - y1) / (y2 - y1) * 512)
+    mx2 = round((candidate.x + candidate.width - inset_x - x1) / (x2 - x1) * 512)
+    my2 = round((candidate.y + candidate.height - inset_y - y1) / (y2 - y1) * 512)
+    radius = max(2, min((my2 - my1) // 2, (mx2 - mx1) // 6))
+    cv2.rectangle(mask, (mx1 + radius, my1), (mx2 - radius, my2), 1, -1)
+    cv2.rectangle(mask, (mx1, my1 + radius), (mx2, my2 - radius), 1, -1)
+    cv2.circle(mask, (mx1 + radius, my1 + radius), radius, 1, -1)
+    cv2.circle(mask, (mx2 - radius, my1 + radius), radius, 1, -1)
+    cv2.circle(mask, (mx1 + radius, my2 - radius), radius, 1, -1)
+    cv2.circle(mask, (mx2 - radius, my2 - radius), radius, 1, -1)
     mask = cv2.dilate(mask, np.ones((7, 7), np.uint8), iterations=1).astype(np.float32)
     image = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255
     image = np.transpose(image, (2, 0, 1))[None]

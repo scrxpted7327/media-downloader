@@ -214,11 +214,31 @@ class DownloadEditActionTests(unittest.TestCase):
             self.assertFalse(any(label.startswith("⏩ Voice Speed") for label in labels))
             self.assertTrue(any(label.startswith("🎤 Voice Settings [") for label in labels))
             self.assertIn("❌ Auto Captions", labels)
-            self.assertIn("❌ Remove Watermark", labels)
+            self.assertIn("🔄 Watermark Mode [Keep]", labels)
             self.assertIn("❌ Channel Banner", labels)
             self.assertIn(f"editcfg:{edit.id}:set:auto_captions:yes", callbacks)
-            self.assertIn(f"editcfg:{edit.id}:set:watermark_removal:yes", callbacks)
+            self.assertIn(f"editcfg:{edit.id}:watermark_mode", callbacks)
             self.assertIn(f"editcfg:{edit.id}:set:channel_banner:yes", callbacks)
+
+        asyncio.run(run())
+
+    def test_swap_mode_shows_replacement_text_setting(self):
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            await update_edit_job(
+                self.db_path, edit.id,
+                watermark_mode="swap", watermark_text="@my_channel",
+            )
+            edit = await get_edit_job(self.db_path, edit.id)
+
+            markup = build_editconfig_keyboard(edit)
+            labels = [button.text for row in markup.inline_keyboard for button in row]
+            callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+            self.assertIn("🔄 Watermark Mode [Swap]", labels)
+            self.assertIn("✏️ Replacement Watermark [@my_channel]", labels)
+            self.assertIn(f"editcfg:{edit.id}:watermark_text", callbacks)
 
         asyncio.run(run())
 

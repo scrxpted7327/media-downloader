@@ -232,6 +232,7 @@ class StorageTests(unittest.TestCase):
                 self.db_path, 1, "full",
                 caption_text="hello", caption_color="yellow", caption_style="bold",
                 caption_position="high", voice_over_voice="alice", voice_quality="premium", voice_speed=1.2,
+                watermark_mode="swap", watermark_text="@replacement",
             )
             self.assertEqual(preset.caption_text, "hello")
             self.assertEqual(preset.caption_color, "yellow")
@@ -240,6 +241,8 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(preset.voice_over_voice, "alice")
             self.assertEqual(preset.voice_quality, "premium")
             self.assertEqual(preset.voice_speed, 1.2)
+            self.assertEqual(preset.watermark_mode, "swap")
+            self.assertEqual(preset.watermark_text, "@replacement")
             updated = await update_preset(self.db_path, preset.id, 1, caption_color="red")
             self.assertEqual(updated.caption_color, "red")
 

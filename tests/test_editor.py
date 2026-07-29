@@ -97,6 +97,29 @@ def _create_test_image(path: Path) -> None:
 
 
 class RenderEditIntegrationTests(unittest.TestCase):
+    def test_render_edit_swaps_manual_watermark_with_text(self):
+        if not Path(shutil.which("ffmpeg") or "").is_file():
+            self.skipTest("ffmpeg not available")
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            video = root / "input.mp4"
+            output = root / "output.mp4"
+            _create_test_video(video)
+
+            asyncio.run(render_edit(
+                input_path=video,
+                output_path=output,
+                auto_captions=False,
+                watermark_removal=True,
+                watermark_mode="swap",
+                watermark_text="@replacement",
+                watermark_position="top-right",
+                timeout_seconds=60,
+            ))
+
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+
     def test_render_edit_banner_and_watermark(self):
         if not Path(shutil.which("ffmpeg") or "").is_file():
             self.skipTest("ffmpeg not available")
