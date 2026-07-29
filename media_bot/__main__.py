@@ -6,6 +6,7 @@ import logging
 import shutil
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -84,6 +85,7 @@ from .storage import (
     update_job,
 )
 from .tools import prefer_ffmpeg_full, provision_ytdlp
+from .watermark import WatermarkAnalysis, analyze_video, create_preview
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1181,6 +1183,74 @@ async def _get_latest_pending_edit(db_path: Path, user_id: int) -> tuple[int, in
         return (row["id"], row["source_job_id"]) if row else None
 
 
+def _watermark_review_keyboard(edit, analysis: WatermarkAnalysis) -> InlineKeyboardMarkup:
+    selected = set(json.loads(edit.watermark_candidates or "[]"))
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{'✅' if item.id in selected else '⬜'} Candidate {item.id} ({item.confidence:.0%})",
+                callback_data=f"watermark:{edit.id}:toggle:{item.id}",
+            )
+        ]
+        for item in analysis.candidates
+    ]
+    rows.append([
+        InlineKeyboardButton("Apply selected", callback_data=f"watermark:{edit.id}:apply"),
+        InlineKeyboardButton("Skip removal", callback_data=f"watermark:{edit.id}:skip"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        return
+    try:
+        edit_id = int(parts[1])
+    except ValueError:
+        return
+    db_path: Path = context.application.bot_data["db_path"]
+    edit = await get_edit_job(db_path, edit_id)
+    if edit is None or edit.user_id != query.from_user.id:
+        await query.answer("This review belongs to another user.", show_alert=True)
+        return
+    if edit.status != "awaiting_watermark_review" or not edit.watermark_analysis:
+        await query.answer("This watermark review is no longer active.", show_alert=True)
+        return
+    await query.answer()
+    analysis = WatermarkAnalysis.from_json(edit.watermark_analysis)
+    action = parts[2]
+    if action == "toggle" and len(parts) == 4:
+        try:
+            candidate_id = int(parts[3])
+        except ValueError:
+            return
+        valid = {item.id for item in analysis.candidates}
+        if candidate_id not in valid:
+            return
+        selected = set(json.loads(edit.watermark_candidates or "[]"))
+        selected.symmetric_difference_update({candidate_id})
+        edit = await update_edit_job(
+            db_path, edit_id, watermark_candidates=json.dumps(sorted(selected)),
+        )
+        await query.edit_message_reply_markup(_watermark_review_keyboard(edit, analysis))
+        return
+    if action == "skip":
+        await update_edit_job(
+            db_path, edit_id, watermark_candidates="[]", status="pending",
+        )
+        await query.edit_message_caption("Watermark removal skipped. Resuming render…")
+    elif action == "apply":
+        await update_edit_job(db_path, edit_id, status="pending")
+        await query.edit_message_caption("Selection accepted. Resuming render…")
+    else:
+        return
+    asyncio.create_task(_render_edit_job(update, context, edit_id))
+
+
 async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
     settings: Settings = context.application.bot_data["settings"]
     db_path: Path = context.application.bot_data["db_path"]
@@ -1220,6 +1290,61 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fill" if preset else "fill")
         wm_removal = edit.watermark_removal
         wm_pos = edit.watermark_position if edit.watermark_position is not None else (preset.watermark_position or "auto" if preset else "auto")
+        wm_candidates = None
+        if wm_removal and wm_pos == "auto":
+            if not edit.watermark_analysis:
+                await msg.edit_text("🔎 Analyzing persistent watermark regions…")
+                try:
+                    analysis = await asyncio.to_thread(analyze_video, Path(edit.file_path))
+                except Exception as exc:
+                    LOGGER.warning("Persistent watermark analysis unavailable: %s", exc)
+                    append_event(
+                        "watermark_analysis", "Analysis unavailable; using legacy delogo detection",
+                        edit_id=edit_id, user_id=edit.user_id, error=str(exc),
+                        fallback_used=True,
+                    )
+                    analysis = None
+                if analysis is None:
+                    wm_candidates = None
+                else:
+                    preview_path = storage_dir / f"edit-{edit.id}-watermarks.jpg"
+                    if analysis.candidates:
+                        await asyncio.to_thread(
+                            create_preview, Path(edit.file_path), analysis, preview_path,
+                        )
+                    confidence = max((item.confidence for item in analysis.candidates), default=0.0)
+                    edit = await update_edit_job(
+                        db_path, edit.id, watermark_analysis=analysis.to_json(),
+                        watermark_confidence=confidence,
+                        watermark_candidates=json.dumps(list(analysis.selected)),
+                        watermark_preview_path=str(preview_path) if analysis.candidates else None,
+                        status="awaiting_watermark_review" if analysis.requires_review else "pending",
+                    )
+                    append_event(
+                        "watermark_analysis", "Persistent watermark analysis completed",
+                        edit_id=edit_id, user_id=edit.user_id, confidence=confidence,
+                        candidates=[item.box for item in analysis.candidates],
+                        selected=list(analysis.selected),
+                        duration_seconds=analysis.duration_seconds,
+                    )
+                    if analysis.requires_review:
+                        await msg.edit_text("Watermark candidates need your review.")
+                        with preview_path.open("rb") as preview:
+                            await update.effective_message.reply_photo(
+                                preview,
+                                caption="Select the numbered regions to remove, then tap Apply.",
+                                reply_markup=_watermark_review_keyboard(edit, analysis),
+                            )
+                        return
+            if edit.watermark_analysis:
+                analysis = WatermarkAnalysis.from_json(edit.watermark_analysis)
+                selected_ids = set(json.loads(edit.watermark_candidates or "[]"))
+                wm_candidates = [
+                    asdict(candidate) for candidate in analysis.candidates
+                    if candidate.id in selected_ids
+                ]
+                if not wm_candidates:
+                    wm_removal = False
         ch_banner = edit.channel_banner
 
         steps = []
@@ -1260,24 +1385,30 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             source_url=source.url,
             timeout_seconds=settings.timeout_seconds,
             progress_callback=reporter,
+            watermark_candidates=wm_candidates,
+            tools_dir=settings.tools_dir,
         )
     except DownloadError as exc:
         await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
         await msg.edit_text(f"❌ Render failed: {exc}")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…")
+    fallback_note = (
+        "\n⚠️ LaMa was unavailable; adaptive FFmpeg removal was used."
+        if getattr(reporter, "watermark_fallback_used", False) else ""
+    )
+    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…{fallback_note}")
     try:
         await _send_document_with_retry(
             update.effective_message,
             out_path,
-            f"✅ Render complete. Job #{edit.id} ready.",
+            f"✅ Render complete. Job #{edit.id} ready.{fallback_note}",
             settings.upload_timeout_seconds,
             _render_pool_keyboard(edit.id, saved=False),
         )
     except Exception as exc:
         await update.effective_message.reply_text(
-            f"✅ Render complete. Job #{edit.id} ready.\n⚠️ Could not send file: {exc}",
+            f"✅ Render complete. Job #{edit.id} ready.{fallback_note}\n⚠️ Could not send file: {exc}",
             reply_markup=_render_pool_keyboard(edit.id, saved=False),
         )
     if subtitles_path:
@@ -1592,6 +1723,7 @@ def main() -> None:
     application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("editconfig", editconfig_command))
     application.add_handler(CallbackQueryHandler(editconfig_callback, pattern=r"^editcfg:"))
+    application.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^watermark:"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^download:"))
     application.add_handler(
         MessageHandler(filters.PHOTO | filters.Document.IMAGE, _message_router)

@@ -52,6 +52,7 @@ nftables==0.1
 numpy==2.5.1
 olefile==0.47
 onnxruntime==1.27.0
+opencv-python-headless==4.13.0.92
 packaging==25.0
 perf==0.1
 pexpect==4.9.0

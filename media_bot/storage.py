@@ -101,6 +101,10 @@ class EditJob:
     banner_scale: str | None
     watermark_removal: bool
     watermark_position: str | None
+    watermark_analysis: str | None
+    watermark_confidence: float | None
+    watermark_candidates: str | None
+    watermark_preview_path: str | None
     channel_banner: bool
     subtitles_path: str | None
     status: str
@@ -357,6 +361,10 @@ async def init_db(db_path: Path) -> None:
                 ("banner_scale", "TEXT"),
                 ("watermark_removal", "INTEGER NOT NULL DEFAULT 0"),
                 ("watermark_position", "TEXT"),
+                ("watermark_analysis", "TEXT"),
+                ("watermark_confidence", "REAL"),
+                ("watermark_candidates", "TEXT"),
+                ("watermark_preview_path", "TEXT"),
                 ("channel_banner", "INTEGER NOT NULL DEFAULT 0"),
                 ("subtitles_path", "TEXT"),
             ]),
@@ -1176,6 +1184,10 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         banner_scale=row["banner_scale"],
         watermark_removal=_safe_bool(row, "watermark_removal"),
         watermark_position=row["watermark_position"],
+        watermark_analysis=row["watermark_analysis"],
+        watermark_confidence=row["watermark_confidence"],
+        watermark_candidates=row["watermark_candidates"],
+        watermark_preview_path=row["watermark_preview_path"],
         channel_banner=_safe_bool(row, "channel_banner"),
         subtitles_path=row["subtitles_path"],
         status=row["status"],
