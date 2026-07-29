@@ -13,6 +13,7 @@ from media_bot.watermark import (
     WatermarkAnalysis,
     analyze_video,
     provision_lama_model,
+    select_onnx_providers,
 )
 
 
@@ -51,6 +52,26 @@ def _top_center_pill_video(path: Path) -> None:
 
 
 class WatermarkAnalysisTests(unittest.TestCase):
+    def test_onnx_defaults_to_cpu_even_when_accelerators_are_available(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                select_onnx_providers(
+                    ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+                ),
+                ["CPUExecutionProvider"],
+            )
+
+    def test_onnx_accelerator_is_explicit_opt_in(self):
+        with patch.dict(
+            "os.environ", {"MEDIA_BOT_ONNX_PROVIDER": "CoreMLExecutionProvider"}
+        ):
+            self.assertEqual(
+                select_onnx_providers(
+                    ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+                ),
+                ["CoreMLExecutionProvider"],
+            )
+
     def test_detects_persistent_corner_text_and_round_trips_json(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "logo.mp4"

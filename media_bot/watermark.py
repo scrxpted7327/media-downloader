@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -20,6 +21,20 @@ LAMA_MODEL_SHA256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4e
 AUTO_ACCEPT_CONFIDENCE = 0.78
 SAMPLE_COUNT = 28
 LAMA_KEYFRAME_FPS = 2.0
+
+
+def select_onnx_providers(available: list[str]) -> list[str]:
+    """Use CPU by default; accelerators are an explicit, validated opt-in."""
+    requested = os.getenv("MEDIA_BOT_ONNX_PROVIDER", "CPUExecutionProvider").strip()
+    if requested in available:
+        return [requested]
+    if "CPUExecutionProvider" in available:
+        LOGGER.warning(
+            "Requested ONNX provider %s is unavailable; using CPUExecutionProvider",
+            requested,
+        )
+        return ["CPUExecutionProvider"]
+    raise RuntimeError(f"no usable ONNX execution provider (available: {available})")
 
 
 @dataclass(frozen=True)
@@ -234,7 +249,7 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
     import onnxruntime as ort
     cv2 = _cv2()
     started = time.monotonic()
-    providers = ort.get_available_providers()
+    providers = select_onnx_providers(ort.get_available_providers())
     session = ort.InferenceSession(str(model_path), providers=providers)
     inputs = session.get_inputs()
     if len(inputs) < 2:
