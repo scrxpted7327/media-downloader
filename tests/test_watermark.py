@@ -34,6 +34,22 @@ def _video(path: Path, *, logo: bool) -> None:
     writer.release()
 
 
+def _top_center_pill_video(path: Path) -> None:
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 12, (320, 180),
+    )
+    for index in range(36):
+        frame = np.full((180, 320, 3), (20 + index * 2, 35, 50), np.uint8)
+        cv2.circle(frame, ((index * 11) % 320, 105), 34, (100, 60, 180), -1)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (112, 9), (208, 35), (3, 3, 3), -1)
+        cv2.addWeighted(overlay, .82, frame, .18, 0, frame)
+        cv2.putText(frame, ".hot_tea.", (119, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                    .42, (245, 245, 245), 1, cv2.LINE_AA)
+        writer.write(frame)
+    writer.release()
+
+
 class WatermarkAnalysisTests(unittest.TestCase):
     def test_detects_persistent_corner_text_and_round_trips_json(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -51,6 +67,19 @@ class WatermarkAnalysisTests(unittest.TestCase):
             path = Path(directory) / "clean.mp4"
             _video(path, logo=False)
             self.assertEqual(analyze_video(path, sample_count=24).candidates, ())
+
+    def test_detects_small_top_center_username_pill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "top-center.mp4"
+            _top_center_pill_video(path)
+
+            analysis = analyze_video(path, sample_count=24)
+
+            self.assertTrue(analysis.candidates)
+            candidate = analysis.candidates[0]
+            self.assertLess(candidate.y, 45)
+            self.assertGreater(candidate.x, 90)
+            self.assertLess(candidate.x + candidate.width, 230)
 
     def test_model_download_is_checksum_verified_and_cached(self):
         payload = b"pinned-model"
