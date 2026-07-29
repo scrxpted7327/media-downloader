@@ -1222,6 +1222,16 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         b_scale = edit.banner_scale if edit.banner_scale is not None else (preset.banner_scale or "fill" if preset else "fill")
         wm_removal = edit.watermark_removal
         wm_pos = edit.watermark_position if edit.watermark_position is not None else (preset.watermark_position or "auto" if preset else "auto")
+        wm_mode = edit.watermark_mode if edit.watermark_mode is not None else (
+            preset.watermark_mode if preset and preset.watermark_mode else
+            ("remove" if wm_removal else "keep")
+        )
+        wm_text = edit.watermark_text if edit.watermark_text is not None else (
+            preset.watermark_text if preset else None
+        )
+        if wm_mode == "swap" and not (wm_text and wm_text.strip()):
+            raise DownloadError("Set Replacement Watermark text before using Swap mode.")
+        wm_removal = wm_mode in ("remove", "swap")
         wm_candidates = None
         if wm_removal and wm_pos == "auto":
             if not edit.watermark_analysis:
@@ -1264,7 +1274,11 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                         with preview_path.open("rb") as preview:
                             await update.effective_message.reply_photo(
                                 preview,
-                                caption="Select the numbered regions to remove, then tap Apply.",
+                                caption=(
+                                    "Select the numbered regions to replace, then tap Apply."
+                                    if wm_mode == "swap"
+                                    else "Select the numbered regions to remove, then tap Apply."
+                                ),
                                 reply_markup=_watermark_review_keyboard(edit, analysis),
                             )
                         return
@@ -1281,7 +1295,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
 
         steps = []
         if wm_removal:
-            steps.append("Watermark removal")
+            steps.append("Watermark swap" if wm_mode == "swap" else "Watermark removal")
         if cap_text or auto_cap:
             steps.append("Captions")
         if v_text:
@@ -1319,6 +1333,8 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             progress_callback=reporter,
             watermark_candidates=wm_candidates,
             tools_dir=settings.tools_dir,
+            watermark_mode=wm_mode,
+            watermark_text=wm_text,
         )
     except DownloadError as exc:
         await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))

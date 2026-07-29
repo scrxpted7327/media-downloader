@@ -1126,6 +1126,70 @@ async def _compose_channel_banner_image(
     return out
 
 
+async def overlay_replacement_watermark(
+    input_path: Path,
+    output_path: Path,
+    text: str,
+    candidates: list[dict] | None,
+    position: str,
+    timeout_seconds: int,
+    progress_callback: ProgressCallback | None = None,
+) -> Path:
+    width, height = _get_video_dimensions(input_path)
+    regions = [
+        (int(item["x"]), int(item["y"]), int(item["width"]), int(item["height"]))
+        for item in (candidates or [])
+    ]
+    if not regions:
+        region_width = max(1, int(width * _WATERMARK_REGION_RATIO))
+        region_height = max(1, int(height * _WATERMARK_REGION_RATIO * .6))
+        positions = {
+            "top-left": (1, 1),
+            "top-right": (width - region_width - 1, 1),
+            "bottom-left": (1, height - region_height - 1),
+            "bottom-right": (width - region_width - 1, height - region_height - 1),
+            "center": ((width - region_width) // 2, (height - region_height) // 2),
+        }
+        x, y = positions.get(position, positions["top-right"])
+        regions = [(x, y, region_width, region_height)]
+    safe_text = (
+        text.replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace(":", "\\:")
+        .replace("%", "\\%")
+    )
+    filters = []
+    for x, y, region_width, region_height in regions:
+        height_size = region_height * .42
+        width_size = region_width / max(1.0, len(text) * .62)
+        font_size = max(10, round(min(height_size, width_size)))
+        border = max(2, round(font_size * .08))
+        padding = max(4, round(font_size * .22))
+        filters.append(
+            f"drawtext=text='{safe_text}':fontcolor=white:fontsize={font_size}:"
+            f"borderw={border}:bordercolor=black@0.9:"
+            f"box=1:boxcolor=black@0.58:boxborderw={padding}:"
+            f"x={x}+({region_width}-text_w)/2:"
+            f"y={y}+({region_height}-text_h)/2"
+        )
+    filters.append("format=yuv420p")
+    command = [
+        "ffmpeg", "-y", "-i", str(input_path), "-vf", ",".join(filters),
+        "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
+        "-c:a", "copy", "-movflags", "+faststart", str(output_path),
+    ]
+    await _run_ffmpeg_with_progress(
+        command,
+        timeout_seconds,
+        f"replacement watermark overlay failed for {input_path.name}",
+        total_duration_us=_get_duration_us(input_path),
+        progress_callback=progress_callback,
+    )
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise DownloadError("replacement watermark overlay produced no output")
+    return output_path
+
+
 async def render_edit(
     input_path: Path,
     output_path: Path,
@@ -1150,6 +1214,8 @@ async def render_edit(
     progress_callback: ProgressCallback | None = None,
     watermark_candidates: list[dict] | None = None,
     tools_dir: Path | None = None,
+    watermark_mode: str = "keep",
+    watermark_text: str | None = None,
 ) -> tuple[Path, str | None]:
     current = input_path
     intermediate = output_path.with_suffix(".intermediate" + output_path.suffix)
@@ -1168,6 +1234,18 @@ async def render_edit(
         if progress_callback:
             await progress_callback(100)
         step_idx += 1
+        if watermark_mode == "swap":
+            if not watermark_text or not watermark_text.strip():
+                raise DownloadError("replacement watermark text is required in Swap mode")
+            current = await overlay_replacement_watermark(
+                current,
+                output_path.with_name(f"{output_path.stem}_swap{output_path.suffix}"),
+                watermark_text.strip(),
+                watermark_candidates,
+                watermark_position,
+                timeout_seconds,
+                progress_callback=progress_callback,
+            )
 
     subtitles_result: str | None = None
     if caption_text or auto_captions:

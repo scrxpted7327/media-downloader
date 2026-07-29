@@ -93,6 +93,11 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
         ("↘️ Bottom-right", "bottom-right"),
         ("🎯 Center", "center"),
     ],
+    "watermark_mode": [
+        ("⏭ Keep original", "keep"),
+        ("🧽 Remove", "remove"),
+        ("🔁 Swap", "swap"),
+    ],
     "watermark_removal": [("✅ Yes", "yes"), ("❌ No", "no")],
     "channel_banner": [("✅ Yes", "yes"), ("❌ No", "no")],
     "auto_captions": [("✅ Yes", "yes"), ("❌ No", "no")],
@@ -100,6 +105,7 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
 
 _TEXT_FIELDS = frozenset({
     "voice_over_voice", "voice_text", "caption_text", "banner_path",
+    "watermark_text",
 })
 
 _BOOL_FIELDS = frozenset({"watermark_removal", "channel_banner", "auto_captions"})
@@ -192,6 +198,8 @@ def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
         "banner_scale": cfg.banner_scale,
         "watermark_removal": cfg.watermark_removal,
         "watermark_position": cfg.watermark_position,
+        "watermark_mode": cfg.watermark_mode,
+        "watermark_text": cfg.watermark_text,
         "channel_banner": cfg.channel_banner,
     }
 
@@ -299,15 +307,28 @@ def _build_config_rows(
         [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
     ]
     if include_watermark_position:
+        wm_mode = values.get("watermark_mode")
+        if not wm_mode:
+            wm_mode = "remove" if values.get("watermark_removal") else "keep"
+        mode_labels = {"keep": "Keep", "remove": "Remove", "swap": "Swap"}
+        rows.append([InlineKeyboardButton(
+            f"🔄 Watermark Mode [{mode_labels.get(wm_mode, wm_mode)}]",
+            callback_data=f"{field_prefix}:watermark_mode",
+        )])
         wm_pos = _fmt_current(values.get("watermark_position"))
         rows.append([InlineKeyboardButton(
             f"🧭 Watermark Position [{wm_pos}]",
             callback_data=f"{field_prefix}:watermark_position",
         )])
+        if wm_mode == "swap":
+            wm_text = _fmt_current(values.get("watermark_text"))
+            rows.append([InlineKeyboardButton(
+                f"✏️ Replacement Watermark [{wm_text}]",
+                callback_data=f"{field_prefix}:watermark_text",
+            )])
     toggles = Menu()
     for label, field in (
         ("Auto Captions", "auto_captions"),
-        ("Remove Watermark", "watermark_removal"),
         ("Channel Banner", "channel_banner"),
     ):
         enabled = bool(values.get(field))
