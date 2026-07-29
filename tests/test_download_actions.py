@@ -242,6 +242,53 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_watermark_text_input_updates_edit_job(self):
+        from media_bot.__main__ import editconfig_text
+
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = {
+                "action": "editconfig",
+                "edit_id": edit.id,
+                "field_name": "watermark_text",
+            }
+            update = MagicMock()
+            update.message = MagicMock()
+            update.message.text = "@alexis.s5"
+            update.message.reply_text = AsyncMock()
+
+            with patch(
+                "media_bot.__main__.show_editconfig_menu",
+                new_callable=AsyncMock,
+            ) as show_menu:
+                handled = await editconfig_text(update, context)
+
+            self.assertTrue(handled)
+            updated = await get_edit_job(self.db_path, edit.id)
+            self.assertEqual(updated.watermark_text, "@alexis.s5")
+            show_menu.assert_awaited_once()
+
+        asyncio.run(run())
+
+    def test_photo_handler_ignores_editconfig_dict_flow(self):
+        async def run():
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = {
+                "action": "editconfig",
+                "edit_id": 1,
+                "field_name": "watermark_text",
+            }
+            update = MagicMock()
+            update.message = MagicMock()
+
+            handled = await settings_photo_handler(update, context)
+
+            self.assertFalse(handled)
+
+        asyncio.run(run())
+
     def test_edit_menu_returns_to_source_download(self):
         from media_bot.settings_ui import handle_editconfig_callback
 

@@ -850,8 +850,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    flow: FlowState = context.user_data.get("settings_flow")
-    if flow is None or not update.message:
+    flow = context.user_data.get("settings_flow")
+    if not isinstance(flow, FlowState) or not update.message:
         return False
     if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD):
         return False

@@ -404,13 +404,13 @@ async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     handled = await settings_text_entry(update, context)
     if handled:
         return
-    handled = await settings_photo_entry(update, context)
+    handled = await editconfig_text(update, context)
     if handled:
         return
     handled = await pool_text_entry(update, context)
     if handled:
         return
-    handled = await editconfig_text(update, context)
+    handled = await settings_photo_entry(update, context)
     if handled:
         return
     await handle_url(update, context)
