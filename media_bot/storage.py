@@ -74,6 +74,8 @@ class Preset:
     banner_scale: str | None
     watermark_removal: bool
     watermark_position: str | None
+    watermark_mode: str | None
+    watermark_text: str | None
     channel_banner: bool
     shared: bool
     share_code: str | None
@@ -102,6 +104,8 @@ class EditJob:
     banner_scale: str | None
     watermark_removal: bool
     watermark_position: str | None
+    watermark_mode: str | None
+    watermark_text: str | None
     watermark_analysis: str | None
     watermark_confidence: float | None
     watermark_candidates: str | None
@@ -341,6 +345,8 @@ async def init_db(db_path: Path) -> None:
                 ("banner_scale", "TEXT"),
                 ("watermark_removal", "INTEGER NOT NULL DEFAULT 0"),
                 ("watermark_position", "TEXT"),
+                ("watermark_mode", "TEXT"),
+                ("watermark_text", "TEXT"),
                 ("channel_banner", "INTEGER NOT NULL DEFAULT 0"),
             ]),
             ("jobs", [
@@ -365,6 +371,8 @@ async def init_db(db_path: Path) -> None:
                 ("banner_scale", "TEXT"),
                 ("watermark_removal", "INTEGER NOT NULL DEFAULT 0"),
                 ("watermark_position", "TEXT"),
+                ("watermark_mode", "TEXT"),
+                ("watermark_text", "TEXT"),
                 ("watermark_analysis", "TEXT"),
                 ("watermark_confidence", "REAL"),
                 ("watermark_candidates", "TEXT"),
@@ -527,8 +535,8 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
             "INSERT INTO presets (user_id, name, crop_preset, caption_text, voice_over_voice, "
             "caption_color, caption_style, caption_position, auto_captions, voice_quality, voice_speed, "
             "voice_text, tts_engine, banner_path, banner_position, banner_scale, "
-            "watermark_removal, watermark_position, channel_banner) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "watermark_removal, watermark_position, watermark_mode, watermark_text, channel_banner) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 name,
@@ -548,6 +556,8 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
                 kwargs.get("banner_scale"),
                 int(bool(kwargs.get("watermark_removal"))),
                 kwargs.get("watermark_position"),
+                kwargs.get("watermark_mode"),
+                kwargs.get("watermark_text"),
                 int(bool(kwargs.get("channel_banner"))),
             ),
         )
@@ -1168,6 +1178,8 @@ def _row_to_preset(row: aiosqlite.Row) -> Preset:
         banner_scale=row["banner_scale"],
         watermark_removal=_safe_bool(row, "watermark_removal"),
         watermark_position=row["watermark_position"],
+        watermark_mode=row["watermark_mode"],
+        watermark_text=row["watermark_text"],
         channel_banner=_safe_bool(row, "channel_banner"),
         shared=bool(row["shared"]),
         share_code=row["share_code"],
@@ -1197,6 +1209,8 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         banner_scale=row["banner_scale"],
         watermark_removal=_safe_bool(row, "watermark_removal"),
         watermark_position=row["watermark_position"],
+        watermark_mode=row["watermark_mode"],
+        watermark_text=row["watermark_text"],
         watermark_analysis=row["watermark_analysis"],
         watermark_confidence=row["watermark_confidence"],
         watermark_candidates=row["watermark_candidates"],

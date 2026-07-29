@@ -46,7 +46,10 @@ shown as numbered Telegram buttons and remain reviewable after a bot restart.
 The pinned Apache-2.0 LaMa ONNX model is downloaded lazily to
 `MEDIA_BOT_TOOLS_DIR` and SHA-256 verified. If ONNX inference or provisioning
 fails, the render completes with adaptive FFmpeg `delogo` regions and reports
-the fallback. Choosing a named watermark position remains a manual override.
+the fallback. Presets can Keep, Remove, or Swap detected watermarks; Swap
+removes selected regions and centers the preset's replacement username/text
+inside each region. Choosing a named watermark position remains a manual
+override.
 
 ### Optional Ryzen Whisper worker
 
