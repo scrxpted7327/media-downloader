@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -768,11 +769,44 @@ async def remove_watermark(
     position: str = "auto",
     timeout_seconds: int = 600,
     progress_callback: ProgressCallback | None = None,
+    candidates: list[dict] | None = None,
+    tools_dir: Path | None = None,
 ) -> Path:
     if not input_path.is_file():
         raise DownloadError(f"input file not found for watermark removal ({input_path.name})")
     if shutil.which("ffmpeg") is None:
         raise DownloadError("ffmpeg is required for watermark removal")
+
+    if position == "auto" and candidates:
+        from .diagnostics import append_event
+        from .watermark import WatermarkCandidate, inpaint_video, provision_lama_model
+        selected = [WatermarkCandidate(**item) for item in candidates]
+        started = time.monotonic()
+        try:
+            model = await asyncio.to_thread(
+                provision_lama_model, tools_dir or Path("runtime/tools"),
+            )
+            backend, duration = await asyncio.to_thread(
+                inpaint_video, input_path, output_path, selected, model, timeout_seconds,
+            )
+            append_event("watermark_removal", "AI watermark removal completed",
+                         confidence=max((item.confidence for item in selected), default=0),
+                         masks=[item.box for item in selected], inference_backend=backend,
+                         fallback_used=False, duration_seconds=round(duration, 3))
+            return output_path
+        except Exception as exc:
+            LOGGER.warning("LaMa inference unavailable; using adaptive delogo: %s", exc)
+            if progress_callback is not None:
+                setattr(progress_callback, "watermark_fallback_used", True)
+            append_event("watermark_removal", "Adaptive delogo fallback used",
+                         confidence=max((item.confidence for item in selected), default=0),
+                         masks=[item.box for item in selected], inference_backend=None,
+                         fallback_used=True, error=str(exc),
+                         duration_seconds=round(time.monotonic() - started, 3))
+            return await _remove_watermark_regions(
+                input_path, output_path, [item.box for item in selected],
+                timeout_seconds, progress_callback,
+            )
 
     if position == "auto":
         detected = await _detect_watermark_position(input_path, timeout_seconds)
@@ -821,6 +855,37 @@ async def remove_watermark(
     if not output_path.is_file():
         LOGGER.warning("Watermark removal produced no output for %s, skipping", input_path.name)
         return input_path
+    return output_path
+
+
+async def _remove_watermark_regions(
+    input_path: Path,
+    output_path: Path,
+    regions: list[tuple[int, int, int, int]],
+    timeout_seconds: int,
+    progress_callback: ProgressCallback | None,
+) -> Path:
+    """Fallback for irregular masks: use one tightly bounded delogo per candidate."""
+    vid_w, vid_h = _get_video_dimensions(input_path)
+    filters = []
+    for x, y, width, height in regions:
+        x = max(1, min(int(x), vid_w - 4))
+        y = max(1, min(int(y), vid_h - 4))
+        width = max(2, min(int(width), vid_w - x - 2))
+        height = max(2, min(int(height), vid_h - y - 2))
+        filters.append(f"delogo=x={x}:y={y}:w={width}:h={height}:show=0")
+    if not filters:
+        return input_path
+    filters.append("format=yuv420p")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path), "-vf", ",".join(filters),
+        "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
+        "-c:a", "copy", "-movflags", "+faststart", str(output_path),
+    ]
+    await _run_ffmpeg_with_progress(
+        cmd, timeout_seconds, f"watermark fallback failed for {input_path.name}",
+        total_duration_us=_get_duration_us(input_path), progress_callback=progress_callback,
+    )
     return output_path
 
 
@@ -1083,6 +1148,8 @@ async def render_edit(
     source_url: str | None = None,
     timeout_seconds: int = 600,
     progress_callback: ProgressCallback | None = None,
+    watermark_candidates: list[dict] | None = None,
+    tools_dir: Path | None = None,
 ) -> tuple[Path, str | None]:
     current = input_path
     intermediate = output_path.with_suffix(".intermediate" + output_path.suffix)
@@ -1093,7 +1160,11 @@ async def render_edit(
         tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_wm{output_path.suffix}")
         if advance:
             advance(step_idx)
-        current = await remove_watermark(current, tmp, watermark_position, timeout_seconds, progress_callback=progress_callback)
+        current = await remove_watermark(
+            current, tmp, watermark_position, timeout_seconds,
+            progress_callback=progress_callback, candidates=watermark_candidates,
+            tools_dir=tools_dir,
+        )
         if progress_callback:
             await progress_callback(100)
         step_idx += 1

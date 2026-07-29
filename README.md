@@ -40,6 +40,14 @@ OS package manager (`brew install ffmpeg`, `apt install ffmpeg`, etc.). The bot
 detects it and tells the operator when it is missing; it does not silently
 package or execute an unverified ffmpeg build.
 
+Automatic watermark removal samples the middle 90% of a video for persistent
+logos or text. Confident regions render immediately; uncertain regions are
+shown as numbered Telegram buttons and remain reviewable after a bot restart.
+The pinned Apache-2.0 LaMa ONNX model is downloaded lazily to
+`MEDIA_BOT_TOOLS_DIR` and SHA-256 verified. If ONNX inference or provisioning
+fails, the render completes with adaptive FFmpeg `delogo` regions and reports
+the fallback. Choosing a named watermark position remains a manual override.
+
 ### Optional Ryzen Whisper worker
 
 To offload automatic caption transcription to a Ryzen machine, add these to
