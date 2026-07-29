@@ -1563,29 +1563,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     asyncio.create_task(_run_report_agent())
 
 
-async def _start_auto_fix(application: Application) -> None:
-    settings: Settings = application.bot_data["settings"]
-
-    async def _report_to_admin(text: str):
-        if settings.allowed_user_ids:
-            chat_id = next(iter(settings.allowed_user_ids))
-            try:
-                await application.bot.send_message(chat_id=chat_id, text=text)
-            except Exception:
-                pass
-
-    async def _watch_loop():
-        from .fix_agent import watch_and_fix
-        await watch_and_fix(
-            workspace=Path.cwd(),
-            tools_dir=settings.tools_dir,
-            report_callback=_report_to_admin,
-        )
-
-    asyncio.create_task(_watch_loop())
-    LOGGER.info("Auto-fix daemon started")
-
-
 async def cleanup_task(context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     db_path: Path = context.application.bot_data["db_path"]
@@ -1616,8 +1593,6 @@ async def _post_init(application: Application) -> None:
     await site.start()
     application.bot_data["download_runner"] = runner
     LOGGER.info("Download server started on port %d", settings.download_port)
-
-    await _start_auto_fix(application)
 
     cleaned = await cleanup_download_messages(db_path, application.bot)
     if cleaned:

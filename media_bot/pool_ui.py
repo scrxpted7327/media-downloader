@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from .storage import (
@@ -35,6 +36,19 @@ from .storage import (
 LOGGER = logging.getLogger(__name__)
 
 _PAGE_SIZE = 6
+
+
+async def _answer_callback(query, text: str | None = None, *, show_alert: bool = False) -> bool:
+    """A stale Telegram callback must not prevent the requested pool action."""
+    try:
+        await query.answer(text, show_alert=show_alert)
+        return True
+    except BadRequest as exc:
+        message = str(exc).lower()
+        if "query is too old" in message or "query id is invalid" in message:
+            LOGGER.info("Ignoring expired pool callback acknowledgement: %s", exc)
+            return False
+        raise
 
 
 class _State:
@@ -67,7 +81,7 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     if query is None or query.data is None:
         return
-    await query.answer()
+    await _answer_callback(query)
 
     flow: FlowState = context.user_data.get("pool_flow")
     if flow is None:
@@ -98,7 +112,7 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         db_path: Path = context.application.bot_data["db_path"]
         job = await get_job(db_path, job_id)
         if job is None or job.file_path is None:
-            await query.answer("Source not found", show_alert=True)
+            await _answer_callback(query, "Source not found", show_alert=True)
             return
         flow.action = _State.POOL_ADD_NAME
         flow.data["source_job_id"] = job.id
@@ -162,13 +176,13 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         item = await get_pool_item(db_path, pool_item_id)
         user = update.effective_user
         if item is None or user is None or item.user_id != user.id:
-            await query.answer("Pool item not found", show_alert=True)
+            await _answer_callback(query, "Pool item not found", show_alert=True)
             return
         path = Path(item.file_path)
         if not path.is_file():
-            await query.answer("Saved file is missing", show_alert=True)
+            await _answer_callback(query, "Saved file is missing", show_alert=True)
             return
-        await query.answer("Sending…")
+        await _answer_callback(query, "Sending…")
         with path.open("rb") as document:
             await query.message.reply_document(
                 document=document,
@@ -192,11 +206,11 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if user:
             tag = await add_pool_tag(db_path, pool_item_id, classification_id, user.id)
             if tag:
-                await query.answer("Tagged")
+                await _answer_callback(query, "Tagged")
             else:
-                await query.answer("Already tagged", show_alert=True)
+                await _answer_callback(query, "Already tagged", show_alert=True)
         else:
-            await query.answer("Unauthorized", show_alert=True)
+            await _answer_callback(query, "Unauthorized", show_alert=True)
         flow.action = _State.CLASSIFY_SELECT
         flow.data["pool_item_id"] = pool_item_id
         await _show_classify_select(update, context)
@@ -208,7 +222,7 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         classification_id = int(parts[3])
         db_path: Path = context.application.bot_data["db_path"]
         removed = await remove_pool_tag(db_path, pool_item_id, classification_id)
-        await query.answer("Removed" if removed else "Not found")
+        await _answer_callback(query, "Removed" if removed else "Not found")
         flow.action = _State.CLASSIFY_SELECT
         flow.data["pool_item_id"] = pool_item_id
         await _show_classify_select(update, context)
@@ -219,9 +233,9 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         db_path: Path = context.application.bot_data["db_path"]
         user = update.effective_user
         if user and await delete_pool_item(db_path, pool_item_id, user.id):
-            await query.answer("Deleted")
+            await _answer_callback(query, "Deleted")
         else:
-            await query.answer("Failed", show_alert=True)
+            await _answer_callback(query, "Failed", show_alert=True)
         flow.action = _State.POOL_LIST
         await _show_pool_list(update, context)
         return
@@ -238,7 +252,7 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         wf = await get_workflow(db_path, wf_id)
         if wf:
             await update_workflow(db_path, wf_id, wf.user_id, enabled=not wf.enabled)
-            await query.answer("Updated")
+            await _answer_callback(query, "Updated")
         await _show_workflow_list(update, context)
         return
 
@@ -247,9 +261,9 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         db_path: Path = context.application.bot_data["db_path"]
         user = update.effective_user
         if user and await delete_workflow(db_path, wf_id, user.id):
-            await query.answer("Deleted")
+            await _answer_callback(query, "Deleted")
         else:
-            await query.answer("Failed", show_alert=True)
+            await _answer_callback(query, "Failed", show_alert=True)
         await _show_workflow_list(update, context)
         return
 
