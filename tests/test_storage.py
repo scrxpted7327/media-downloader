@@ -147,6 +147,22 @@ class StorageTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_download_token_can_target_rendered_edit(self):
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            token = await create_download_token(
+                self.db_path, job.id, 1, 15, edit_job_id=edit.id,
+            )
+
+            consumed = await consume_download_token(self.db_path, token)
+
+            self.assertEqual(consumed.job_id, job.id)
+            self.assertEqual(consumed.edit_job_id, edit.id)
+
+        asyncio.run(run())
+
     def test_cleanup_expired_tokens(self):
         import asyncio
 

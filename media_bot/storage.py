@@ -36,6 +36,7 @@ class JobRecord:
 class DownloadToken:
     token_hash: str
     job_id: int
+    edit_job_id: int | None
     created_at: datetime
     expires_at: datetime
     used_at: datetime | None
@@ -328,6 +329,9 @@ async def init_db(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_dlmsg_expires ON download_messages(expires_at);
         """)
         for _table, _cols in [
+            ("download_tokens", [
+                ("edit_job_id", "INTEGER REFERENCES edit_jobs(id) ON DELETE CASCADE"),
+            ]),
             ("presets", [
                 ("auto_captions", "INTEGER NOT NULL DEFAULT 0"),
                 ("voice_text", "TEXT"),
@@ -441,14 +445,22 @@ async def list_all_jobs(db_path: Path, limit: int = 30) -> list[JobRecord]:
         return [_row_to_job(row) for row in rows]
 
 
-async def create_download_token(db_path: Path, job_id: int, user_id: int, expiry_minutes: int) -> str:
+async def create_download_token(
+    db_path: Path,
+    job_id: int,
+    user_id: int,
+    expiry_minutes: int,
+    *,
+    edit_job_id: int | None = None,
+) -> str:
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
-            "INSERT INTO download_tokens (token_hash, job_id, expires_at, user_id) VALUES (?, ?, ?, ?)",
-            (token_hash, job_id, expires_at.isoformat(), user_id),
+            "INSERT INTO download_tokens "
+            "(token_hash, job_id, edit_job_id, expires_at, user_id) VALUES (?, ?, ?, ?, ?)",
+            (token_hash, job_id, edit_job_id, expires_at.isoformat(), user_id),
         )
         await db.commit()
     return raw_token
@@ -1116,6 +1128,7 @@ def _row_to_token(row: aiosqlite.Row) -> DownloadToken:
     return DownloadToken(
         token_hash=row["token_hash"],
         job_id=row["job_id"],
+        edit_job_id=_safe_int(row, "edit_job_id"),
         created_at=datetime.fromisoformat(row["created_at"]),
         expires_at=datetime.fromisoformat(row["expires_at"]),
         used_at=datetime.fromisoformat(row["used_at"]) if row["used_at"] else None,

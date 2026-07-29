@@ -340,6 +340,44 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
         await status_message.edit_text(text, reply_markup=keyboard)
 
 
+async def _send_render_download_link(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    edit,
+    settings: Settings,
+    db_path: Path,
+) -> str:
+    """Send a usable edit link before attempting the slower Telegram upload."""
+    token = await create_download_token(
+        db_path,
+        edit.source_job_id,
+        edit.user_id,
+        settings.token_expiry_minutes,
+        edit_job_id=edit.id,
+    )
+    url = _build_download_url(settings, token)
+    link_message = await message.reply_text(
+        f"⬇️ Direct download ({settings.token_expiry_minutes} min):\n{url}",
+        disable_web_page_preview=True,
+        reply_markup=_render_pool_keyboard(edit.id, saved=False),
+    )
+    record_id = await store_download_message(
+        db_path, link_message.chat_id, link_message.message_id,
+        settings.token_expiry_minutes,
+    )
+    context.job_queue.run_once(
+        _delete_expired_link,
+        settings.token_expiry_minutes * 60,
+        data={
+            "chat_id": link_message.chat_id,
+            "message_id": link_message.message_id,
+            "db_path": str(db_path),
+            "msg_record_id": record_id,
+        },
+    )
+    return url
+
+
 def _build_download_url(settings: Settings, token: str) -> str:
     domain = settings.download_domain or "localhost"
     return f"https://{domain}/download/{token}"
@@ -720,114 +758,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             watermark_removal=preset.watermark_removal,
             channel_banner=preset.channel_banner,
         )
-
-        msg = await query.edit_message_text(f"🎬 Rendering with \"{preset.name}\"...")
-
-        async def _preset_render_task():
-            out_path = storage_dir / f"edit-{edit.id}-final.mp4"
-            try:
-                steps = []
-                if preset.watermark_removal:
-                    steps.append("Watermark removal")
-                if preset.caption_text or preset.auto_captions:
-                    steps.append("Captions")
-                if preset.voice_text:
-                    steps.append("Voice-over")
-                if preset.channel_banner and job.url:
-                    steps.append("Channel banner")
-                if preset.banner_path:
-                    steps.append("Banner overlay")
-                if not steps:
-                    steps.append("Rendering")
-
-                reporter = _ProgressReporter(msg, steps)
-
-                out_path, subtitles_path = await render_edit(
-                    input_path=Path(dest),
-                    output_path=out_path,
-                    caption_text=preset.caption_text,
-                    caption_color=preset.caption_color or "white",
-                    caption_style=preset.caption_style or "basic",
-                    caption_position=preset.caption_position or "bottom",
-                    auto_captions=preset.auto_captions,
-                    voice_text=preset.voice_text,
-                    voice=preset.voice_over_voice or "default",
-                    voice_quality=preset.voice_quality or "basic",
-                    voice_speed=preset.voice_speed or 1.0,
-                    tts_engine=preset.tts_engine,
-                    banner_path=Path(preset.banner_path) if preset.banner_path else None,
-                    banner_position=preset.banner_position or "bottom",
-                    banner_scale=preset.banner_scale or "fill",
-                    watermark_removal=preset.watermark_removal,
-                    watermark_position=preset.watermark_position or "auto",
-                    channel_banner=preset.channel_banner,
-                    source_url=job.url,
-                    timeout_seconds=settings.timeout_seconds,
-                    progress_callback=reporter,
-                )
-            except DownloadError as exc:
-                await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
-                await msg.edit_text(f"❌ Render failed: {exc}")
-                return
-            await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
-            file_sent = False
-            try:
-                with out_path.open("rb") as f:
-                    await context.bot.send_document(
-                        chat_id=query.message.chat_id,
-                        document=f,
-                        caption=f"✅ Rendered with \"{preset.name}\"",
-                        reply_to_message_id=query.message.message_id,
-                        reply_markup=_render_pool_keyboard(edit.id, saved=False),
-                    )
-                file_sent = True
-            except Exception:
-                pass
-            if not file_sent:
-                token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
-                url = _build_download_url(settings, token)
-                dl_msg = await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f"✅ Rendered with \"{preset.name}\" – one-time download ({settings.token_expiry_minutes} min):\n{url}",
-                    reply_to_message_id=query.message.message_id,
-                    disable_web_page_preview=True,
-                )
-                msg_record_id = await store_download_message(db_path, dl_msg.chat_id, dl_msg.message_id, settings.token_expiry_minutes)
-                context.job_queue.run_once(
-                    _delete_expired_link,
-                    settings.token_expiry_minutes * 60,
-                    data={"chat_id": dl_msg.chat_id, "message_id": dl_msg.message_id, "db_path": str(db_path), "msg_record_id": msg_record_id},
-                )
-            if subtitles_path:
-                try:
-                    with Path(subtitles_path).open("rb") as f:
-                        await context.bot.send_document(
-                            chat_id=query.message.chat_id,
-                            document=f,
-                            caption="📄 Subtitles available.",
-                            reply_to_message_id=query.message.message_id,
-                        )
-                except Exception:
-                    srt_token = await create_download_token(db_path, edit.id, current_user_id, settings.token_expiry_minutes)
-                    srt_url = _build_download_url(settings, srt_token)
-                    srt_msg = await context.bot.send_message(
-                        chat_id=query.message.chat_id,
-                        text=f"📄 Subtitles: {srt_url}",
-                        reply_to_message_id=query.message.message_id,
-                        disable_web_page_preview=True,
-                    )
-                    srt_record_id = await store_download_message(db_path, srt_msg.chat_id, srt_msg.message_id, settings.token_expiry_minutes)
-                    context.job_queue.run_once(
-                        _delete_expired_link,
-                        settings.token_expiry_minutes * 60,
-                        data={"chat_id": srt_msg.chat_id, "message_id": srt_msg.message_id, "db_path": str(db_path), "msg_record_id": srt_record_id},
-                    )
-            try:
-                await msg.edit_text(f"✅ Rendered with \"{preset.name}\" — file sent above." if file_sent else f"✅ Rendered with \"{preset.name}\" — download link sent above.")
-            except Exception:
-                pass
-
-        asyncio.create_task(_preset_render_task())
+        await query.edit_message_text(f"🎬 Rendering with \"{preset.name}\"…")
+        asyncio.create_task(_render_edit_job(update, context, edit.id))
         return
 
 
@@ -1397,13 +1329,23 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         "\n⚠️ LaMa was unavailable; adaptive FFmpeg removal was used."
         if getattr(reporter, "watermark_fallback_used", False) else ""
     )
-    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…{fallback_note}")
+    try:
+        await _send_render_download_link(
+            update.effective_message, context, edit, settings, db_path,
+        )
+        delivery_status = "Direct download ready; uploading a Telegram copy"
+    except Exception as exc:
+        LOGGER.warning("Could not send direct edit link for job %s: %s", edit.id, exc)
+        delivery_status = "Uploading"
+    await _safe_status_edit(
+        msg, f"✅ Render complete. {delivery_status} for job #{edit.id}…{fallback_note}",
+    )
     try:
         await _send_document_with_retry(
             update.effective_message,
             out_path,
             f"✅ Render complete. Job #{edit.id} ready.{fallback_note}",
-            settings.upload_timeout_seconds,
+            min(settings.upload_timeout_seconds, 120),
             _render_pool_keyboard(edit.id, saved=False),
         )
     except Exception as exc:
