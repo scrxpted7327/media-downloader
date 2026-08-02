@@ -43,6 +43,7 @@ class Settings:
     db_path: Path = field(default_factory=lambda: Path("runtime/jobs/media-bot.db"))
     token_expiry_minutes: int = 15
     retention_days: int = 7
+    mass_download_max_mb: int = 50 * 1024
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -64,14 +65,15 @@ class Settings:
         db_path = Path(os.getenv("MEDIA_BOT_DB_PATH") or "runtime/jobs/media-bot.db").expanduser()
         token_expiry = int(os.getenv("MEDIA_BOT_TOKEN_EXPIRY_MINUTES") or "15")
         retention_days = int(os.getenv("MEDIA_BOT_RETENTION_DAYS") or "7")
+        mass_download_max_mb = int(os.getenv("MEDIA_BOT_MASS_DOWNLOAD_MAX_MB") or str(50 * 1024))
         if max_size < 1 or timeout < 1 or upload_timeout < 1:
             raise ValueError("download size and timeouts must be positive")
         if not (1 <= download_port <= 65535):
             raise ValueError("download port must be a valid TCP port")
         if not (1 <= token_expiry <= 1440):
             raise ValueError("token expiry must be between 1 and 1440 minutes")
-        if retention_days < 1:
-            raise ValueError("retention days must be positive")
+        if retention_days < 1 or mass_download_max_mb < 1:
+            raise ValueError("retention days and mass download size must be positive")
         return cls(
             token=token,
             allowed_user_ids=users,
@@ -88,4 +90,5 @@ class Settings:
             db_path=db_path,
             token_expiry_minutes=token_expiry,
             retention_days=retention_days,
+            mass_download_max_mb=mass_download_max_mb,
         )

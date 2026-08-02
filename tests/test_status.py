@@ -3,6 +3,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from telegram.error import RetryAfter
@@ -11,6 +12,7 @@ from media_bot.__main__ import (
     DownloadReporter,
     _ProgressReporter,
     _format_eta_line,
+    _notify_restart_online,
     _safe_status_edit,
     _send_document_with_retry,
 )
@@ -68,6 +70,33 @@ class ProgressReporterTests(unittest.TestCase):
 
 
 class EtaFormatTests(unittest.TestCase):
+    def test_restart_online_notification_consumes_marker(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                marker = Path(tmp) / "restart-requested"
+                ack = Path(tmp) / "restart-ack"
+                marker.write_text("requested")
+                ack.write_text("sent")
+                application = SimpleNamespace(bot=AsyncMock())
+                settings = SimpleNamespace(allowed_chat_ids={-1008}, allowed_user_ids={123})
+                with (
+                    patch("media_bot.__main__.RESTART_MARKER", marker),
+                    patch("media_bot.__main__.RESTART_ACK", ack),
+                    patch("media_bot.__main__.append_event"),
+                    patch.dict("os.environ", {}, clear=True),
+                ):
+                    notified = await _notify_restart_online(application, settings)
+
+                self.assertTrue(notified)
+                application.bot.send_message.assert_awaited_once_with(
+                    chat_id=-1008,
+                    text="🟢 MediaDL bot is back online.",
+                )
+                self.assertFalse(marker.exists())
+                self.assertFalse(ack.exists())
+
+        asyncio.run(run())
+
     def test_format_eta_line(self):
         self.assertEqual(_format_eta_line(0.5, 10), "⏱ calculating…")
         self.assertIn("left", _format_eta_line(10, 50))

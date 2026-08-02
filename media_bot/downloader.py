@@ -294,6 +294,62 @@ async def download_tiktok_slideshow(
         raise
 
 
+async def download_tiktok_account(
+    gallerydl: Path,
+    profile_url: str,
+    max_archive_mb: int,
+    timeout_seconds: int,
+    post_limit: int | None = 50,
+) -> tuple[tempfile.TemporaryDirectory[str], Path, int]:
+    """Download a TikTok profile and package its media as one ZIP archive."""
+    if not gallerydl.is_file() or not os.access(gallerydl, os.X_OK):
+        raise DownloadError("gallery-dl is required for TikTok account downloads")
+    if post_limit is not None and not (1 <= post_limit <= 500):
+        raise DownloadError("TikTok account limit must be between 1 and 500, or 'all'")
+
+    temporary = tempfile.TemporaryDirectory(prefix="media-bot-tiktok-account-")
+    root = Path(temporary.name)
+    downloads = root / "media"
+    downloads.mkdir()
+    command = [
+        str(gallerydl), "--config-ignore", "--no-colors",
+        "--directory", str(downloads), "--write-metadata",
+        "--filename", "{id}_{num:03}.{extension}", "--sleep-request", "0.5",
+    ]
+    if post_limit is not None:
+        command.extend(["--post-range", f"1-{post_limit}"])
+    command.append(profile_url)
+    try:
+        await _run_checked(
+            command, timeout_seconds,
+            f"TikTok account download failed for {profile_url[:80]}",
+        )
+        media = sorted(
+            path for path in downloads.rglob("*")
+            if path.is_file() and path.suffix.lower() in (
+                _IMAGE_SUFFIXES | _VIDEO_SUFFIXES | {".mp3", ".m4a", ".aac", ".wav"}
+            )
+        )
+        if not media:
+            raise DownloadError("TikTok account produced no downloadable media")
+        total_bytes = sum(path.stat().st_size for path in media)
+        if total_bytes > max_archive_mb * 1024 * 1024:
+            raise DownloadError(
+                f"TikTok account media exceeds the configured {max_archive_mb} MB archive limit"
+            )
+        account = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile_url.rstrip("/").split("/")[-1]) or "account"
+        archive = root / f"tiktok-{account.lstrip('@')}.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED, allowZip64=True) as bundle:
+            for path in media:
+                bundle.write(path, path.relative_to(downloads))
+        if not archive.is_file() or archive.stat().st_size == 0:
+            raise DownloadError("TikTok account archive creation failed")
+        return temporary, archive, len(media)
+    except Exception:
+        temporary.cleanup()
+        raise
+
+
 async def _render_tiktok_video(
     directory: Path, images: list[Path], audio: Path,
     max_filesize_mb: int, timeout_seconds: int,

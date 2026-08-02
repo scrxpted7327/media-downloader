@@ -1,9 +1,27 @@
 import unittest
 
-from media_bot.platforms import extract_supported_urls, is_supported_url, is_tiktok_photo_url
+from media_bot.platforms import (
+    extract_supported_urls,
+    is_supported_url,
+    is_tiktok_photo_url,
+    normalize_tiktok_profile,
+)
 
 
 class SupportedUrlTests(unittest.TestCase):
+    def test_normalizes_tiktok_profile_inputs(self):
+        expected = "https://www.tiktok.com/@creator.name"
+        for value in (
+            "creator.name", "@creator.name", "tiktok.com/creator.name",
+            "www.tiktok.com/@creator.name/", "https://www.tiktok.com/@creator.name/posts",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_tiktok_profile(value), expected)
+
+    def test_rejects_non_profile_tiktok_input(self):
+        self.assertIsNone(normalize_tiktok_profile("https://example.com/@creator"))
+        self.assertIsNone(normalize_tiktok_profile("https://www.tiktok.com/@creator/video/123"))
+
     def test_all_supported_platforms(self):
         for url in (
             "https://www.youtube.com/watch?v=abc", "https://youtube.com/shorts/abc", "https://youtu.be/abc",

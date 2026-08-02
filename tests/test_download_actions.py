@@ -10,6 +10,7 @@ from media_bot.settings_ui import (
     _State,
     _handle_preset_create_callback,
     build_editconfig_keyboard,
+    presets_command,
     settings_photo_handler,
 )
 from media_bot.storage import (
@@ -66,6 +67,119 @@ class DownloadEditActionTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmpdir.cleanup()
+
+    def test_presets_command_opens_preset_list(self):
+        async def run():
+            await init_db(self.db_path)
+            await create_preset(self.db_path, 1, "My preset")
+            context = _make_context(self.db_path, self.storage_dir)
+            message = MagicMock()
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.message = message
+            update.callback_query = None
+            update.effective_user = SimpleNamespace(id=1)
+
+            await presets_command(update, context)
+
+            self.assertEqual(context.user_data["settings_flow"].action, _State.PRESET_LIST)
+            message.reply_text.assert_awaited_once()
+            self.assertIn("Your presets", message.reply_text.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_active_text_input_consumes_url_before_downloader(self):
+        from media_bot.__main__ import _message_router
+
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = {
+                "action": "editconfig",
+                "edit_id": edit.id,
+                "field_name": "voice_text",
+            }
+            message = MagicMock()
+            message.text = "https://example.com/narration"
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.message = message
+            update.effective_message = message
+
+            with (
+                patch("media_bot.__main__._authorized", return_value=True),
+                patch("media_bot.__main__.show_editconfig_menu", new_callable=AsyncMock),
+                patch("media_bot.__main__.handle_url", new_callable=AsyncMock) as download,
+            ):
+                await _message_router(update, context)
+
+            updated = await get_edit_job(self.db_path, edit.id)
+            self.assertEqual(updated.voice_text, "https://example.com/narration")
+            download.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_active_preset_watermark_text_is_accepted(self):
+        from media_bot.__main__ import _message_router
+
+        async def run():
+            await init_db(self.db_path)
+            preset = await create_preset(self.db_path, 1, "Watermarked")
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = FlowState(
+                action=_State.PRESET_EDIT_FIELD,
+                data={"preset_id": preset.id, "field_name": "watermark_text"},
+            )
+            message = MagicMock()
+            message.text = "@PursuitFiles4"
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.message = message
+            update.effective_message = message
+            update.effective_user = SimpleNamespace(id=1)
+
+            with (
+                patch("media_bot.__main__._authorized", return_value=True),
+                patch("media_bot.__main__.handle_url", new_callable=AsyncMock) as download,
+            ):
+                await _message_router(update, context)
+
+            updated = next(item for item in await list_presets(self.db_path, 1) if item.id == preset.id)
+            self.assertEqual(updated.watermark_text, "@PursuitFiles4")
+            download.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_active_input_rejects_wrong_message_without_downloading(self):
+        from media_bot.__main__ import _message_router
+
+        async def run():
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = {
+                "action": "editconfig",
+                "edit_id": 1,
+                "field_name": "voice_text",
+            }
+            message = MagicMock()
+            message.text = None
+            message.photo = []
+            message.document = SimpleNamespace(mime_type="application/pdf")
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.message = message
+            update.effective_message = message
+
+            with (
+                patch("media_bot.__main__._authorized", return_value=True),
+                patch("media_bot.__main__.handle_url", new_callable=AsyncMock) as download,
+            ):
+                await _message_router(update, context)
+
+            message.reply_text.assert_awaited_once()
+            download.assert_not_awaited()
+
+        asyncio.run(run())
 
     def test_edit_opens_editconfig_and_creates_job(self):
         from media_bot.__main__ import download_callback
@@ -160,6 +274,35 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_download_preset_from_photo_message_still_starts_render(self):
+        from media_bot.__main__ import download_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
+            source = self.storage_dir / "source.mp4"
+            source.write_bytes(b"fake-video")
+            await update_job(self.db_path, job.id, file_path=str(source), status="uploaded")
+            preset = await create_preset(self.db_path, 1, "photo preset")
+            update, query = _make_update(f"download:preset:{job.id}:{preset.id}")
+            query.message.photo = [SimpleNamespace()]
+            query.edit_message_text.side_effect = RuntimeError("message has no text")
+            query.edit_message_caption = AsyncMock()
+            context = _make_context(self.db_path, self.storage_dir)
+            scheduled = []
+
+            def capture(coro):
+                scheduled.append(coro)
+                coro.close()
+
+            with patch("media_bot.__main__.asyncio.create_task", side_effect=capture):
+                await download_callback(update, context)
+
+            query.edit_message_caption.assert_awaited_once()
+            self.assertEqual(len(scheduled), 1)
+
+        asyncio.run(run())
+
     def test_rendered_edit_pool_button_toggles_with_confirmation(self):
         from media_bot.__main__ import download_callback
 
@@ -221,6 +364,19 @@ class DownloadEditActionTests(unittest.TestCase):
             self.assertIn(f"editcfg:{edit.id}:set:channel_banner:yes", callbacks)
 
         asyncio.run(run())
+
+    def test_preset_menu_has_no_manual_caption_text(self):
+        from media_bot.settings_ui import _build_config_rows
+
+        rows = _build_config_rows(
+            {"caption_text": "legacy text"},
+            field_prefix="preset:field:1",
+            toggle_prefix="preset:set:1",
+        )
+        labels = [button.text for row in rows for button in row]
+        callbacks = [button.callback_data for row in rows for button in row]
+        self.assertFalse(any("Caption Text" in label for label in labels))
+        self.assertFalse(any(value.endswith(":caption_text") for value in callbacks))
 
     def test_swap_mode_shows_replacement_text_setting(self):
         async def run():
@@ -286,6 +442,46 @@ class DownloadEditActionTests(unittest.TestCase):
             handled = await settings_photo_handler(update, context)
 
             self.assertFalse(handled)
+
+        asyncio.run(run())
+
+    def test_edit_config_banner_upload_updates_edit_job(self):
+        async def run():
+            await init_db(self.db_path)
+            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = {
+                "action": "editconfig",
+                "edit_id": edit.id,
+                "field_name": "banner_path",
+            }
+            telegram_file = MagicMock()
+
+            async def download(destination):
+                Path(destination).write_bytes(b"image")
+
+            telegram_file.download_to_drive = AsyncMock(side_effect=download)
+            photo = SimpleNamespace(get_file=AsyncMock(return_value=telegram_file))
+            message = MagicMock()
+            message.photo = [photo]
+            message.document = None
+            message.reply_text = AsyncMock()
+            update = MagicMock()
+            update.message = message
+            update.effective_user = SimpleNamespace(id=1)
+
+            with patch(
+                "media_bot.settings_ui.show_editconfig_menu", new_callable=AsyncMock,
+            ) as show_menu:
+                handled = await settings_photo_handler(update, context)
+
+            self.assertTrue(handled)
+            updated = await get_edit_job(self.db_path, edit.id)
+            expected = self.storage_dir / "banners" / f"banner_1_{edit.id}.jpg"
+            self.assertEqual(updated.banner_path, str(expected))
+            self.assertTrue(expected.is_file())
+            self.assertNotIn("field_name", context.user_data["settings_flow"])
+            show_menu.assert_awaited_once_with(update, context, edit.id)
 
         asyncio.run(run())
 

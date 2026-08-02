@@ -12,7 +12,9 @@ from media_bot.editor import (
     _get_video_dimensions,
     _segments_to_srt,
     _transcribe_ssh,
+    render_captions,
     render_edit,
+    render_voice_over,
 )
 from media_bot.downloader import DownloadError
 
@@ -97,6 +99,52 @@ def _create_test_image(path: Path) -> None:
 
 
 class RenderEditIntegrationTests(unittest.TestCase):
+    def test_auto_captions_preserve_video_when_no_speech_is_found(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"silent-video")
+            with (
+                patch("media_bot.editor.shutil.which", return_value="/usr/bin/ffmpeg"),
+                patch("media_bot.editor.transcribe_audio", return_value=[]),
+            ):
+                asyncio.run(render_captions(source, output, auto_captions=True))
+            self.assertEqual(output.read_bytes(), source.read_bytes())
+
+    def test_auto_tts_falls_back_to_espeak_and_does_not_apply_speed_twice(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+
+            async def fail_edge(*args):
+                raise RuntimeError("network unavailable")
+
+            async def make_espeak(_text, path, _voice, _speed, _timeout):
+                path.write_bytes(b"audio")
+
+            async def fake_run(command, *_args, **_kwargs):
+                Path(command[-1]).write_bytes(b"rendered")
+                return b"", b""
+
+            with (
+                patch("media_bot.editor._detect_tts_engine", return_value="edge-tts"),
+                patch("media_bot.editor._tts_espeak", side_effect=make_espeak),
+                patch.dict("media_bot.editor._TTS_ENGINES", {"edge-tts": fail_edge}),
+                patch("media_bot.editor._run_checked", side_effect=fake_run) as run_checked,
+                patch("media_bot.editor.shutil.which", return_value="/usr/bin/espeak-ng"),
+            ):
+                asyncio.run(render_voice_over(
+                    source, output, "Narration", voice="en-US-GuyNeural", speed=1.5,
+                ))
+
+            command = run_checked.await_args.args[0]
+            filter_graph = command[command.index("-filter_complex") + 1]
+            self.assertNotIn("atempo", filter_graph)
+            self.assertTrue(output.is_file())
+
     def test_render_edit_swaps_manual_watermark_with_text(self):
         if not Path(shutil.which("ffmpeg") or "").is_file():
             self.skipTest("ffmpeg not available")
@@ -170,7 +218,7 @@ class RenderEditIntegrationTests(unittest.TestCase):
         finally:
             tmpdir.cleanup()
 
-    def test_render_edit_channel_banner_skips_portrait(self):
+    def test_render_edit_channel_banner_renders_on_portrait(self):
         if not Path(shutil.which("ffmpeg") or "").is_file():
             self.skipTest("ffmpeg not available")
         tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-test-")
@@ -184,16 +232,18 @@ class RenderEditIntegrationTests(unittest.TestCase):
                 capture_output=True, check=True,
             )
 
-            asyncio.run(render_edit(
-                input_path=video,
-                output_path=output,
-                auto_captions=False,
-                channel_banner=True,
-                source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                timeout_seconds=60,
-            ))
+            with patch("media_bot.editor._fetch_channel_identity", return_value=("Test Channel", None)):
+                asyncio.run(render_edit(
+                    input_path=video,
+                    output_path=output,
+                    auto_captions=False,
+                    channel_banner=True,
+                    source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    timeout_seconds=60,
+                ))
 
             self.assertTrue(output.is_file(), "channel_banner on portrait produced no output")
+            self.assertNotEqual(output.read_bytes(), video.read_bytes())
         finally:
             tmpdir.cleanup()
 

@@ -104,7 +104,7 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
 }
 
 _TEXT_FIELDS = frozenset({
-    "voice_over_voice", "voice_text", "caption_text", "banner_path",
+    "voice_over_voice", "voice_text", "banner_path",
     "watermark_text",
 })
 
@@ -184,7 +184,8 @@ def _choice_keyboard(field: str, back_data: str, set_prefix: str) -> InlineKeybo
 def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
     return {
         "auto_captions": cfg.auto_captions,
-        "caption_text": cfg.caption_text,
+        # Manual caption text is retired; captions always come from transcription.
+        "caption_text": None,
         "caption_color": cfg.caption_color,
         "caption_style": cfg.caption_style,
         "caption_position": cfg.caption_position,
@@ -240,13 +241,14 @@ def _tts_engine_overview(engine: str) -> str:
     return (
         f"🎤 Voice settings\n\n"
         f"Current TTS engine: {engine}\n{detail}\n\n"
-        "AI visual narration is not available yet, so manual Voice Text is deprecated."
+        "Set Voice Text to the narration you want generated."
     )
 
 
 def _voice_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{back_data}:voice_over_voice")],
+        [InlineKeyboardButton("📝 Voice Text", callback_data=f"{back_data}:voice_text")],
         [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{back_data}:voice_quality")],
         [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{back_data}:voice_speed")],
         [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{back_data}:tts_engine")],
@@ -288,7 +290,6 @@ def _build_config_rows(
     toggle_prefix: str,
     include_watermark_position: bool = False,
 ) -> list[list[InlineKeyboardButton]]:
-    cap_text = _fmt_current(values.get("caption_text"))
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
     pos = _fmt_current(values.get("caption_position"))
@@ -296,7 +297,6 @@ def _build_config_rows(
     v_quality = _fmt_current(values.get("voice_quality") or "basic")
     b_path = _fmt_current(values.get("banner_path"))
     rows = [
-        [InlineKeyboardButton(f"💬 Caption Text [{cap_text}]", callback_data=f"{field_prefix}:caption_text")],
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
@@ -638,6 +638,12 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _show_menu(update, context)
 
 
+async def presets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the user's preset list directly."""
+    context.user_data["settings_flow"] = FlowState(action=_State.PRESET_LIST)
+    await _show_preset_list(update, context)
+
+
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or query.data is None:
@@ -851,11 +857,20 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     flow = context.user_data.get("settings_flow")
-    if not isinstance(flow, FlowState) or not update.message:
+    if not update.message:
         return False
-    if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD):
+    editconfig_upload = (
+        isinstance(flow, dict)
+        and flow.get("action") == "editconfig"
+        and flow.get("field_name") == "banner_path"
+        and flow.get("edit_id") is not None
+    )
+    settings_upload = isinstance(flow, FlowState) and flow.action in (
+        _State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD,
+    )
+    if not editconfig_upload and not settings_upload:
         return False
-    if (
+    if isinstance(flow, FlowState) and (
         flow.action == _State.PRESET_EDIT_FIELD
         and flow.data.get("field_name") != "banner_path"
     ):
@@ -890,8 +905,22 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     banners_dir.mkdir(parents=True, exist_ok=True)
 
     file = await upload.get_file()
-    dest = banners_dir / f"banner_{user.id}{suffix}"
+    filename_suffix = f"_{flow['edit_id']}" if editconfig_upload else ""
+    dest = banners_dir / f"banner_{user.id}{filename_suffix}{suffix}"
     await file.download_to_drive(dest)
+
+    if editconfig_upload:
+        edit_id = int(flow["edit_id"])
+        updated = await update_edit_job(
+            context.application.bot_data["db_path"], edit_id, banner_path=str(dest),
+        )
+        if updated is None:
+            await message.reply_text("Edit job not found.")
+            return True
+        flow.pop("field_name", None)
+        await message.reply_text("Banner image saved.")
+        await show_editconfig_menu(update, context, edit_id)
+        return True
 
     if flow.action == "set_profile_banner":
         flow.action = _State.MENU
@@ -996,7 +1025,9 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if preset_id is None or field_name is None:
             return False
         value = None if text.lower() == "/skip" else text
-        text_only_fields = {"voice_over_voice", "voice_text", "caption_text", "banner_path", "voice_speed"}
+        text_only_fields = {
+            "voice_over_voice", "voice_text", "watermark_text", "banner_path", "voice_speed",
+        }
         if field_name in text_only_fields:
             if field_name in ("voice_speed",):
                 if value is not None:
@@ -1061,7 +1092,7 @@ async def _show_preset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     rows = []
     for p in page:
         mark = "⭐ " if active_name and p.name == active_name else ""
-        color = color_emoji(p.caption_color)
+        color = color_emoji(p.caption_color or "white")
         label = f"{mark}{p.name} ({color} {p.caption_style or 'none'})"
         rows.append([InlineKeyboardButton(label, callback_data=f"preset:edit:{p.id}")])
     rows.append([InlineKeyboardButton("➕ Create new", callback_data="settings:create_preset")])
@@ -1110,7 +1141,9 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     status = "⭐ Active " if is_active else ""
     text = (
         f"{status}Preset: {preset.name}\n"
-        f"Tap any setting to change it."
+        "Tap any setting to change it.\n\n"
+        "Set as Active puts this preset first (with a ⭐) on each new download's "
+        "quick-render buttons. It does not render automatically."
     )
     await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
@@ -1468,10 +1501,6 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
         toggle_prefix=f"{prefix}:set",
         include_watermark_position=True,
     )
-    rows = [
-        row for row in rows
-        if not row[0].callback_data.endswith(":caption_text")
-    ]
     menu = Menu()
     menu.rows.extend(rows)
     menu.action("💾 Save Config to Preset", f"{prefix}:save_preset")
@@ -1673,6 +1702,7 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             flow["field_name"] = "voice_menu"
         rows = [
             [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{prefix}:voice_menu:voice_over_voice")],
+            [InlineKeyboardButton("📝 Voice Text", callback_data=f"{prefix}:voice_menu:voice_text")],
             [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{prefix}:voice_menu:voice_quality")],
             [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{prefix}:voice_menu:voice_speed")],
             [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{prefix}:voice_menu:tts_engine")],

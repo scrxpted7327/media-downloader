@@ -210,6 +210,11 @@ async def list_tts_voices(engine: str | None = None) -> list[dict[str, str]]:
 
 
 def resolve_voice(voice: str, engine: str | None = None) -> str:
+    # Neural voice names are Edge-specific. Preserve the language when auto
+    # mode falls back to eSpeak instead of passing an invalid voice name.
+    if engine == "espeak-ng" and voice and voice.endswith("Neural"):
+        locale = voice.split("-", 2)
+        return "-".join(locale[:2]).lower() if len(locale) >= 2 else "en"
     if voice and voice not in ("default", "male", "female", ""):
         return voice
     if engine == "edge-tts":
@@ -502,7 +507,14 @@ async def render_captions(
     if auto_captions or not caption_text:
         segments = await transcribe_audio(input_path, timeout_seconds=timeout_seconds)
         if not segments:
-            raise DownloadError(f"transcription produced no segments for {input_path.name}")
+            # Silence and music-only clips are valid inputs. Auto captions have
+            # nothing to add, so preserve the video and let later edit steps run.
+            LOGGER.info("No speech segments found in %s; skipping captions", input_path.name)
+            if output_path != input_path:
+                shutil.copy2(input_path, output_path)
+            if progress_callback:
+                await progress_callback(100)
+            return output_path
         srt_content = _segments_to_srt(segments)
         tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-srt-")
         srt_path = Path(tmpdir.name) / "captions.srt"
@@ -651,7 +663,19 @@ async def render_voice_over(
     try:
         if progress_callback:
             await progress_callback(10)
-        await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
+        try:
+            await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
+        except Exception as exc:
+            # Auto mode should remain usable when the network-backed Edge TTS
+            # service is unavailable on the bot host.
+            if (tts_engine in (None, "auto") and engine == "edge-tts"
+                    and shutil.which("espeak-ng")):
+                LOGGER.warning("Edge TTS failed; falling back to eSpeak NG: %s", exc)
+                engine = "espeak-ng"
+                tmp_audio.unlink(missing_ok=True)
+                await _tts_espeak(voice_text, tmp_audio, voice, speed, timeout_seconds)
+            else:
+                raise
         if progress_callback:
             await progress_callback(30)
 
@@ -668,8 +692,7 @@ async def render_voice_over(
                 "-i", str(input_video),
                 "-i", str(tmp_audio),
                 "-filter_complex",
-                f"[1:a]asetrate={preset['ar']},aresample={preset['ar']}:filter_type=kaiser,"
-                f"atempo={speed:.2f}[aout]",
+                f"[1:a]aresample={preset['ar']}:filter_type=kaiser[aout]",
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "copy",
                 "-c:a", preset["codec"],
@@ -984,45 +1007,19 @@ async def render_channel_banner(
         raise DownloadError("ffmpeg is required for channel banner overlay")
 
     vid_w, vid_h = _get_video_dimensions(input_path)
-    if vid_w <= vid_h:
-        LOGGER.info("Video is portrait/square (%dx%d), skipping channel banner", vid_w, vid_h)
-        if output_path != input_path:
-            shutil.copy2(str(input_path), str(output_path))
-        return output_path
-
     avatar_path: Path | None = None
     channel_title = ""
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-channel-")
     try:
         try:
-            import yt_dlp
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                info = ydl.extract_info(source_url, download=False)
-                channel_title = info.get("channel", info.get("uploader", info.get("creator", ""))) or ""
-                avatar_url = (
-                    info.get("channel_url") or info.get("uploader_url") or ""
-                )
-                if avatar_url:
-                    try:
-                        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl2:
-                            chan_info = ydl2.extract_info(avatar_url, download=False)
-                            thumb = chan_info.get("thumbnails", [])
-                            if thumb:
-                                av_url = thumb[-1].get("url", "")
-                                if av_url:
-                                    import urllib.request
-                                    avatar_path = Path(tmpdir.name) / "avatar.png"
-                                    urllib.request.urlretrieve(av_url, avatar_path)
-                    except Exception:
-                        pass
-                if not avatar_path:
-                    thumbs = info.get("thumbnails", [])
-                    if thumbs:
-                        av_url = thumbs[-1].get("url", "")
-                        if av_url:
-                            import urllib.request
-                            avatar_path = Path(tmpdir.name) / "avatar.png"
-                            urllib.request.urlretrieve(av_url, avatar_path)
+            metadata_timeout = min(30, max(5, timeout_seconds))
+            channel_title, avatar_bytes = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_channel_identity, source_url),
+                timeout=metadata_timeout,
+            )
+            if avatar_bytes:
+                avatar_path = Path(tmpdir.name) / "avatar.img"
+                avatar_path.write_bytes(avatar_bytes)
         except Exception as exc:
             LOGGER.warning("Could not fetch channel info: %s", exc)
 
@@ -1058,6 +1055,42 @@ async def render_channel_banner(
     if not output_path.is_file():
         raise DownloadError(f"channel banner overlay produced no output file ({output_path.name})")
     return output_path
+
+
+def _fetch_channel_identity(source_url: str) -> tuple[str, bytes | None]:
+    """Fetch channel text/avatar with bounded network operations."""
+    import urllib.request
+    import yt_dlp
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 10,
+        "retries": 1,
+        "extractor_retries": 1,
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(source_url, download=False)
+    channel_title = info.get("channel", info.get("uploader", info.get("creator", ""))) or ""
+    avatar_url = info.get("channel_url") or info.get("uploader_url") or ""
+    thumbnails = []
+    if avatar_url:
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                channel_info = ydl.extract_info(avatar_url, download=False)
+            thumbnails = channel_info.get("thumbnails", [])
+        except Exception:
+            pass
+    if not thumbnails:
+        thumbnails = info.get("thumbnails", [])
+    image_url = thumbnails[-1].get("url", "") if thumbnails else ""
+    if not image_url:
+        return channel_title, None
+    with urllib.request.urlopen(image_url, timeout=10) as response:
+        avatar = response.read(10 * 1024 * 1024 + 1)
+    if len(avatar) > 10 * 1024 * 1024:
+        raise DownloadError("channel avatar exceeds 10 MB")
+    return channel_title, avatar
 
 
 async def _compose_channel_banner_image(

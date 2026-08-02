@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from media_bot.downloader import (
     DownloadError,
     download_progress,
+    download_tiktok_account,
     download_tiktok_slideshow,
     read_source_metadata,
 )
@@ -31,6 +32,32 @@ class DownloadProgressTests(unittest.TestCase):
 
 
 class TikTokGalleryDlFallbackTests(unittest.TestCase):
+    def test_downloads_tiktok_account_media_into_zip(self):
+        async def fake_run(cmd, timeout_seconds, error_prefix):
+            directory = Path(cmd[cmd.index("--directory") + 1])
+            (directory / "one.mp4").write_bytes(b"video")
+            (directory / "two.jpg").write_bytes(b"image")
+            (directory / "one.json").write_text("{}")
+
+        gallerydl = Path(tempfile.gettempdir()) / "fake-gallery-dl-account"
+        gallerydl.write_text("#!/bin/sh\n")
+        gallerydl.chmod(0o755)
+
+        async def run():
+            with patch("media_bot.downloader._run_checked", new=AsyncMock(side_effect=fake_run)):
+                temporary, archive, count = await download_tiktok_account(
+                    gallerydl, "https://www.tiktok.com/@creator", 100, 30, 25,
+                )
+            try:
+                self.assertEqual(count, 2)
+                import zipfile
+                with zipfile.ZipFile(archive) as bundle:
+                    self.assertEqual(set(bundle.namelist()), {"one.mp4", "two.jpg"})
+            finally:
+                temporary.cleanup()
+
+        asyncio.run(run())
+
     def test_accepts_video_when_gallery_dl_returns_mp4(self):
         """yt-dlp failures fall back to gallery-dl, which may download a video — not slides."""
 

@@ -27,6 +27,7 @@ RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
 EVENTS_PATH = Path("runtime/events.jsonl")
 SUPERVISOR_LOG = Path("runtime/supervisor.log")
+RESTART_ACK = Path("runtime/restart-shutdown-notified")
 _LOCK_HANDLE = None
 _ERROR_LOG_PATTERN = re.compile(r"Error logged: (err_[A-Za-z0-9_]+)")
 
@@ -54,9 +55,13 @@ def _notification_chat_id() -> str | None:
     return None
 
 
-def _send_telegram_message(text: str) -> None:
+def _restart_notification_chat_id() -> str | None:
+    return os.getenv("TELEGRAM_RESTART_CHAT_ID", "").strip() or _notification_chat_id()
+
+
+def _send_telegram_message(text: str, chat_id: str | None = None) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = _notification_chat_id()
+    chat_id = chat_id or _notification_chat_id()
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_BOT_TOKEN and an error destination must be configured")
     api_base = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip().rstrip("/") or "https://api.telegram.org"
@@ -68,6 +73,29 @@ def _send_telegram_message(text: str) -> None:
     with urllib.request.urlopen(request, timeout=15) as response:
         if response.status >= 400:
             raise RuntimeError(f"Telegram returned HTTP {response.status}")
+
+
+async def notify_restart_shutdown() -> bool:
+    """Handle restart_bot.py's SIGUSR1 shutdown-notification handshake."""
+    success = False
+    try:
+        chat_id = _restart_notification_chat_id()
+        if not chat_id:
+            raise RuntimeError("a Telegram restart destination must be configured")
+        await asyncio.to_thread(
+            _send_telegram_message,
+            "🔴 MediaDL bot is shutting down for a restart…",
+            chat_id,
+        )
+        append_event("restart_shutdown_notified", "Restart shutdown notification sent")
+        success = True
+    except Exception as exc:
+        LOGGER.error("Could not send restart shutdown notification: %s", exc)
+        append_event("restart_shutdown_notification_failed", str(exc))
+    finally:
+        RESTART_ACK.parent.mkdir(parents=True, exist_ok=True)
+        RESTART_ACK.write_text("sent\n" if success else "failed\n", encoding="utf-8")
+    return success
 
 
 async def notify_error(error_id: str, path: Path | None = None) -> bool:
@@ -191,6 +219,10 @@ async def write_error_file(error_id: str, stderr: str, category: str) -> Path:
 
 
 async def supervise(cwd: Path) -> None:
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGUSR1,
+        lambda: asyncio.create_task(notify_restart_shutdown()),
+    )
     bot_args = [sys.executable, "-m", "media_bot"]
     crash_count = 0
     last_crash_time = 0.0
