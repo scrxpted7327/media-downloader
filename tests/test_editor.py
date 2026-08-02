@@ -9,6 +9,8 @@ from unittest.mock import patch
 from media_bot.editor import (
     _ass_timestamp,
     _caption_chunks,
+    _caption_position_override,
+    _build_ass_style,
     _image_difference,
     _get_video_dimensions,
     _segments_to_srt,
@@ -35,6 +37,15 @@ class ImageDifferenceTests(unittest.TestCase):
 
 
 class SegmentsToSrtTests(unittest.TestCase):
+    def test_small_caption_style_and_exact_vertical_position(self):
+        style = _build_ass_style("white", "small", "y30", video_height=1280)
+        self.assertEqual(style["fontsize"], 21)
+        self.assertEqual(style["alignment"], 5)
+        self.assertEqual(
+            _caption_position_override("y30", 720, 1280),
+            "{\\an5\\pos(360,384)}",
+        )
+
     def test_ass_timestamp_uses_centiseconds(self):
         self.assertEqual(_ass_timestamp(40.2), "0:00:40.20")
         self.assertEqual(_ass_timestamp(3661.999), "1:01:02.00")

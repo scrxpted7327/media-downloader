@@ -81,8 +81,20 @@ class FlowState:
 
 
 _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
-    "caption_style": [("✍️ Basic", "basic"), ("💪 Bold", "bold"), ("💬 Bubble", "bubble"), ("🖼️ Border", "border"), ("🎨 Filled", "filled")],
-    "caption_position": [("⬆️ Top", "low"), ("↔️ Middle", "middle"), ("⬇️ Bottom", "high")],
+    "caption_style": [
+        ("✍️ Basic", "basic"), ("🔎 Small Font", "small"),
+        ("💪 Bold", "bold"), ("💬 Bubble", "bubble"),
+        ("🖼️ Border", "border"), ("🎨 Filled", "filled"),
+    ],
+    "caption_position": [
+        ("⬆️ Top", "low"),
+        ("🎯 10% from top", "y10"), ("🎯 20% from top", "y20"),
+        ("🎯 30% from top", "y30"), ("🎯 40% from top", "y40"),
+        ("↔️ Center (50%)", "y50"),
+        ("🎯 60% from top", "y60"), ("🎯 70% from top", "y70"),
+        ("🎯 80% from top", "y80"), ("🎯 90% from top", "y90"),
+        ("⬇️ Bottom", "high"),
+    ],
     "voice_quality": [("📶 Basic", "basic"), ("✨ Premium", "premium")],
     "voice_speed": [
         ("🐢 0.50×", "0.5"), ("0.75×", "0.75"), ("1.00×", "1.0"),
@@ -128,6 +140,13 @@ def _fmt_current(value: Any, *, color: bool = False) -> str:
     if len(text) > 18:
         return text[:15] + "…"
     return text
+
+
+def _caption_position_label(value: Any) -> str:
+    raw = str(value or "none")
+    if len(raw) == 3 and raw.startswith("y") and raw[1:].isdigit():
+        return f"{raw[1:]}% from top"
+    return {"low": "top", "middle": "middle", "high": "bottom"}.get(raw, raw)
 
 
 def _coerce_choice_value(field: str, raw: str) -> Any:
@@ -298,7 +317,7 @@ def _build_config_rows(
 ) -> list[list[InlineKeyboardButton]]:
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
-    pos = _fmt_current(values.get("caption_position"))
+    pos = _caption_position_label(values.get("caption_position"))
     v_name = _fmt_current(values.get("voice_over_voice") or "default")
     v_quality = _fmt_current(values.get("voice_quality") or "basic")
     b_path = _fmt_current(values.get("banner_path"))
