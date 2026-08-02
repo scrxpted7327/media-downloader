@@ -84,6 +84,57 @@ class MenuTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fix_agent.validate_model("openai/gpt-5; touch /tmp/bad")
 
+    def test_known_fix_refuses_to_mutate_when_repair_is_disabled(self):
+        async def run():
+            with patch(
+                "media_bot.fix_agent.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as create_process:
+                result = await fix_agent.apply_known_fix(
+                    {"category": "ytdlp", "message": "yt-dlp failed"},
+                    Path("/tmp/tools"),
+                )
+
+            self.assertIn("disabled", result.lower())
+            create_process.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_dependency_fix_never_installs_an_inferred_package(self):
+        async def run():
+            with patch(
+                "media_bot.fix_agent.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as create_process:
+                result = await fix_agent.apply_known_fix(
+                    {
+                        "category": "dependency",
+                        "message": "ModuleNotFoundError: No module named 'surprise_pkg'",
+                    },
+                    Path("/tmp/tools"),
+                    repair_enabled=True,
+                )
+
+            self.assertIn("surprise_pkg", result)
+            self.assertIn("disabled", result.lower())
+            create_process.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_fix_script_execution_requires_explicit_enablement(self):
+        async def run():
+            with patch(
+                "media_bot.fix_agent.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as create_process:
+                code, output = await fix_agent.run_fix_script("ignored.sh")
+
+            self.assertEqual(code, -1)
+            self.assertIn("disabled", output.lower())
+            create_process.assert_not_awaited()
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

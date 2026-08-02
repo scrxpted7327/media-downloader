@@ -26,6 +26,12 @@ from media_bot.storage import (
 )
 
 
+def _write_test_image(path: Path, image_format: str = "JPEG") -> None:
+    from PIL import Image
+
+    Image.new("RGB", (8, 8), (20, 40, 60)).save(path, format=image_format)
+
+
 def _make_update(callback_data: str, user_id: int = 1):
     query = MagicMock()
     query.data = callback_data
@@ -206,7 +212,17 @@ class DownloadEditActionTests(unittest.TestCase):
 
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            source_job = await create_job(
+                self.db_path,
+                "https://example.com/source",
+                user_id=1,
+                chat_id=2,
+            )
+            edit = await create_edit_job(
+                self.db_path,
+                source_job_id=source_job.id,
+                user_id=1,
+            )
             context = _make_context(self.db_path, self.storage_dir)
             context.user_data["settings_flow"] = {
                 "action": "editconfig",
@@ -527,7 +543,10 @@ class DownloadEditActionTests(unittest.TestCase):
     def test_edit_menu_has_inline_toggles_and_no_caption_text(self):
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            source = await create_job(
+                self.db_path, "https://example.com/menu", user_id=1, chat_id=2,
+            )
+            edit = await create_edit_job(self.db_path, source_job_id=source.id, user_id=1)
 
             markup = build_editconfig_keyboard(edit)
             buttons = [button for row in markup.inline_keyboard for button in row]
@@ -564,7 +583,10 @@ class DownloadEditActionTests(unittest.TestCase):
     def test_swap_mode_shows_replacement_text_setting(self):
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            source = await create_job(
+                self.db_path, "https://example.com/swap", user_id=1, chat_id=2,
+            )
+            edit = await create_edit_job(self.db_path, source_job_id=source.id, user_id=1)
             await update_edit_job(
                 self.db_path, edit.id,
                 watermark_mode="swap", watermark_text="@my_channel",
@@ -586,7 +608,10 @@ class DownloadEditActionTests(unittest.TestCase):
 
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            source = await create_job(
+                self.db_path, "https://example.com/watermark", user_id=1, chat_id=2,
+            )
+            edit = await create_edit_job(self.db_path, source_job_id=source.id, user_id=1)
             context = _make_context(self.db_path, self.storage_dir)
             context.user_data["settings_flow"] = {
                 "action": "editconfig",
@@ -632,7 +657,17 @@ class DownloadEditActionTests(unittest.TestCase):
     def test_edit_config_banner_upload_updates_edit_job(self):
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=1, user_id=1)
+            source_job = await create_job(
+                self.db_path,
+                "https://example.com/banner-source",
+                user_id=1,
+                chat_id=2,
+            )
+            edit = await create_edit_job(
+                self.db_path,
+                source_job_id=source_job.id,
+                user_id=1,
+            )
             context = _make_context(self.db_path, self.storage_dir)
             context.user_data["settings_flow"] = {
                 "action": "editconfig",
@@ -642,7 +677,7 @@ class DownloadEditActionTests(unittest.TestCase):
             telegram_file = MagicMock()
 
             async def download(destination):
-                Path(destination).write_bytes(b"image")
+                _write_test_image(Path(destination))
 
             telegram_file.download_to_drive = AsyncMock(side_effect=download)
             photo = SimpleNamespace(get_file=AsyncMock(return_value=telegram_file))
@@ -661,9 +696,13 @@ class DownloadEditActionTests(unittest.TestCase):
 
             self.assertTrue(handled)
             updated = await get_edit_job(self.db_path, edit.id)
-            expected = self.storage_dir / "banners" / f"banner_1_{edit.id}.jpg"
-            self.assertEqual(updated.banner_path, str(expected))
-            self.assertTrue(expected.is_file())
+            destination = Path(updated.banner_path)
+            self.assertEqual(
+                destination.parent,
+                self.storage_dir / "banners" / "user_1" / f"edit_{edit.id}",
+            )
+            self.assertEqual(destination.suffix, ".jpg")
+            self.assertTrue(destination.is_file())
             self.assertNotIn("field_name", context.user_data["settings_flow"])
             show_menu.assert_awaited_once_with(update, context, edit.id)
 
@@ -736,7 +775,11 @@ class DownloadEditActionTests(unittest.TestCase):
                 action=_State.PRESET_CREATE_BANNER,
             )
             telegram_file = MagicMock()
-            telegram_file.download_to_drive = AsyncMock()
+
+            async def download(destination):
+                _write_test_image(Path(destination), "PNG")
+
+            telegram_file.download_to_drive = AsyncMock(side_effect=download)
             document = SimpleNamespace(
                 file_name="uploaded-banner.png",
                 file_size=2_100_000,
@@ -754,8 +797,13 @@ class DownloadEditActionTests(unittest.TestCase):
             handled = await settings_photo_handler(update, context)
 
             self.assertTrue(handled)
-            destination = telegram_file.download_to_drive.await_args.args[0]
-            self.assertEqual(destination, self.storage_dir / "banners" / "banner_1.png")
+            destination = Path(context.user_data["settings_flow"].data["banner_path"])
+            self.assertEqual(
+                destination.parent,
+                self.storage_dir / "banners" / "user_1" / "preset_draft",
+            )
+            self.assertEqual(destination.suffix, ".png")
+            self.assertTrue(destination.is_file())
             self.assertEqual(
                 context.user_data["settings_flow"].data["banner_path"],
                 str(destination),

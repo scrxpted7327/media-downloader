@@ -64,12 +64,16 @@ class Settings:
     render_workers: int = 1
     work_queue_capacity: int = 32
     per_user_work_capacity: int = 4
+    admin_user_ids: frozenset[int] = field(default_factory=frozenset)
+    repair_enabled: bool = False
 
     @classmethod
     def from_environment(cls) -> "Settings":
         _load_dotenv()
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         users = _id_set("TELEGRAM_ALLOWED_USER_IDS")
+        configured_admins = _id_set("TELEGRAM_ADMIN_USER_IDS")
+        admins = configured_admins or users
         chats = _id_set("TELEGRAM_ALLOWED_CHAT_IDS")
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
@@ -109,6 +113,7 @@ class Settings:
         retention_days = int(os.getenv("MEDIA_BOT_RETENTION_DAYS") or "7")
         mass_download_max_mb = int(os.getenv("MEDIA_BOT_MASS_DOWNLOAD_MAX_MB") or "2048")
         allow_mass_download_all = _bool_value("MEDIA_BOT_ALLOW_MASS_DOWNLOAD_ALL")
+        repair_enabled = _bool_value("MEDIA_BOT_ENABLE_REPAIR")
         download_workers = int(os.getenv("MEDIA_BOT_DOWNLOAD_WORKERS") or "2")
         render_workers = int(os.getenv("MEDIA_BOT_RENDER_WORKERS") or "1")
         work_queue_capacity = int(os.getenv("MEDIA_BOT_WORK_QUEUE_CAPACITY") or "32")
@@ -152,4 +157,6 @@ class Settings:
             render_workers=render_workers,
             work_queue_capacity=work_queue_capacity,
             per_user_work_capacity=per_user_work_capacity,
+            admin_user_ids=admins,
+            repair_enabled=repair_enabled,
         )

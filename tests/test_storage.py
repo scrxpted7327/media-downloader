@@ -7,29 +7,31 @@ from pathlib import Path
 import aiosqlite
 
 from media_bot.storage import (
-    Classification,
-    EditJob,
-    JobRecord,
-    PoolItem,
-    Preset,
-    SharedPreset,
-    UserSettings,
-    Workflow,
+    LATEST_SCHEMA_VERSION,
+    SQLITE_BUSY_TIMEOUT_MS,
+    CleanupResult,
+    UnsafeStoragePath,
     add_pool_tag,
+    cleanup_edit_artifacts,
     cleanup_expired_tokens,
     cleanup_old_jobs,
+    cleanup_user_jobs,
     consume_download_token,
     create_classification,
     create_download_token,
+    create_durable_pool_item,
     create_edit_job,
     create_job,
     create_pool_item,
     create_preset,
     create_workflow,
-    delete_pool_item,
+    create_workflow_run,
+    delete_durable_pool_item,
+    delete_edit_job_with_artifacts,
+    delete_job_with_artifacts,
     delete_preset,
     delete_workflow,
-    get_classification,
+    foreign_key_violations,
     get_edit_job,
     get_job,
     get_or_create_classification,
@@ -37,7 +39,7 @@ from media_bot.storage import (
     get_saved_edit_pool_item,
     get_saved_source_pool_item,
     get_preset_by_share_code,
-    get_workflow,
+    get_workflow_run,
     init_db,
     list_classifications,
     list_pool_items,
@@ -47,8 +49,10 @@ from media_bot.storage import (
     list_source_jobs_for_user,
     list_user_jobs,
     list_workflows,
+    open_database,
     remove_pool_tag,
     reconcile_interrupted_work,
+    reset_source_edits,
     share_preset,
     stage_edit_source,
     update_edit_job,
@@ -57,6 +61,7 @@ from media_bot.storage import (
     update_preset,
     update_user_settings,
     update_workflow,
+    update_workflow_run,
 )
 
 
@@ -232,7 +237,10 @@ class StorageTests(unittest.TestCase):
             await update_job(self.db_path, job.id, status="uploaded", file_path=str(fake))
             old_ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("UPDATE jobs SET created_at = ? WHERE id = ?", (old_ts, job.id))
+                await db.execute(
+                    "UPDATE jobs SET created_at = ?, updated_at = ? WHERE id = ?",
+                    (old_ts, old_ts, job.id),
+                )
                 await db.commit()
             removed = await cleanup_old_jobs(self.db_path, storage_dir, 0)
             self.assertEqual(removed, 1)
@@ -303,6 +311,7 @@ class StorageTests(unittest.TestCase):
             found = await get_preset_by_share_code(self.db_path, code)
             self.assertIsNotNone(found)
             self.assertEqual(found.id, preset.id)
+            self.assertIsNone(await share_preset(self.db_path, preset.id, 2))
 
         asyncio.run(run())
 
@@ -458,6 +467,452 @@ class StorageTests(unittest.TestCase):
 
             self.assertEqual(size, 10)
             self.assertEqual(destination.read_bytes(), b"video-data")
+
+        asyncio.run(run())
+
+    def test_database_connections_always_enable_integrity_settings(self):
+        async def run():
+            await init_db(self.db_path)
+            async with open_database(self.db_path) as db:
+                async with db.execute("PRAGMA foreign_keys") as cursor:
+                    foreign_keys = await cursor.fetchone()
+                async with db.execute("PRAGMA busy_timeout") as cursor:
+                    busy_timeout = await cursor.fetchone()
+                async with db.execute("SELECT 1 AS value") as cursor:
+                    row = await cursor.fetchone()
+
+            self.assertEqual(foreign_keys[0], 1)
+            self.assertEqual(busy_timeout[0], SQLITE_BUSY_TIMEOUT_MS)
+            self.assertIsInstance(row, aiosqlite.Row)
+            self.assertEqual(row["value"], 1)
+
+        asyncio.run(run())
+
+    def test_foreign_keys_reject_invalid_edit_parent(self):
+        async def run():
+            await init_db(self.db_path)
+            with self.assertRaises(aiosqlite.IntegrityError):
+                await create_edit_job(self.db_path, 999, 1)
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+
+        asyncio.run(run())
+
+    def test_migrations_are_versioned_and_idempotent(self):
+        async def run():
+            await init_db(self.db_path)
+            await init_db(self.db_path)
+            async with open_database(self.db_path) as db:
+                async with db.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ) as cursor:
+                    versions = [row["version"] for row in await cursor.fetchall()]
+            self.assertEqual(versions, list(range(1, LATEST_SCHEMA_VERSION + 1)))
+
+        asyncio.run(run())
+
+    def test_migration_repairs_orphaned_edits_without_deleting_them(self):
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 7, 8)
+            edit = await create_edit_job(self.db_path, job.id, 7)
+
+            # Reproduce a database produced by the historical connections that
+            # did not enable foreign-key enforcement.
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA foreign_keys=OFF")
+                await db.execute("DELETE FROM jobs WHERE id = ?", (job.id,))
+                await db.execute("DELETE FROM schema_migrations WHERE version = 3")
+                await db.commit()
+
+            await init_db(self.db_path)
+
+            recovered_job = await get_job(self.db_path, job.id)
+            self.assertIsNotNone(recovered_job)
+            self.assertEqual(recovered_job.status, "deleted")
+            self.assertTrue(recovered_job.url.startswith("recovered://"))
+            self.assertIsNotNone(await get_edit_job(self.db_path, edit.id))
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+            async with open_database(self.db_path) as db:
+                async with db.execute(
+                    "SELECT COUNT(*) AS count FROM migration_repairs "
+                    "WHERE migration_version = 3 AND table_name = 'jobs'"
+                ) as cursor:
+                    repair_count = (await cursor.fetchone())["count"]
+            self.assertEqual(repair_count, 1)
+
+        asyncio.run(run())
+
+    def test_migration_repairs_all_legacy_relation_shapes_without_data_loss(self):
+        async def run():
+            await init_db(self.db_path)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA foreign_keys=OFF")
+                await db.execute(
+                    "INSERT INTO shared_presets "
+                    "(preset_id, user_id, share_code) VALUES (901, 7, 'orphan-share')"
+                )
+                await db.execute(
+                    "INSERT INTO pool_tags "
+                    "(pool_item_id, classification_id, user_id) VALUES (902, 903, 7)"
+                )
+                await db.execute(
+                    "INSERT INTO workflow_runs "
+                    "(workflow_id, pool_item_id, user_id) VALUES (904, 905, 7)"
+                )
+                await db.execute(
+                    "INSERT INTO pool_items "
+                    "(user_id, source_job_id, edit_job_id, file_path) "
+                    "VALUES (7, 906, 907, 'missing.mp4')"
+                )
+                await db.execute(
+                    "INSERT INTO workflows "
+                    "(user_id, name, trigger_classification_id, action_type, action_preset_id) "
+                    "VALUES (7, 'legacy refs', 908, 'none', 909)"
+                )
+                await db.execute("DELETE FROM schema_migrations WHERE version = 3")
+                await db.commit()
+
+            await init_db(self.db_path)
+
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+            async with open_database(self.db_path) as db:
+                for table in ("shared_presets", "pool_tags", "workflow_runs"):
+                    async with db.execute(
+                        f"SELECT COUNT(*) AS count FROM {table}"
+                    ) as cursor:
+                        self.assertEqual((await cursor.fetchone())["count"], 1)
+                async with db.execute(
+                    "SELECT source_job_id, edit_job_id FROM pool_items "
+                    "WHERE file_path = 'missing.mp4'"
+                ) as cursor:
+                    pool = await cursor.fetchone()
+                async with db.execute(
+                    "SELECT trigger_classification_id, action_preset_id FROM workflows "
+                    "WHERE name = 'legacy refs'"
+                ) as cursor:
+                    workflow = await cursor.fetchone()
+            self.assertIsNone(pool["source_job_id"])
+            self.assertIsNone(pool["edit_job_id"])
+            self.assertIsNone(workflow["trigger_classification_id"])
+            self.assertIsNone(workflow["action_preset_id"])
+
+        asyncio.run(run())
+
+    def test_migration_does_not_swallow_unexpected_schema_errors(self):
+        async def run():
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("CREATE TABLE jobs (id INTEGER PRIMARY KEY)")
+                await db.commit()
+
+            with self.assertRaises(aiosqlite.OperationalError):
+                await init_db(self.db_path)
+
+        asyncio.run(run())
+
+    def test_update_no_kwargs_paths_use_a_real_connection(self):
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            self.assertEqual((await update_edit_job(self.db_path, edit.id)).id, edit.id)
+
+            pool = await create_pool_item(
+                self.db_path, 1, "/tmp/video.mp4", source_job_id=job.id
+            )
+            workflow = await create_workflow(self.db_path, 1, "noop", "none")
+            workflow_run = await create_workflow_run(
+                self.db_path, workflow.id, pool.id, 1
+            )
+            self.assertEqual(
+                (await update_workflow_run(self.db_path, workflow_run.id)).id,
+                workflow_run.id,
+            )
+            self.assertEqual(
+                (await get_workflow_run(self.db_path, workflow_run.id)).id,
+                workflow_run.id,
+            )
+
+        asyncio.run(run())
+
+    def test_durable_pool_copy_survives_job_cleanup(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            source = storage_dir / "1-source.mp4"
+            source.write_bytes(b"durable-video")
+            thumbnail = storage_dir / "1-thumbnail.jpg"
+            thumbnail.write_bytes(b"image")
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            await update_job(
+                self.db_path,
+                job.id,
+                status="uploaded",
+                file_path=str(source),
+                thumbnail_path=str(thumbnail),
+            )
+
+            pool = await create_durable_pool_item(
+                self.db_path,
+                storage_dir,
+                1,
+                source,
+                source_job_id=job.id,
+                thumbnail_file=thumbnail,
+            )
+            pool_file = Path(pool.file_path)
+            pool_thumbnail = Path(pool.thumbnail_path)
+            self.assertNotEqual(pool_file, source)
+            self.assertEqual(pool_file.read_bytes(), b"durable-video")
+            self.assertTrue(
+                pool_file.is_relative_to((storage_dir / "pool").resolve())
+            )
+
+            deleted = await delete_job_with_artifacts(
+                self.db_path, storage_dir, job.id, user_id=1
+            )
+            self.assertGreaterEqual(deleted.records_deleted, 1)
+            self.assertFalse(source.exists())
+            self.assertFalse(thumbnail.exists())
+            self.assertTrue(pool_file.exists())
+            self.assertTrue(pool_thumbnail.exists())
+            surviving_pool = await get_pool_item(self.db_path, pool.id)
+            self.assertIsNone(surviving_pool.source_job_id)
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+
+            removed_pool = await delete_durable_pool_item(
+                self.db_path, storage_dir, pool.id, 1
+            )
+            self.assertEqual(removed_pool.records_deleted, 1)
+            self.assertEqual(removed_pool.files_deleted, 2)
+            self.assertFalse(pool_file.exists())
+            self.assertFalse(pool_thumbnail.exists())
+
+        asyncio.run(run())
+
+    def test_legacy_pool_reference_preserves_job_file(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            source = storage_dir / "source.mp4"
+            source.write_bytes(b"saved-video")
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            await update_job(self.db_path, job.id, file_path=str(source))
+            pool = await create_pool_item(
+                self.db_path, 1, str(source), source_job_id=job.id
+            )
+
+            result = await delete_job_with_artifacts(
+                self.db_path, storage_dir, job.id, user_id=1
+            )
+
+            self.assertTrue(source.exists())
+            self.assertEqual(result.files_preserved, 1)
+            self.assertIsNone((await get_pool_item(self.db_path, pool.id)).source_job_id)
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+
+        asyncio.run(run())
+
+    def test_cleanup_edit_artifacts_removes_staging_preview_and_intermediates(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            staged = storage_dir / f"edit-{edit.id}-source.mp4"
+            final = storage_dir / f"edit-{edit.id}-final.mp4"
+            intermediate = storage_dir / f"edit-{edit.id}-final_cap.mp4"
+            hidden_intermediate = storage_dir / f".edit-{edit.id}-final_cap.mp4"
+            subtitles = storage_dir / f"edit-{edit.id}-final.srt"
+            preview = storage_dir / f"edit-{edit.id}-watermarks.jpg"
+            for path in (
+                staged, final, intermediate, hidden_intermediate, subtitles, preview,
+            ):
+                path.write_bytes(b"artifact")
+            await update_edit_job(
+                self.db_path,
+                edit.id,
+                status="rendered",
+                file_path=str(final),
+                subtitles_path=str(subtitles),
+                watermark_preview_path=str(preview),
+            )
+
+            result = await cleanup_edit_artifacts(
+                self.db_path,
+                storage_dir,
+                edit.id,
+                user_id=1,
+                preserve_output=True,
+            )
+
+            self.assertEqual(result.files_deleted, 4)
+            self.assertTrue(final.exists())
+            self.assertTrue(subtitles.exists())
+            self.assertFalse(staged.exists())
+            self.assertFalse(intermediate.exists())
+            self.assertFalse(hidden_intermediate.exists())
+            self.assertFalse(preview.exists())
+            updated = await get_edit_job(self.db_path, edit.id)
+            self.assertIsNone(updated.watermark_preview_path)
+            self.assertEqual(updated.file_path, str(final))
+
+        asyncio.run(run())
+
+    def test_reset_source_edits_cleans_every_unpooled_artifact(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            artifacts = [
+                storage_dir / f"edit-{edit.id}-source.mp4",
+                storage_dir / f"edit-{edit.id}-final.mp4",
+                storage_dir / f"edit-{edit.id}-final.srt",
+                storage_dir / f"edit-{edit.id}-final_voice.mp4",
+                storage_dir / f"edit-{edit.id}-watermarks.jpg",
+            ]
+            for path in artifacts:
+                path.write_bytes(b"artifact")
+            await update_edit_job(
+                self.db_path,
+                edit.id,
+                status="rendered",
+                file_path=str(artifacts[1]),
+                subtitles_path=str(artifacts[2]),
+                watermark_preview_path=str(artifacts[4]),
+            )
+
+            result = await reset_source_edits(
+                self.db_path, storage_dir, job.id, 1
+            )
+
+            self.assertEqual(result.records_deleted, 1)
+            self.assertEqual(result.files_deleted, len(artifacts))
+            self.assertIsNone(await get_edit_job(self.db_path, edit.id))
+            self.assertFalse(any(path.exists() for path in artifacts))
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+
+        asyncio.run(run())
+
+    def test_reset_preserves_pool_referenced_edit_output(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            staged = storage_dir / f"edit-{edit.id}-source.mp4"
+            final = storage_dir / f"edit-{edit.id}-final.mp4"
+            staged.write_bytes(b"staged")
+            final.write_bytes(b"saved")
+            await update_edit_job(
+                self.db_path, edit.id, status="rendered", file_path=str(final)
+            )
+            pool = await create_pool_item(
+                self.db_path,
+                1,
+                str(final),
+                source_job_id=job.id,
+                edit_job_id=edit.id,
+            )
+
+            result = await reset_source_edits(
+                self.db_path, storage_dir, job.id, 1
+            )
+
+            self.assertTrue(final.exists())
+            self.assertFalse(staged.exists())
+            self.assertEqual(result.files_preserved, 1)
+            saved = await get_pool_item(self.db_path, pool.id)
+            self.assertIsNone(saved.edit_job_id)
+            self.assertEqual(saved.source_job_id, job.id)
+
+        asyncio.run(run())
+
+    def test_cleanup_refuses_to_unlink_outside_storage_root(self):
+        async def run():
+            await init_db(self.db_path)
+            root = Path(self.tmpdir.name)
+            storage_dir = root / "jobs"
+            storage_dir.mkdir()
+            outside = root / "outside.mp4"
+            outside.write_bytes(b"do-not-delete")
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            await update_job(self.db_path, job.id, file_path=str(outside))
+
+            result = await delete_job_with_artifacts(
+                self.db_path, storage_dir, job.id, user_id=1
+            )
+
+            self.assertIsInstance(result, CleanupResult)
+            self.assertEqual(result.unsafe_paths, (str(outside.resolve()),))
+            self.assertTrue(outside.exists())
+            self.assertIsNone(await get_job(self.db_path, job.id))
+
+        asyncio.run(run())
+
+    def test_durable_pool_copy_rejects_source_outside_storage_root(self):
+        async def run():
+            await init_db(self.db_path)
+            root = Path(self.tmpdir.name)
+            storage_dir = root / "jobs"
+            storage_dir.mkdir()
+            outside = root / "outside.mp4"
+            outside.write_bytes(b"outside")
+
+            with self.assertRaises(UnsafeStoragePath):
+                await create_durable_pool_item(
+                    self.db_path, storage_dir, 1, outside
+                )
+            self.assertTrue(outside.exists())
+
+        asyncio.run(run())
+
+    def test_cleanup_user_jobs_preserves_durable_pool_items(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            source = storage_dir / "source.mp4"
+            source.write_bytes(b"source")
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            await update_job(self.db_path, job.id, file_path=str(source))
+            pool = await create_durable_pool_item(
+                self.db_path, storage_dir, 1, source, source_job_id=job.id
+            )
+
+            result = await cleanup_user_jobs(self.db_path, storage_dir, 1)
+
+            self.assertGreaterEqual(result.records_deleted, 1)
+            self.assertFalse(source.exists())
+            self.assertTrue(Path(pool.file_path).exists())
+            self.assertIsNone((await get_pool_item(self.db_path, pool.id)).source_job_id)
+            self.assertEqual(await foreign_key_violations(self.db_path), [])
+
+        asyncio.run(run())
+
+    def test_delete_edit_api_checks_owner_before_touching_files(self):
+        async def run():
+            await init_db(self.db_path)
+            storage_dir = Path(self.tmpdir.name) / "jobs"
+            storage_dir.mkdir()
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            artifact = storage_dir / f"edit-{edit.id}-source.mp4"
+            artifact.write_bytes(b"artifact")
+            await update_edit_job(self.db_path, edit.id, file_path=str(artifact))
+
+            result = await delete_edit_job_with_artifacts(
+                self.db_path, storage_dir, edit.id, user_id=2
+            )
+
+            self.assertEqual(result.records_deleted, 0)
+            self.assertTrue(artifact.exists())
+            self.assertIsNotNone(await get_edit_job(self.db_path, edit.id))
 
         asyncio.run(run())
 

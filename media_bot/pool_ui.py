@@ -11,14 +11,11 @@ from telegram.ext import ContextTypes
 
 from .access import ResourceNotFound, require_owned_job
 from .storage import (
-    Classification,
-    PoolItem,
-    Workflow,
     add_pool_tag,
     create_classification,
-    create_pool_item,
+    create_durable_pool_item,
     create_workflow,
-    delete_pool_item,
+    delete_durable_pool_item,
     delete_workflow,
     get_classification,
     get_job,
@@ -241,8 +238,15 @@ async def pool_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if query.data.startswith("pool:delete:"):
         pool_item_id = int(query.data.split(":")[-1])
         db_path: Path = context.application.bot_data["db_path"]
+        storage_dir: Path = context.application.bot_data["storage_dir"]
         user = update.effective_user
-        if user and await delete_pool_item(db_path, pool_item_id, user.id):
+        result = (
+            await delete_durable_pool_item(
+                db_path, storage_dir, pool_item_id, user.id,
+            )
+            if user else None
+        )
+        if result and result.records_deleted:
             await _answer_callback(query, "Deleted")
         else:
             await _answer_callback(query, "Failed", show_alert=True)
@@ -328,10 +332,9 @@ async def _show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [InlineKeyboardButton("🏊 Pool", callback_data="pool:list")],
         [InlineKeyboardButton("➕ Add to Pool", callback_data="pool:add")],
         [InlineKeyboardButton("🏷️ Classifications", callback_data="pool:classify")],
-        [InlineKeyboardButton("⚙️ Workflows", callback_data="pool:workflows")],
         [InlineKeyboardButton("🔎 Filter Pool", callback_data="pool:filter")],
     ])
-    msg = "🏊 Pool menu:\nManage your video pool, classifications, and workflows."
+    msg = "🏊 Pool menu:\nManage saved videos and classifications."
     if update.message:
         await update.message.reply_text(msg, reply_markup=keyboard)
     elif update.callback_query:
@@ -508,7 +511,6 @@ async def _show_classify_select(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _show_workflow_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    flow: FlowState = context.user_data["pool_flow"]
     db_path: Path = context.application.bot_data["db_path"]
     user = update.effective_user
     if user is None:
@@ -563,7 +565,15 @@ async def _add_pool_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("Source not found.")
         return
 
-    pool_item = await create_pool_item(db_path, user.id, source.file_path, source_job_id=source_job_id, title=title)
+    pool_item = await create_durable_pool_item(
+        db_path,
+        context.application.bot_data["storage_dir"],
+        user.id,
+        Path(source.file_path),
+        source_job_id=source_job_id,
+        title=title,
+        thumbnail_file=Path(source.thumbnail_path) if source.thumbnail_path else None,
+    )
     await update.message.reply_text(f"Added to pool as item #{pool_item.id}.")
     flow.action = _State.MENU
     await _show_menu(update, context)

@@ -3,13 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import shutil
-import subprocess
-import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 from .diagnostics import redact_sensitive
@@ -63,7 +59,15 @@ def load_error_log(error_path: Path) -> dict | None:
         return None
 
 
-async def apply_known_fix(error_info: dict, tools_dir: Path) -> str | None:
+async def apply_known_fix(
+    error_info: dict,
+    tools_dir: Path,
+    *,
+    repair_enabled: bool = False,
+) -> str | None:
+    if not repair_enabled:
+        return "Automatic repair is disabled by MEDIA_BOT_ENABLE_REPAIR."
+
     category = error_info.get("category", "unknown")
     error_message = error_info.get("message", "")
 
@@ -72,7 +76,7 @@ async def apply_known_fix(error_info: dict, tools_dir: Path) -> str | None:
     if category == "ffmpeg":
         if shutil.which("ffmpeg") is None:
             return "ffmpeg is not installed. Install it with: apt install ffmpeg"
-        return None
+        return "ffmpeg is installed; no automatic repair was applied."
     if category == "dependency":
         return await _fix_dependency(error_message)
     if category == "disk":
@@ -85,46 +89,50 @@ async def apply_known_fix(error_info: dict, tools_dir: Path) -> str | None:
 
 
 async def _fix_ytdlp(tools_dir: Path) -> str | None:
-    ytdlp_path = tools_dir / "yt-dlp"
-    if not ytdlp_path.is_file():
-        return "yt-dlp not found in tools directory."
+    import os
+
+    from .tools import _asset_name
+
+    try:
+        binary_name = _asset_name()
+    except RuntimeError as exc:
+        return f"yt-dlp update error: {exc}"
+    ytdlp_path = tools_dir / binary_name
+    if not ytdlp_path.is_file() or not os.access(ytdlp_path, os.X_OK):
+        return f"Verified yt-dlp binary {binary_name!r} not found in tools directory."
     try:
         proc = await asyncio.create_subprocess_exec(
             str(ytdlp_path), "--update",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode == 0:
-            LOGGER.info("yt-dlp updated successfully")
-            return None
-        LOGGER.warning("yt-dlp update failed: %s", stderr.decode()[:200])
-        return f"yt-dlp update failed: {stderr.decode()[:200]}"
-    except (OSError, asyncio.TimeoutError) as exc:
+    except OSError as exc:
         return f"yt-dlp update error: {exc}"
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return "yt-dlp update error: timed out after 60 seconds"
+    error = stderr.decode("utf-8", "replace")[:200]
+    if proc.returncode == 0:
+        LOGGER.info("yt-dlp updated successfully")
+        return None
+    LOGGER.warning("yt-dlp update failed: %s", error)
+    return f"yt-dlp update failed: {error}"
 
 
 async def _fix_dependency(error_message: str) -> str | None:
-    import re
     match = re.search(r"no module named\s+'?(\w+(?:[.-]\w+)*)'?", error_message, re.IGNORECASE)
     if not match:
         match = re.search(r"import\s+(\w+)", error_message)
     if match:
         module = match.group(1).lower()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pip", "install", module,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-            if proc.returncode == 0:
-                LOGGER.info("Installed dependency: %s", module)
-                return None
-            return f"Failed to install {module}: {stderr.decode()[:200]}"
-        except (OSError, asyncio.TimeoutError) as exc:
-            return f"Dependency install error: {exc}"
-    return None
+        return (
+            f"Missing dependency {module!r}. Automatic package installation is disabled; "
+            "install the reviewed, pinned project dependency manually."
+        )
+    return "A dependency error was detected, but no automatic repair was applied."
 
 
 def validate_model(model: str) -> str:
@@ -167,7 +175,14 @@ async def invoke_opencode_fix(
     return str(fix_script)
 
 
-async def run_fix_script(script_path: str, timeout: int = 900) -> tuple[int, str]:
+async def run_fix_script(
+    script_path: str,
+    timeout: int = 900,
+    *,
+    repair_enabled: bool = False,
+) -> tuple[int, str]:
+    if not repair_enabled:
+        return -1, "Repair script execution is disabled by MEDIA_BOT_ENABLE_REPAIR."
     process = await asyncio.create_subprocess_exec(
         "/usr/bin/env", "bash", script_path,
         stdout=asyncio.subprocess.PIPE,
@@ -191,7 +206,13 @@ async def watch_and_fix(
     workspace: Path,
     tools_dir: Path,
     report_callback: callable | None = None,
+    *,
+    repair_enabled: bool = False,
 ) -> None:
+    if not repair_enabled:
+        LOGGER.info("Auto-fix agent disabled by MEDIA_BOT_ENABLE_REPAIR")
+        return
+
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     FIX_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
     processed: set[str] = set()
@@ -215,7 +236,11 @@ async def watch_and_fix(
                 category = categorize_error(error_info.get("message", ""))
                 error_info["category"] = category
 
-                fix_result = await apply_known_fix(error_info, tools_dir)
+                fix_result = await apply_known_fix(
+                    error_info,
+                    tools_dir,
+                    repair_enabled=repair_enabled,
+                )
                 if fix_result is None:
                     LOGGER.info("Known fix applied successfully for %s", ef.name)
                     if report_callback:

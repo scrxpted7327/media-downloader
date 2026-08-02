@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,13 +22,13 @@ from .storage import (
     EditJob,
     JobRecord,
     Preset,
+    create_durable_pool_item,
     create_edit_job,
-    create_pool_item,
     create_preset,
     delete_preset,
     get_edit_job,
-    get_job,
     get_or_create_user_settings,
+    get_preset_by_share_code,
     list_presets,
     list_source_jobs_for_user,
     list_user_jobs,
@@ -42,12 +44,21 @@ LOGGER = logging.getLogger(__name__)
 _PAGE_SIZE = 6
 _BANNER_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 _MAX_BANNER_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_BANNER_IMAGE_PIXELS = 40_000_000
+_MAX_BANNER_ASSETS_PER_USER = 100
+_MAX_BANNER_STORAGE_BYTES_PER_USER = 256 * 1024 * 1024
+_BANNER_FORMAT_EXTENSIONS = {
+    "JPEG": frozenset({".jpg", ".jpeg"}),
+    "PNG": frozenset({".png"}),
+    "WEBP": frozenset({".webp"}),
+}
 
 
 class _State:
     MENU = "settings_menu"
     PRESET_LIST = "preset_list"
     PRESET_CREATE_NAME = "preset_create_name"
+    PRESET_IMPORT_CODE = "preset_import_code"
     PRESET_CREATE_CAPTION = "preset_create_caption"
     PRESET_CREATE_CAPTION_COLOR = "preset_create_caption_color"
     PRESET_CREATE_CAPTION_HUE = "preset_create_caption_hue"
@@ -302,10 +313,93 @@ def _text_input_keyboard(back_data: str, skip_data: str) -> InlineKeyboardMarkup
 _BANNER_INSTRUCTIONS = (
     "Banner image:\n"
     "• Send a photo to upload it\n"
-    "• Paste a direct http(s) image URL\n"
     "• Type `profile` to reuse your profile banner\n"
-    "• Tap Skip to leave the banner empty"
+    "• Tap Skip to leave the banner empty\n\n"
+    "For security, remote URLs and server file paths are not accepted."
 )
+
+
+def _banner_asset_path(
+    storage_dir: Path,
+    user_id: int,
+    scope: str,
+    suffix: str,
+) -> Path:
+    """Return a user-scoped, immutable path for one uploaded banner asset."""
+    if not scope or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in scope):
+        raise ValueError("invalid banner scope")
+    normalized_suffix = suffix.lower()
+    if normalized_suffix not in _BANNER_IMAGE_EXTENSIONS:
+        raise ValueError("unsupported banner image extension")
+    user_root = storage_dir / "banners" / f"user_{int(user_id)}"
+    count = 0
+    total = 0
+    for candidate in user_root.rglob("*") if user_root.is_dir() else ():
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                count += 1
+                total += candidate.stat().st_size
+        except FileNotFoundError:
+            continue
+    if count >= _MAX_BANNER_ASSETS_PER_USER or total >= _MAX_BANNER_STORAGE_BYTES_PER_USER:
+        raise ValueError("banner storage quota reached")
+    directory = user_root / scope
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{uuid.uuid4().hex}{normalized_suffix}"
+
+
+def _latest_profile_banner(storage_dir: Path, user_id: int) -> Path | None:
+    directory = storage_dir / "banners" / f"user_{int(user_id)}" / "profile"
+    if not directory.is_dir():
+        return None
+    candidates = [
+        path for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in _BANNER_IMAGE_EXTENSIONS
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
+
+
+def _validate_banner_image(path: Path, expected_suffix: str) -> None:
+    """Verify bytes, dimensions, and claimed extension before publishing an asset."""
+    from PIL import Image, UnidentifiedImageError
+
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError("banner upload was not saved") from exc
+    if size < 1 or size > _MAX_BANNER_IMAGE_BYTES:
+        raise ValueError("banner image must be between 1 byte and 20 MB")
+
+    try:
+        with Image.open(path) as image:
+            image_format = (image.format or "").upper()
+            allowed_extensions = _BANNER_FORMAT_EXTENSIONS.get(image_format)
+            if allowed_extensions is None or expected_suffix.lower() not in allowed_extensions:
+                raise ValueError("banner contents do not match a supported image type")
+            width, height = image.size
+            if width < 1 or height < 1 or width * height > _MAX_BANNER_IMAGE_PIXELS:
+                raise ValueError("banner image dimensions are not supported")
+            image.verify()
+    except (OSError, UnidentifiedImageError) as exc:
+        raise ValueError("banner is not a valid JPG, PNG, or WebP image") from exc
+
+
+async def _save_banner_upload(upload: Any, destination: Path) -> None:
+    """Download to a private partial file, validate, then atomically publish it."""
+    partial = destination.with_name(f".{destination.name}.part")
+    telegram_file = await upload.get_file()
+    try:
+        await telegram_file.download_to_drive(partial)
+        await asyncio.to_thread(
+            _validate_banner_image,
+            partial,
+            destination.suffix,
+        )
+        await asyncio.to_thread(partial.replace, destination)
+    finally:
+        await asyncio.to_thread(partial.unlink, missing_ok=True)
 
 
 def _build_config_rows(
@@ -352,15 +446,15 @@ def _build_config_rows(
                 callback_data=f"{field_prefix}:watermark_text",
             )])
     toggles = Menu()
-    for label, field in (
+    for label, field_name in (
         ("Auto Captions", "auto_captions"),
         ("Channel Banner", "channel_banner"),
     ):
-        enabled = bool(values.get(field))
+        enabled = bool(values.get(field_name))
         toggles.toggle(
             label,
             enabled,
-            f"{toggle_prefix}:{field}:{'no' if enabled else 'yes'}",
+            f"{toggle_prefix}:{field_name}:{'no' if enabled else 'yes'}",
         )
     rows.extend(toggles.rows)
     return rows
@@ -472,7 +566,6 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
             await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
         elif flow.action == _State.PRESET_CREATE_BANNER:
             flow.data.pop("banner_path", None)
-            flow.data.pop("banner_url", None)
             flow.action = _State.PRESET_CREATE_BANNER_MENU
             await _edit_message(query, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
         return
@@ -503,9 +596,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
             await _show_menu(update, context)
             return
         prev = _CREATE_PREV_STEP[flow.action]
-        if flow.action == _State.PRESET_CREATE_BANNER and (
-            flow.data.get("banner_path") or flow.data.get("banner_url")
-        ):
+        if flow.action == _State.PRESET_CREATE_BANNER and flow.data.get("banner_path"):
             prev = _State.PRESET_CREATE_BANNER_MENU
         if flow.action == _State.PRESET_CREATE_CAPTION_STYLE:
             flow.data.pop("caption_style", None)
@@ -526,7 +617,6 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
             flow.data.pop("pending_hue", None)
         if prev == _State.PRESET_CREATE_BANNER:
             flow.data.pop("banner_path", None)
-            flow.data.pop("banner_url", None)
             flow.data.pop("banner_position", None)
             flow.data.pop("banner_scale", None)
         flow.action = prev
@@ -567,8 +657,9 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         return
 
     if data == "preset_create:banner:done":
-        flow.data.setdefault("watermark_removal", True)
+        flow.data.setdefault("watermark_removal", False)
         flow.data.setdefault("watermark_position", "auto")
+        flow.data.setdefault("watermark_mode", "keep")
         flow.data.setdefault("channel_banner", False)
         flow.action = _State.PRESET_CREATE_CHANNEL_BANNER
         await _show_confirm(update, context, flow.action, "Channel banner for landscape videos?")
@@ -705,6 +796,16 @@ async def settings_callback(
             query,
             "Send the preset name (for example “default”).",
             _text_input_keyboard("settings:menu", "settings:menu"),
+        )
+        return
+
+    if query.data == "settings:import_preset":
+        flow.action = _State.PRESET_IMPORT_CODE
+        flow.data.clear()
+        await _edit_message(
+            query,
+            "Send the shared preset code, or /skip to cancel.",
+            _text_input_keyboard("settings:presets", "settings:presets"),
         )
         return
 
@@ -933,6 +1034,10 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
         ):
             await message.reply_text("That banner is too large. Send an image under 20 MB.")
             return True
+    upload_size = getattr(upload, "file_size", None)
+    if isinstance(upload_size, int) and upload_size > _MAX_BANNER_IMAGE_BYTES:
+        await message.reply_text("That banner is too large. Send an image under 20 MB.")
+        return True
 
     user = update.effective_user
     if user is None:
@@ -948,13 +1053,27 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
             await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
             return True
     storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
-    banners_dir = storage_dir / "banners"
-    banners_dir.mkdir(parents=True, exist_ok=True)
-
-    file = await upload.get_file()
-    filename_suffix = f"_{flow['edit_id']}" if editconfig_upload else ""
-    dest = banners_dir / f"banner_{user.id}{filename_suffix}{suffix}"
-    await file.download_to_drive(dest)
+    if editconfig_upload:
+        scope = f"edit_{int(flow['edit_id'])}"
+    elif flow.action == "set_profile_banner":
+        scope = "profile"
+    elif flow.action == _State.PRESET_EDIT_FIELD:
+        preset_id = flow.data.get("preset_id")
+        if preset_id is None:
+            await message.reply_text("Could not determine which preset to update.")
+            return True
+        scope = f"preset_{int(preset_id)}"
+    else:
+        scope = "preset_draft"
+    try:
+        dest = _banner_asset_path(storage_dir, user.id, scope, suffix)
+        await _save_banner_upload(upload, dest)
+    except Exception as exc:
+        LOGGER.warning("Rejected banner upload for user %s: %s", user.id, exc)
+        await message.reply_text(
+            "That file is not a valid banner image. Send a JPG, PNG, or WebP image under 20 MB."
+        )
+        return True
 
     if editconfig_upload:
         updated = await update_edit_job(
@@ -982,10 +1101,7 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if flow.action == _State.PRESET_EDIT_FIELD and flow.data.get("field_name") == "banner_path":
         preset_id = flow.data.get("preset_id")
-        if preset_id is not None:
-            await _apply_preset_edit(update, context, preset_id, "banner_path", str(dest))
-        else:
-            await message.reply_text("Could not determine which preset to update.")
+        await _apply_preset_edit(update, context, preset_id, "banner_path", str(dest))
         return True
 
     return False
@@ -999,8 +1115,44 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return False
 
     text = update.message.text.strip()
-    db_path: Path = context.application.bot_data["db_path"]
     user = update.effective_user
+
+    if flow.action == _State.PRESET_IMPORT_CODE:
+        if text.lower() == "/skip":
+            flow.action = _State.PRESET_LIST
+            flow.page = 0
+            await _show_preset_list(update, context)
+            return True
+        if user is None:
+            return True
+        db_path: Path = context.application.bot_data["db_path"]
+        shared = await get_preset_by_share_code(db_path, text)
+        if shared is None:
+            await update.message.reply_text(
+                "That share code is invalid or no longer active. Try again or use /skip."
+            )
+            return True
+        existing_names = {
+            preset.name.casefold() for preset in await list_presets(db_path, user.id)
+        }
+        base_name = f"{shared.name} (shared)"
+        name = base_name
+        suffix = 2
+        while name.casefold() in existing_names:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        values = _config_snapshot(shared)
+        # Shared presets grant configuration access, not access to another
+        # user's private banner asset. Importers can attach their own banner.
+        omitted_banner = bool(values.get("banner_path"))
+        values["banner_path"] = None
+        imported = await create_preset(db_path, user.id, name, **values)
+        flow.action = _State.PRESET_LIST
+        flow.page = 0
+        note = " The original banner was omitted for privacy." if omitted_banner else ""
+        await update.message.reply_text(f"✅ Imported preset “{imported.name}”.{note}")
+        await _show_preset_list(update, context)
+        return True
 
     if flow.action == _State.PRESET_CREATE_NAME:
         if not text:
@@ -1013,8 +1165,9 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         flow.data["voice_quality"] = "basic"
         flow.data["voice_speed"] = 1.0
         flow.data["tts_engine"] = "auto"
-        flow.data["watermark_removal"] = True
+        flow.data["watermark_removal"] = False
         flow.data["watermark_position"] = "auto"
+        flow.data["watermark_mode"] = "keep"
         flow.data["channel_banner"] = False
         flow.action = _State.PRESET_CREATE_CAPTION_COLOR
         await update.message.reply_text(
@@ -1053,16 +1206,29 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if flow.action == _State.PRESET_CREATE_BANNER:
         if text.lower() != "/skip":
             storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
-            banner_file = storage_dir / "banners" / f"banner_{user.id if user else 0}.png"
-            if text.lower() in ("profile", "p") and banner_file.is_file():
+            banner_file = _latest_profile_banner(storage_dir, user.id if user else 0)
+            if text.lower() in ("profile", "p") and banner_file is not None:
                 flow.data["banner_path"] = str(banner_file)
-            elif text.startswith("http://") or text.startswith("https://"):
-                flow.data["banner_url"] = text
+            elif text.lower() in ("profile", "p"):
+                await update.message.reply_text(
+                    "No profile banner is set yet. Upload a photo, or use Set Profile Banner first."
+                )
+                return True
             else:
-                await update.message.reply_text("Send a photo, type 'profile', paste an image URL, or /skip:")
+                await update.message.reply_text(
+                    "For security, banner URLs and server file paths are not accepted. "
+                    "Send a photo, type 'profile', or use /skip."
+                )
                 return True
         flow.action = _State.PRESET_CREATE_BANNER_MENU
         await _edit_or_send(update, "Banner settings:", _banner_menu_keyboard("preset_create:banner"))
+        return True
+
+    if flow.action == "set_profile_banner":
+        await update.message.reply_text(
+            "Send a JPG, PNG, or WebP image to set your profile banner. "
+            "Remote URLs and server file paths are not accepted."
+        )
         return True
 
     if flow.action == _State.PRESET_EDIT_FIELD:
@@ -1085,21 +1251,25 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
                         await update.message.reply_text("Enter a number between 0.5 and 2.0")
                         return True
             if field_name == "banner_path" and value is not None:
-                if value.startswith("http"):
-                    import urllib.request
-                    storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
-                    banners_dir = storage_dir / "banners"
-                    banners_dir.mkdir(parents=True, exist_ok=True)
-                    banner_dest = banners_dir / f"banner_{user.id}_{preset_id}.png"
-                    try:
-                        await update.message.reply_text("Downloading banner image...")
-                        urllib.request.urlretrieve(value, banner_dest)
-                        value = str(banner_dest)
-                    except Exception as exc:
-                        await update.message.reply_text(f"Failed to download banner: {exc}")
+                if value.lower() in ("profile", "p"):
+                    storage_dir: Path = context.application.bot_data.get(
+                        "storage_dir", Path("runtime/jobs")
+                    )
+                    profile_banner = _latest_profile_banner(
+                        storage_dir,
+                        user.id if user else 0,
+                    )
+                    if profile_banner is None:
+                        await update.message.reply_text(
+                            "No profile banner is set yet. Upload a photo instead."
+                        )
                         return True
-                elif not Path(value).is_file():
-                    await update.message.reply_text("Banner image file not found. Send a URL, a valid local path, or /skip to clear.")
+                    value = str(profile_banner)
+                else:
+                    await update.message.reply_text(
+                        "For security, banner URLs and server file paths are not accepted. "
+                        "Send a photo, type 'profile', or use /skip to clear."
+                    )
                     return True
             await _apply_preset_edit(update, context, preset_id, field_name, value)
             return True
@@ -1111,6 +1281,7 @@ async def _show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📁 My Presets", callback_data="settings:presets")],
         [InlineKeyboardButton("➕ Create Preset", callback_data="settings:create_preset")],
+        [InlineKeyboardButton("🔗 Import Shared Preset", callback_data="settings:import_preset")],
         [InlineKeyboardButton("🖼️ Set Profile Banner", callback_data="settings:profile_banner")],
         [InlineKeyboardButton("📊 Stats / History", callback_data="settings:stats")],
         [InlineKeyboardButton("🎬 Edit Existing Video", callback_data="settings:edit_source")],
@@ -1142,6 +1313,7 @@ async def _show_preset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         label = f"{mark}{p.name} ({color} {p.caption_style or 'none'})"
         rows.append([InlineKeyboardButton(label, callback_data=f"preset:edit:{p.id}")])
     rows.append([InlineKeyboardButton("➕ Create new", callback_data="settings:create_preset")])
+    rows.append([InlineKeyboardButton("🔗 Import shared", callback_data="settings:import_preset")])
 
     nav = []
     if flow.page > 0:
@@ -1315,18 +1487,9 @@ async def _finalize_preset_create(update: Update, context: ContextTypes.DEFAULT_
         return
     flow: FlowState = context.user_data["settings_flow"]
 
-    banner_url = flow.data.pop("banner_url", None)
-    if banner_url:
-        await _edit_or_send(update, "Downloading banner image...")
-        import urllib.request
-        storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
-        banner_dest = storage_dir / f"banner_{user.id}_{flow.data['name']}.png"
-        try:
-            urllib.request.urlretrieve(banner_url, banner_dest)
-            flow.data["banner_path"] = str(banner_dest)
-        except Exception as exc:
-            LOGGER.warning("Banner download failed: %s", exc)
-            await _edit_or_send(update, f"Banner download failed: {exc}. Preset created without banner.")
+    # Discard stale in-memory URL state from versions that accepted remote
+    # banners. New flows only retain validated Telegram uploads.
+    flow.data.pop("banner_url", None)
 
     preset_values = dict(flow.data)
     preset_name = preset_values.pop("name")
@@ -1545,13 +1708,13 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if edit.file_path is None:
         await update.callback_query.answer("Edit not found", show_alert=True)
         return
-    pool_item = await create_pool_item(
+    pool_item = await create_durable_pool_item(
         db_path,
+        storage_dir,
         user.id,
-        edit.file_path,
+        Path(edit.file_path),
         source_job_id=edit.source_job_id,
         edit_job_id=edit.id,
-        file_size=edit.file_size,
         title=f"Edit #{edit.id}",
     )
     await update.callback_query.answer("Added to pool")

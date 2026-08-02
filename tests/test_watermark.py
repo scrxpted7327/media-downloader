@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -178,6 +179,29 @@ class WatermarkAnalysisTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "checksum"):
                 provision_lama_model(Path(directory), lambda *a, **k: Response())
             self.assertFalse((Path(directory) / "lama_fp32.onnx").exists())
+
+    def test_model_download_honors_cancellation_and_removes_partial(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _size):
+                return b"model"
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(InterruptedError, "cancelled"):
+                provision_lama_model(
+                    root,
+                    lambda *a, **k: Response(),
+                    cancel_event=cancel_event,
+                )
+            self.assertEqual(list(root.iterdir()), [])
 
 
 if __name__ == "__main__":

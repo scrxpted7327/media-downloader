@@ -4,14 +4,28 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import unicodedata
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .downloader import DownloadError, _run_checked
+if TYPE_CHECKING:
+    from PIL import Image
+
+from .downloader import (
+    DownloadError,
+    _create_subprocess_exec,
+    _run_checked,
+    _terminate_process,
+)
 from .tools import prefer_ffmpeg_full
 
 prefer_ffmpeg_full()
@@ -40,7 +54,7 @@ def _detect_video_encoder() -> str:
              "-c:v", "libx264", "-t", "1", "-f", "null", "-"],
             capture_output=True, timeout=10,
         )
-        if result.returncode == 0 or "Unknown encoder" not in result.stderr.decode():
+        if result.returncode == 0:
             _VIDEO_ENCODER = "libx264"
             return _VIDEO_ENCODER
     except (OSError, subprocess.TimeoutExpired):
@@ -58,9 +72,7 @@ def _detect_video_encoder() -> str:
                 return _VIDEO_ENCODER
         except (OSError, subprocess.TimeoutExpired):
             pass
-    _VIDEO_ENCODER = "mpeg4"
-    LOGGER.warning("No hardware encoder found, falling back to mpeg4")
-    return _VIDEO_ENCODER
+    raise DownloadError("ffmpeg has no supported video encoder available")
 
 _WHISPER_MODEL = None
 _WHISPER_LOCK = asyncio.Lock()
@@ -141,13 +153,7 @@ async def _tts_say(
         cmd.extend(["-v", resolved])
     rate = 175 + int((speed - 1.0) * 500)
     cmd.extend(["-r", str(rate), text])
-    try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        if proc.returncode != 0:
-            raise DownloadError(f"say TTS failed: {stderr.decode()[:200]}")
-    except (OSError, asyncio.TimeoutError) as exc:
-        raise DownloadError("say TTS failed or timed out") from exc
+    await _run_checked(cmd, timeout, "say TTS failed or timed out")
 
 
 _TTS_ENGINES: dict[str, callable] = {
@@ -234,15 +240,18 @@ async def _run_ffmpeg_with_progress(
     if cmd and Path(cmd[0]).name.startswith("ffmpeg") and "-progress" not in cmd:
         cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
 
+    process: asyncio.subprocess.Process | None = None
+    readers: tuple[asyncio.Task[None], ...] = ()
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await _create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name == "posix"),
         )
     except OSError as exc:
         raise DownloadError(f"{label}: process failed") from exc
 
     last_pct = -1
-    stderr_lines: list[bytes] = []
+    stderr_lines: deque[bytes] = deque(maxlen=2000)
 
     async def _read_stderr() -> None:
         assert process.stderr is not None
@@ -277,7 +286,12 @@ async def _run_ffmpeg_with_progress(
                 pct = min(99, int(current_us * 100 // total_duration_us))
                 if pct > last_pct:
                     last_pct = pct
-                    await progress_callback(pct)
+                    try:
+                        await progress_callback(pct)
+                    except Exception as exc:
+                        # Progress reporting is cosmetic and must never stop pipe
+                        # draining or deadlock a long-running FFmpeg process.
+                        LOGGER.warning("Could not report %s progress: %s", label, exc)
 
     readers = (
         asyncio.create_task(_read_progress()),
@@ -286,13 +300,19 @@ async def _run_ffmpeg_with_progress(
 
     try:
         await asyncio.wait_for(process.wait(), timeout=timeout)
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
+    except asyncio.CancelledError:
+        for reader in readers:
+            reader.cancel()
+        await _terminate_process(process)
+        await asyncio.gather(*readers, return_exceptions=True)
+        raise
     except (OSError, asyncio.TimeoutError) as exc:
-        process.kill()
-        await process.wait()
+        for reader in readers:
+            reader.cancel()
+        await _terminate_process(process)
         await asyncio.gather(*readers, return_exceptions=True)
         raise DownloadError(f"{label} timed out (>{timeout}s)") from exc
-
-    await asyncio.gather(*readers)
 
     if process.returncode != 0:
         details = b"".join(stderr_lines).decode("utf-8", "replace").strip().splitlines()[-3:]
@@ -329,6 +349,7 @@ try:
     segments, info = model.transcribe(
         tmp.name, beam_size=5, word_timestamps=True, vad_filter=True,
         condition_on_previous_text=True,
+        language=os.environ.get("WHISPER_LANGUAGE") or None,
     )
     result = [{
         "start": round(s.start, 3),
@@ -357,24 +378,45 @@ async def _transcribe_ssh(wav_path: Path, language: str | None, timeout: int) ->
     if ssh_key:
         ssh_args.extend(["-i", ssh_key])
     ssh_args.append(ssh_target)
-    ssh_args.extend(["python3", "-c", _SSH_WHISPER_SCRIPT])
-    LOGGER.info("Transcribing via SSH to %s...", ssh_target)
-    proc = await asyncio.create_subprocess_exec(
-        *ssh_args,
-        stdin=wav_path.open("rb"),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    language_env = (
+        f"WHISPER_LANGUAGE={shlex.quote(language)} " if language else ""
     )
+    # OpenSSH sends the remote command through a shell. Pass one fully quoted
+    # command string so the multiline Python program remains one ``-c`` value.
+    ssh_args.append(
+        f"{language_env}python3 -c {shlex.quote(_SSH_WHISPER_SCRIPT)}"
+    )
+    LOGGER.info("Transcribing via SSH to %s...", ssh_target)
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise DownloadError(f"SSH whisper timed out on {ssh_target}")
+        with wav_path.open("rb") as wav_stream:
+            proc = await _create_subprocess_exec(
+                *ssh_args,
+                stdin=wav_stream,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=(os.name == "posix"),
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout,
+                )
+            except asyncio.CancelledError:
+                await _terminate_process(proc)
+                raise
+            except asyncio.TimeoutError as exc:
+                await _terminate_process(proc)
+                raise DownloadError(
+                    f"SSH whisper timed out on {ssh_target}"
+                ) from exc
+    except OSError as exc:
+        raise DownloadError(f"Could not start SSH whisper on {ssh_target}") from exc
     if proc.returncode != 0:
         err = stderr.decode("utf-8", "replace")[:300]
         raise DownloadError(f"SSH whisper failed on {ssh_target}: {err}")
-    result = json.loads(stdout.decode("utf-8", "replace"))
+    try:
+        result = json.loads(stdout.decode("utf-8", "replace"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DownloadError(f"SSH whisper returned invalid JSON from {ssh_target}") from exc
     if "error" in result:
         raise DownloadError(f"SSH whisper error: {result['error']}")
     segments = result.get("segments", [])
@@ -389,6 +431,29 @@ async def transcribe_audio(
 ) -> list[dict]:
     if shutil.which("ffmpeg") is None:
         raise DownloadError("ffmpeg is required for transcription")
+
+    # FFmpeg reports a fairly opaque mapping error when a perfectly valid video
+    # has no audio stream. Treat that as "no speech" so automatic captions can
+    # remain enabled for silent/video-only inputs.
+    if shutil.which("ffprobe") is not None:
+        try:
+            stdout, _ = await _run_checked(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=index", "-of", "csv=p=0",
+                    str(input_path),
+                ],
+                min(timeout_seconds, 30),
+                f"audio stream probe failed for {input_path.name}",
+            )
+        except DownloadError:
+            # Let the extraction command provide the definitive error for
+            # malformed media or an ffprobe/ffmpeg capability mismatch.
+            LOGGER.debug("Could not probe audio stream for %s", input_path.name)
+        else:
+            if not stdout.strip():
+                LOGGER.info("No audio stream found in %s; skipping transcription", input_path.name)
+                return []
 
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-whisper-")
     wav_path = Path(tmpdir.name) / "audio.wav"
@@ -444,25 +509,60 @@ async def transcribe_audio(
         tmpdir.cleanup()
 
 
+def _normalize_caption_text(value: str) -> str:
+    """Normalize Whisper punctuation without changing the spoken wording."""
+    text = unicodedata.normalize("NFKC", value).translate(str.maketrans({
+        "\u2018": "'", "\u2019": "'", "\u201a": "'",
+        "\u201c": '"', "\u201d": '"',
+        "\u2013": "-", "\u2014": "-", "\u2212": "-",
+        "\u2026": "...",
+    }))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+([,.;:!?%])", r"\1", text)
+    text = re.sub(r"([([{])\s+", r"\1", text)
+    text = re.sub(r"\s+([)\]}])", r"\1", text)
+    return text
+
+
 def _caption_chunks(segments: list[dict], words_per_caption: int = 2) -> list[dict]:
     """Turn Whisper segments into short, accurately timed caption beats."""
     chunks: list[dict] = []
     for segment in segments:
-        timed_words = [
-            word for word in segment.get("words", [])
-            if word.get("word") and word.get("start") is not None and word.get("end") is not None
-        ]
+        timed_words: list[dict] = []
+        for raw_word in segment.get("words", []):
+            if (
+                not raw_word.get("word")
+                or raw_word.get("start") is None
+                or raw_word.get("end") is None
+            ):
+                continue
+            word = dict(raw_word)
+            word["word"] = _normalize_caption_text(str(word["word"]))
+            if not word["word"]:
+                continue
+            # Whisper occasionally emits punctuation as its own timed token.
+            # Attach closing punctuation to the prior word so it neither gains
+            # a visual space nor consumes one of the words in a short beat.
+            if re.fullmatch(r"[,.;:!?%)+\]}]+", word["word"]) and timed_words:
+                timed_words[-1]["word"] = _normalize_caption_text(
+                    f"{timed_words[-1]['word']}{word['word']}"
+                )
+                timed_words[-1]["end"] = word["end"]
+            else:
+                timed_words.append(word)
         if timed_words:
             for offset in range(0, len(timed_words), words_per_caption):
                 group = timed_words[offset:offset + words_per_caption]
                 chunks.append({
                     "start": float(group[0]["start"]),
                     "end": float(group[-1]["end"]),
-                    "text": " ".join(str(word["word"]).strip() for word in group),
+                    "text": _normalize_caption_text(
+                        " ".join(str(word["word"]).strip() for word in group)
+                    ),
                 })
             continue
 
-        words = str(segment.get("text", "")).split()
+        words = _normalize_caption_text(str(segment.get("text", ""))).split()
         if not words:
             continue
         start = float(segment["start"])
@@ -474,7 +574,11 @@ def _caption_chunks(segments: list[dict], words_per_caption: int = 2) -> list[di
         cursor = start
         for index, (group, weight) in enumerate(zip(groups, weights)):
             chunk_end = end if index == len(groups) - 1 else cursor + duration * weight / total_weight
-            chunks.append({"start": cursor, "end": chunk_end, "text": " ".join(group)})
+            chunks.append({
+                "start": cursor,
+                "end": chunk_end,
+                "text": _normalize_caption_text(" ".join(group)),
+            })
             cursor = chunk_end
     return chunks
 
@@ -529,7 +633,7 @@ async def render_captions(
             # nothing to add, so preserve the video and let later edit steps run.
             LOGGER.info("No speech segments found in %s; skipping captions", input_path.name)
             if output_path != input_path:
-                shutil.copy2(input_path, output_path)
+                await asyncio.to_thread(shutil.copy2, input_path, output_path)
             if progress_callback:
                 await progress_callback(100)
             return output_path
@@ -713,7 +817,10 @@ async def render_voice_over(
     preset = _VOICE_PRESETS.get(quality.lower(), _VOICE_PRESETS["basic"])
 
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-tts-")
-    tmp_audio = Path(tmpdir.name) / "tts-output.wav"
+    # macOS `say` writes AIFF by default and rejects a `.wav` destination unless
+    # a matching data format is supplied. FFmpeg accepts AIFF directly.
+    audio_suffix = ".aiff" if engine == "say" else ".wav"
+    tmp_audio = Path(tmpdir.name) / f"tts-output{audio_suffix}"
 
     tts_func = _TTS_ENGINES.get(engine)
     if tts_func is None:
@@ -743,15 +850,13 @@ async def render_voice_over(
 
         if progress_callback:
             await progress_callback(50)
-        if progress_callback:
-            await progress_callback(50)
         await _run_checked(
             [
                 "ffmpeg", "-y",
                 "-i", str(input_video),
                 "-i", str(tmp_audio),
                 "-filter_complex",
-                f"[1:a]aresample={preset['ar']}:filter_type=kaiser[aout]",
+                f"[1:a]aresample={preset['ar']}:filter_type=kaiser,apad[aout]",
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "copy",
                 "-c:a", preset["codec"],
@@ -864,13 +969,54 @@ async def remove_watermark(
         from .watermark import WatermarkCandidate, inpaint_video, provision_lama_model
         selected = [WatermarkCandidate(**item) for item in candidates]
         started = time.monotonic()
+        cancel_event = threading.Event()
         try:
-            model = await asyncio.to_thread(
-                provision_lama_model, tools_dir or Path("runtime/tools"),
-            )
-            backend, duration = await asyncio.to_thread(
-                inpaint_video, input_path, output_path, selected, model, timeout_seconds,
-            )
+            provision_worker = asyncio.create_task(asyncio.to_thread(
+                provision_lama_model,
+                tools_dir or Path("runtime/tools"),
+                cancel_event=cancel_event,
+            ))
+            try:
+                model = await asyncio.shield(provision_worker)
+            except asyncio.CancelledError:
+                cancel_event.set()
+                await asyncio.gather(provision_worker, return_exceptions=True)
+                if output_path != input_path:
+                    output_path.unlink(missing_ok=True)
+                raise
+
+            async def _inpaint_worker() -> tuple[str, float] | None:
+                try:
+                    return await asyncio.to_thread(
+                        inpaint_video,
+                        input_path,
+                        output_path,
+                        selected,
+                        model,
+                        timeout_seconds,
+                        cancel_event,
+                    )
+                except Exception:
+                    # Once cancellation is requested, the caller is already
+                    # joining this worker; consume its cooperative stop error.
+                    if cancel_event.is_set():
+                        return None
+                    raise
+
+            worker = asyncio.create_task(_inpaint_worker())
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # to_thread cannot be force-cancelled. Ask the frame loop/remux
+                # to stop, then join it so no worker can outlive its edit job.
+                cancel_event.set()
+                await asyncio.gather(worker, return_exceptions=True)
+                if output_path != input_path:
+                    output_path.unlink(missing_ok=True)
+                raise
+            if result is None:
+                raise DownloadError("LaMa watermark removal stopped unexpectedly")
+            backend, duration = result
             append_event("watermark_removal", "AI watermark removal completed",
                          confidence=max((item.confidence for item in selected), default=0),
                          masks=[item.box for item in selected], inference_backend=backend,
@@ -1110,8 +1256,6 @@ async def render_channel_banner(
 
         duration_us = _get_duration_us(input_path)
         banner_height = int(vid_h * _CHANNEL_BANNER_HEIGHT_RATIO)
-        position_map = {"bottom": f"0:{vid_h - banner_height}"}
-        pos = position_map["bottom"]
 
         cmd = [
             "ffmpeg", "-y",
@@ -1332,88 +1476,119 @@ async def render_edit(
     watermark_text: str | None = None,
 ) -> tuple[Path, str | None]:
     current = input_path
-    intermediate = output_path.with_suffix(".intermediate" + output_path.suffix)
     step_idx = 0
     advance = getattr(progress_callback, "set_step", None)
+    intermediates: set[Path] = set()
+    staged_srt: Path | None = None
+    final_srt = output_path.with_suffix(".srt")
 
-    if watermark_removal:
-        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_wm{output_path.suffix}")
-        if advance:
-            advance(step_idx)
-        current = await remove_watermark(
-            current, tmp, watermark_position, timeout_seconds,
-            progress_callback=progress_callback, candidates=watermark_candidates,
-            tools_dir=tools_dir,
+    def _stage(label: str) -> Path:
+        path = output_path.with_name(
+            f".{output_path.stem}_{label}{output_path.suffix}"
         )
-        if progress_callback:
-            await progress_callback(100)
-        step_idx += 1
-        if watermark_mode == "swap":
-            if not watermark_text or not watermark_text.strip():
-                raise DownloadError("replacement watermark text is required in Swap mode")
-            current = await overlay_replacement_watermark(
-                current,
-                output_path.with_name(f"{output_path.stem}_swap{output_path.suffix}"),
-                watermark_text.strip(),
-                watermark_candidates,
-                watermark_position,
-                timeout_seconds,
+        intermediates.add(path)
+        return path
+
+    try:
+        if watermark_removal:
+            tmp = _stage("wm")
+            if advance:
+                advance(step_idx)
+            current = await remove_watermark(
+                current, tmp, watermark_position, timeout_seconds,
+                progress_callback=progress_callback, candidates=watermark_candidates,
+                tools_dir=tools_dir,
+            )
+            if progress_callback:
+                await progress_callback(100)
+            step_idx += 1
+            if watermark_mode == "swap":
+                if not watermark_text or not watermark_text.strip():
+                    raise DownloadError("replacement watermark text is required in Swap mode")
+                current = await overlay_replacement_watermark(
+                    current,
+                    _stage("swap"),
+                    watermark_text.strip(),
+                    watermark_candidates,
+                    watermark_position,
+                    timeout_seconds,
+                    progress_callback=progress_callback,
+                )
+
+        if caption_text or auto_captions:
+            tmp = _stage("cap")
+            if auto_captions:
+                staged_srt = output_path.with_name(f".{output_path.stem}_captions.srt")
+                intermediates.add(staged_srt)
+            if advance:
+                advance(step_idx)
+            current = await render_captions(
+                current, tmp,
+                caption_text, caption_color, caption_style, caption_position,
+                auto_captions, timeout_seconds,
+                srt_output_path=staged_srt,
+                progress_callback=progress_callback,
+                bottom_safe_area=(
+                    .17
+                    if channel_banner or (banner_path and banner_position == "bottom")
+                    else 0.0
+                ),
+            )
+            if progress_callback:
+                await progress_callback(100)
+            step_idx += 1
+
+        if voice_text:
+            tmp = _stage("voice")
+            if advance:
+                advance(step_idx)
+            current = await render_voice_over(
+                current, tmp, voice_text, tts_engine, voice, voice_quality,
+                voice_speed, timeout_seconds,
                 progress_callback=progress_callback,
             )
+            step_idx += 1
 
-    subtitles_result: str | None = None
-    if caption_text or auto_captions:
-        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_cap{output_path.suffix}")
-        if advance:
-            advance(step_idx)
-        current = await render_captions(
-            current, tmp,
-            caption_text, caption_color, caption_style, caption_position, auto_captions, timeout_seconds,
-            srt_output_path=output_path.with_suffix(".srt"),
-            progress_callback=progress_callback,
-            bottom_safe_area=(
-                .17 if channel_banner or (banner_path and banner_position == "bottom") else 0.0
-            ),
-        )
-        if auto_captions:
-            srt_path = output_path.with_suffix(".srt")
-            if srt_path.is_file():
-                subtitles_result = str(srt_path)
-        if progress_callback:
-            await progress_callback(100)
-        step_idx += 1
+        if channel_banner and source_url:
+            tmp = _stage("chan")
+            if advance:
+                advance(step_idx)
+            current = await render_channel_banner(
+                current, tmp, source_url, caption_text, timeout_seconds,
+                progress_callback=progress_callback,
+            )
+            step_idx += 1
 
-    if voice_text:
-        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_voice{output_path.suffix}")
-        if advance:
-            advance(step_idx)
-        current = await render_voice_over(
-            current, tmp, voice_text, tts_engine, voice, voice_quality, voice_speed, timeout_seconds,
-            progress_callback=progress_callback,
-        )
-        step_idx += 1
+        if banner_path:
+            tmp = _stage("banner")
+            if advance:
+                advance(step_idx)
+            current = await render_banner(
+                current, tmp, banner_path, banner_position, banner_scale,
+                timeout_seconds, progress_callback=progress_callback,
+            )
 
-    if channel_banner and source_url:
-        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_chan{output_path.suffix}")
-        if advance:
-            advance(step_idx)
-        current = await render_channel_banner(
-            current, tmp, source_url, caption_text, timeout_seconds,
-            progress_callback=progress_callback,
-        )
-        step_idx += 1
+        if current == input_path:
+            # Preserve the staged source when editing is a no-op. Copy to a
+            # sibling first so replacing an existing output remains atomic.
+            passthrough = _stage("passthrough")
+            await asyncio.to_thread(shutil.copy2, input_path, passthrough)
+            current = passthrough
 
-    if banner_path:
-        tmp = intermediate if current == input_path else output_path.with_name(f"{output_path.stem}_banner{output_path.suffix}")
-        if advance:
-            advance(step_idx)
-        current = await render_banner(
-            current, tmp, banner_path, banner_position, banner_scale, timeout_seconds,
-            progress_callback=progress_callback,
-        )
+        if current != output_path:
+            await asyncio.to_thread(os.replace, current, output_path)
 
-    if current != output_path:
-        shutil.move(str(current), str(output_path))
-
-    intermediate.unlink(missing_ok=True)
-    return output_path, subtitles_result
+        subtitles_result: str | None = None
+        if staged_srt is not None and staged_srt.is_file():
+            await asyncio.to_thread(os.replace, staged_srt, final_srt)
+            subtitles_result = str(final_srt)
+        return output_path, subtitles_result
+    finally:
+        # Every edit stage writes next to the destination. Always remove stale
+        # products, including partially written files on failure/cancellation.
+        for path in intermediates:
+            if path not in (input_path, output_path, final_srt):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as exc:
+                    LOGGER.warning("Could not remove edit intermediate %s: %s", path, exc)

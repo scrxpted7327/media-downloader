@@ -7,6 +7,7 @@ import platform
 import shutil
 import stat
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -70,10 +71,23 @@ def provision_ytdlp(tools_dir: Path, version: str | None = None) -> Path:
     asset_name = _asset_name()
     target = tools_dir / asset_name
     metadata = tools_dir / "yt-dlp-version"
+    cached_version = None
+    if target.is_file() and metadata.is_file() and os.access(target, os.X_OK):
+        cached_version = metadata.read_text(encoding="utf-8").strip()
+        # With no requested version, keep using the last verified binary. This
+        # makes restarts deterministic and allows the bot to start offline.
+        if version is None or cached_version == version:
+            return target
+
     release_url = GITHUB_RELEASE + (f"tags/{version}" if version else "latest")
-    release = _get_json(release_url)
+    try:
+        release = _get_json(release_url)
+    except (OSError, TimeoutError, urllib.error.URLError):
+        if cached_version:
+            return target
+        raise
     tag = release["tag_name"]
-    if target.is_file() and metadata.is_file() and metadata.read_text().strip() == tag:
+    if cached_version == tag:
         return target
 
     assets = {item["name"]: item["browser_download_url"] for item in release["assets"]}
@@ -92,5 +106,7 @@ def provision_ytdlp(tools_dir: Path, version: str | None = None) -> Path:
             raise RuntimeError("yt-dlp checksum verification failed; executable was not installed")
         os.chmod(binary, binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         os.replace(binary, target)
-        metadata.write_text(tag + "\n", encoding="utf-8")
+        version_file = temp_dir / "yt-dlp-version"
+        version_file.write_text(tag + "\n", encoding="utf-8")
+        os.replace(version_file, metadata)
     return target

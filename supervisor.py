@@ -16,6 +16,12 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
+from media_bot.diagnostics import (
+    append_bounded_line,
+    append_event_record,
+    write_redacted_json,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -27,6 +33,13 @@ RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
 EVENTS_PATH = Path("runtime/events.jsonl")
 SUPERVISOR_LOG = Path("runtime/supervisor.log")
+EVENTS_MAX_BYTES = 5 * 1024 * 1024
+EVENTS_BACKUP_COUNT = 3
+SUPERVISOR_LOG_MAX_BYTES = 10 * 1024 * 1024
+SUPERVISOR_LOG_BACKUP_COUNT = 3
+GRACEFUL_STOP_SECONDS = 10
+FORCE_KILL_SECONDS = 5
+WEEKLY_RESTART_SECONDS = 86400 * 7
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
 _LOCK_HANDLE = None
 _ERROR_LOG_PATTERN = re.compile(r"Error logged: (err_[A-Za-z0-9_]+)")
@@ -35,6 +48,28 @@ _SECRET_PATTERN = re.compile(
     r"(?:token|secret|password|api[_-]?key)\s*[=:]\s*\S+)"
 )
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+
+
+class _BoundedSupervisorLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            append_bounded_line(
+                SUPERVISOR_LOG,
+                redact_sensitive(self.format(record)),
+                max_bytes=SUPERVISOR_LOG_MAX_BYTES,
+                backup_count=SUPERVISOR_LOG_BACKUP_COUNT,
+            )
+        except Exception:
+            pass
+
+
+if not any(isinstance(handler, _BoundedSupervisorLogHandler) for handler in LOGGER.handlers):
+    _bounded_log_handler = _BoundedSupervisorLogHandler()
+    _bounded_log_handler.setLevel(logging.INFO)
+    _bounded_log_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    LOGGER.addHandler(_bounded_log_handler)
 
 
 def redact_sensitive(value: str, limit: int = 5000) -> str:
@@ -160,7 +195,6 @@ def acquire_supervisor_lock() -> None:
 
 
 def append_event(kind: str, message: str, **context) -> None:
-    EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "kind": kind,
@@ -168,22 +202,26 @@ def append_event(kind: str, message: str, **context) -> None:
         "source": "supervisor",
         **context,
     }
-    with EVENTS_PATH.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(payload, default=str) + "\n")
+    append_event_record(
+        EVENTS_PATH,
+        payload,
+        max_bytes=EVENTS_MAX_BYTES,
+        backup_count=EVENTS_BACKUP_COUNT,
+    )
 
 
 async def _capture_stream(stream, name: str, output: deque[str]) -> None:
     if stream is None:
         return
-    SUPERVISOR_LOG.parent.mkdir(parents=True, exist_ok=True)
     while line := await stream.readline():
         text = line.decode("utf-8", "replace").rstrip()
         output.append(text)
-        with SUPERVISOR_LOG.open("a", encoding="utf-8") as log:
-            log.write(
-                f"{datetime.now(timezone.utc).isoformat()} "
-                f"{name}: {redact_sensitive(text)}\n"
-            )
+        append_bounded_line(
+            SUPERVISOR_LOG,
+            f"{datetime.now(timezone.utc).isoformat()} {name}: {redact_sensitive(text)}",
+            max_bytes=SUPERVISOR_LOG_MAX_BYTES,
+            backup_count=SUPERVISOR_LOG_BACKUP_COUNT,
+        )
         if name == "stderr" or "error" in text.lower() or "failed" in text.lower():
             append_event("process_output", text, stream=name)
         match = _ERROR_LOG_PATTERN.search(text)
@@ -237,97 +275,210 @@ async def write_error_file(error_id: str, stderr: str, category: str) -> Path:
         "source": "supervisor",
     }
     path = ERRORS_DIR / f"{error_id}.json"
-    path.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    write_redacted_json(path, info)
     return path
 
 
-async def supervise(cwd: Path) -> None:
-    asyncio.get_running_loop().add_signal_handler(
-        signal.SIGUSR1,
-        lambda: asyncio.create_task(notify_restart_shutdown()),
+async def _terminate_process_group(
+    process: asyncio.subprocess.Process,
+    *,
+    term_timeout: float = GRACEFUL_STOP_SECONDS,
+    kill_timeout: float = FORCE_KILL_SECONDS,
+) -> bool:
+    """Stop the bot and all of its descendants, escalating only after a grace period."""
+    def group_exists() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    if process.returncode is not None and not group_exists():
+        return True
+    wait_task = asyncio.create_task(process.wait())
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        await asyncio.gather(wait_task, return_exceptions=True)
+        return True
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + term_timeout
+    while group_exists() and loop.time() < deadline:
+        await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0)))
+    if not group_exists():
+        await asyncio.gather(wait_task, return_exceptions=True)
+        return True
+
+    LOGGER.warning("Bot process group %s ignored SIGTERM; sending SIGKILL", process.pid)
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        await asyncio.gather(wait_task, return_exceptions=True)
+        return True
+    deadline = loop.time() + kill_timeout
+    while group_exists() and loop.time() < deadline:
+        await asyncio.sleep(min(0.05, max(deadline - loop.time(), 0)))
+    stopped = not group_exists()
+    if stopped:
+        await asyncio.gather(wait_task, return_exceptions=True)
+        return True
+    LOGGER.error("Bot process group %s did not exit after SIGKILL", process.pid)
+    if not wait_task.done():
+        wait_task.cancel()
+    await asyncio.gather(wait_task, return_exceptions=True)
+    return False
+
+
+async def _wait_for_stop(stop_event: asyncio.Event, delay: float) -> bool:
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _launch_bot(bot_args: list[str], cwd: Path) -> asyncio.subprocess.Process:
+    """Launch the bot in its own session so its complete process tree is controllable."""
+    return await asyncio.create_subprocess_exec(
+        *bot_args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
+
+
+async def supervise(cwd: Path) -> None:
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def request_stop(signum: signal.Signals) -> None:
+        if not stop_event.is_set():
+            LOGGER.info("Supervisor received %s; shutting down", signum.name)
+            append_event("supervisor_shutdown_requested", "Supervisor shutdown requested", signal=signum.name)
+            stop_event.set()
+
+    installed_signals: list[signal.Signals] = []
+    for signum, callback in (
+        (signal.SIGUSR1, lambda: asyncio.create_task(notify_restart_shutdown())),
+        (signal.SIGTERM, lambda: request_stop(signal.SIGTERM)),
+        (signal.SIGINT, lambda: request_stop(signal.SIGINT)),
+    ):
+        try:
+            loop.add_signal_handler(signum, callback)
+            installed_signals.append(signum)
+        except (NotImplementedError, RuntimeError):
+            LOGGER.warning("Could not install handler for %s", signum.name)
+
     bot_args = [sys.executable, "-m", "media_bot"]
     crash_count = 0
     last_crash_time = 0.0
 
-    while True:
-        LOGGER.info("Starting bot: %s", " ".join(bot_args))
-        append_event("launch_attempt", "Starting bot", command=bot_args, cwd=str(cwd))
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *bot_args,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+    try:
+        while not stop_event.is_set():
+            LOGGER.info("Starting bot: %s", " ".join(bot_args))
+            append_event("launch_attempt", "Starting bot", command=bot_args, cwd=str(cwd))
+            try:
+                proc = await _launch_bot(bot_args, cwd)
+            except Exception as exc:
+                error_id = f"launch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+                detail = f"{exc.__class__.__name__}: {exc}"
+                error_path = await write_error_file(error_id, detail, "launch_failure")
+                append_event("launch_failure", detail, error_id=error_id)
+                LOGGER.exception("Could not launch bot")
+                await notify_error(error_id, error_path)
+                if await _wait_for_stop(stop_event, RESTART_DELAY):
+                    return
+                continue
+            start_time = time.monotonic()
+            stdout_lines: deque[str] = deque(maxlen=2000)
+            stderr_lines: deque[str] = deque(maxlen=2000)
+            readers = (
+                asyncio.create_task(_capture_stream(proc.stdout, "stdout", stdout_lines)),
+                asyncio.create_task(_capture_stream(proc.stderr, "stderr", stderr_lines)),
             )
-        except Exception as exc:
-            error_id = f"launch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-            detail = f"{exc.__class__.__name__}: {exc}"
-            error_path = await write_error_file(error_id, detail, "launch_failure")
-            append_event("launch_failure", detail, error_id=error_id)
-            LOGGER.exception("Could not launch bot")
-            await notify_error(error_id, error_path)
-            await asyncio.sleep(RESTART_DELAY)
-            continue
-        start_time = time.monotonic()
-        stdout_lines: deque[str] = deque(maxlen=2000)
-        stderr_lines: deque[str] = deque(maxlen=2000)
-        readers = (
-            asyncio.create_task(_capture_stream(proc.stdout, "stdout", stdout_lines)),
-            asyncio.create_task(_capture_stream(proc.stderr, "stderr", stderr_lines)),
-        )
+            process_wait = asyncio.create_task(proc.wait())
+            shutdown_wait = asyncio.create_task(stop_event.wait())
 
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=86400 * 7)
-        except asyncio.TimeoutError:
-            LOGGER.info("Bot running for 7 days, restarting...")
-            proc.kill()
-            await proc.wait()
+            try:
+                done, _ = await asyncio.wait(
+                    {process_wait, shutdown_wait},
+                    timeout=WEEKLY_RESTART_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if shutdown_wait in done:
+                    await _terminate_process_group(proc)
+                    await asyncio.gather(*readers, return_exceptions=True)
+                    append_event("supervisor_stopped", "Supervisor and bot stopped gracefully")
+                    return
+                if process_wait not in done:
+                    LOGGER.info("Bot running for 7 days; restarting gracefully")
+                    append_event("weekly_restart", "Starting scheduled weekly bot restart")
+                    await _terminate_process_group(proc)
+                    await asyncio.gather(*readers, return_exceptions=True)
+                    crash_count = 0
+                    continue
+            except asyncio.CancelledError:
+                await _terminate_process_group(proc)
+                await asyncio.gather(*readers, return_exceptions=True)
+                raise
+            finally:
+                for waiter in (process_wait, shutdown_wait):
+                    if not waiter.done():
+                        waiter.cancel()
+                await asyncio.gather(process_wait, shutdown_wait, return_exceptions=True)
+
             await asyncio.gather(*readers, return_exceptions=True)
-            crash_count = 0
-            continue
-        await asyncio.gather(*readers, return_exceptions=True)
 
-        duration = time.monotonic() - start_time
-        exit_code = proc.returncode or 0
-        stdout_text = "\n".join(stdout_lines)
-        stderr_text = "\n".join(stderr_lines)
-        append_event(
-            "process_exit",
-            f"Bot exited with code {exit_code}",
-            exit_code=exit_code,
-            duration_seconds=round(duration, 3),
-            stdout_tail=stdout_text[-5000:],
-            stderr_tail=stderr_text[-10000:],
-        )
-        LOGGER.info("Bot exited (code=%s, ran=%.1fs)", exit_code, duration)
+            duration = time.monotonic() - start_time
+            exit_code = proc.returncode or 0
+            stdout_text = "\n".join(stdout_lines)
+            stderr_text = "\n".join(stderr_lines)
+            append_event(
+                "process_exit",
+                f"Bot exited with code {exit_code}",
+                exit_code=exit_code,
+                duration_seconds=round(duration, 3),
+                stdout_tail=stdout_text[-5000:],
+                stderr_tail=stderr_text[-10000:],
+            )
+            LOGGER.info("Bot exited (code=%s, ran=%.1fs)", exit_code, duration)
 
-        if exit_code == 0:
-            crash_count = 0
-            await asyncio.sleep(RESTART_DELAY)
-            continue
+            if exit_code == 0:
+                crash_count = 0
+                if await _wait_for_stop(stop_event, RESTART_DELAY):
+                    return
+                continue
 
-        crash_count += 1
-        now = time.monotonic()
-        if now - last_crash_time > 600:
-            crash_count = 1
-        last_crash_time = now
+            crash_count += 1
+            now = time.monotonic()
+            if now - last_crash_time > 600:
+                crash_count = 1
+            last_crash_time = now
 
-        has_error_output = has_traceback(stderr_text) or has_code_error(stderr_text) or (
-            "error" in stderr_text.lower() and exit_code != -9
-        )
+            has_error_output = has_traceback(stderr_text) or has_code_error(stderr_text) or (
+                "error" in stderr_text.lower() and exit_code != -9
+            )
 
-        if has_error_output:
-            category = classify_error(stderr_text)
-            error_id = f"crash_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-            error_path = await write_error_file(error_id, stderr_text, category)
-            LOGGER.error("Crash #%d [%s]: %s…", crash_count, category, stderr_text[:250])
-            await notify_error(error_id, error_path)
-        else:
-            LOGGER.info("No actionable error output (exit=%d), restarting...", exit_code)
+            if has_error_output:
+                category = classify_error(stderr_text)
+                error_id = f"crash_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+                error_path = await write_error_file(error_id, stderr_text, category)
+                LOGGER.error("Crash #%d [%s]: %s…", crash_count, category, stderr_text[:250])
+                await notify_error(error_id, error_path)
+            else:
+                LOGGER.info("No actionable error output (exit=%d), restarting...", exit_code)
 
-        delay = min(RESTART_DELAY * (2 ** min(crash_count - 1, 6)), MAX_RESTART_DELAY)
-        await asyncio.sleep(delay)
+            delay = min(RESTART_DELAY * (2 ** min(crash_count - 1, 6)), MAX_RESTART_DELAY)
+            if await _wait_for_stop(stop_event, delay):
+                return
+    finally:
+        for signum in installed_signals:
+            loop.remove_signal_handler(signum)
 
 
 def main() -> None:
@@ -335,7 +486,13 @@ def main() -> None:
     load_dotenv()
     acquire_supervisor_lock()
     LOGGER.info("Supervisor starting in %s", cwd)
-    asyncio.run(supervise(cwd))
+    try:
+        asyncio.run(supervise(cwd))
+    except KeyboardInterrupt:
+        LOGGER.info("Supervisor interrupted")
+    except BaseException:
+        LOGGER.exception("Supervisor stopped unexpectedly")
+        raise
 
 
 if __name__ == "__main__":
