@@ -165,6 +165,42 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_pool_page_preset_selection_enqueues_the_created_edit(self):
+        from media_bot.__main__ import settings_callback_entry
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(
+                self.db_path, "https://example.com/source", user_id=1, chat_id=2,
+            )
+            source = self.storage_dir / "source.mp4"
+            source.write_bytes(b"video")
+            await update_job(
+                self.db_path, job.id, file_path=str(source), status="uploaded",
+            )
+            preset = await create_preset(self.db_path, 1, "Pool preset")
+            update, _query = _make_update(f"edit:preset:{preset.id}")
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data["settings_flow"] = FlowState(
+                action=_State.EDIT_PRESET_SELECT,
+                data={"source_job_id": job.id},
+            )
+
+            with patch(
+                "media_bot.__main__._enqueue_render", new_callable=AsyncMock,
+            ) as enqueue:
+                await settings_callback_entry(update, context)
+
+            enqueue.assert_awaited_once()
+            edit_id = enqueue.await_args.args[2]
+            edit = await get_edit_job(self.db_path, edit_id)
+            self.assertIsNotNone(edit)
+            self.assertEqual(edit.source_job_id, job.id)
+            self.assertEqual(edit.preset_id, preset.id)
+            self.assertTrue(Path(edit.file_path).is_file())
+
+        asyncio.run(run())
+
     def test_active_text_input_consumes_url_before_downloader(self):
         from media_bot.__main__ import _message_router
 

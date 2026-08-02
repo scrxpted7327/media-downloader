@@ -1110,7 +1110,9 @@ async def settings_callback_entry(update: Update, context: ContextTypes.DEFAULT_
         if query:
             await query.answer("Not authorized", show_alert=True)
         return
-    await settings_callback(update, context)
+    result = await settings_callback(update, context)
+    if result is not None and result[0] == "render":
+        await _enqueue_render(update, context, result[1])
     if "settings_flow" in context.user_data:
         _bind_flow_context(update, context)
 

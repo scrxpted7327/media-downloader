@@ -650,7 +650,9 @@ async def presets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _show_preset_list(update, context)
 
 
-async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def settings_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[str, int] | None:
     query = update.callback_query
     if query is None or query.data is None:
         return
@@ -847,8 +849,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if query.data.startswith("edit:preset:"):
         preset_id = int(query.data.split(":")[-1])
-        await _start_edit_process(update, context, preset_id)
-        return
+        edit_id = await _start_edit_process(update, context, preset_id)
+        return ("render", edit_id) if edit_id is not None else None
 
     if query.data == "edit:use_temp":
         await _start_temp_edit(update, context)
@@ -1403,26 +1405,28 @@ async def _show_edit_preset_select(update: Update, context: ContextTypes.DEFAULT
     await _edit_or_send(update, text, keyboard)
 
 
-async def _start_edit_process(update: Update, context: ContextTypes.DEFAULT_TYPE, preset_id: int) -> None:
+async def _start_edit_process(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, preset_id: int,
+) -> int | None:
     db_path: Path = context.application.bot_data["db_path"]
     storage_dir: Path = context.application.bot_data["storage_dir"]
     flow: FlowState = context.user_data["settings_flow"]
     source_job_id = flow.data.get("source_job_id")
     user = update.effective_user
     if user is None or source_job_id is None:
-        return
+        return None
     try:
         source = await require_owned_job(db_path, source_job_id, user.id)
     except ResourceNotFound:
         await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
-        return
+        return None
     if source.file_path is None:
         await update.callback_query.answer("Source not found", show_alert=True)
-        return
+        return None
     source_path = Path(source.file_path)
     if not source_path.is_file():
         await update.callback_query.answer("Source file missing", show_alert=True)
-        return
+        return None
 
     edit = await create_edit_job(db_path, source_job_id, user.id, preset_id)
     dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
@@ -1436,6 +1440,7 @@ async def _start_edit_process(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _edit_or_send(update, f"🎬 Edit job #{edit.id} created from source #{source_job_id}.\nRendering with your preset...", keyboard)
     context.user_data["settings_flow"].action = _State.EDIT_PROCESSING
     context.user_data["settings_flow"].data = {"edit_id": edit.id, "source_job_id": source_job_id}
+    return edit.id
 
 
 async def _start_temp_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
