@@ -6,6 +6,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from media_bot.download_server import create_download_app
 from media_bot.storage import (
+    consume_download_token,
     create_download_token,
     create_edit_job,
     create_job,
@@ -75,6 +76,49 @@ class DownloadServerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 403)
         self.assertEqual(await response.text(), "Access denied")
+
+        outside.unlink()
+        inside = self.storage / "recovered.mp4"
+        inside.write_bytes(b"recovered")
+        await update_job(self.db_path, job.id, file_path=str(inside))
+        retry = await self.client.get(f"/download/{token}")
+        self.assertEqual(retry.status, 200)
+        self.assertEqual(await retry.read(), b"recovered")
+
+    async def test_head_does_not_consume_download_token(self):
+        media = self.storage / "head-safe.mp4"
+        media.write_bytes(b"video")
+        job = await create_job(self.db_path, "https://example.com/video", 7, 9)
+        await update_job(self.db_path, job.id, file_path=str(media))
+        token = await create_download_token(self.db_path, job.id, 7, 15)
+
+        response = await self.client.head(f"/download/{token}")
+        self.assertEqual(response.status, 405)
+        claimed = await consume_download_token(self.db_path, token)
+        self.assertIsNotNone(claimed)
+
+    async def test_missing_file_does_not_consume_download_token(self):
+        missing = self.storage / "missing.mp4"
+        job = await create_job(self.db_path, "https://example.com/video", 7, 9)
+        await update_job(self.db_path, job.id, file_path=str(missing))
+        token = await create_download_token(self.db_path, job.id, 7, 15)
+
+        response = await self.client.get(f"/download/{token}")
+        self.assertEqual(response.status, 404)
+        self.assertIsNotNone(await consume_download_token(self.db_path, token))
+
+    async def test_refuses_symlink_escape_without_consuming_token(self):
+        outside = Path(self.temporary.name) / "private.mp4"
+        outside.write_bytes(b"private")
+        symlink = self.storage / "escape.mp4"
+        symlink.symlink_to(outside)
+        job = await create_job(self.db_path, "https://example.com/video", 7, 9)
+        await update_job(self.db_path, job.id, file_path=str(symlink))
+        token = await create_download_token(self.db_path, job.id, 7, 15)
+
+        response = await self.client.get(f"/download/{token}")
+        self.assertEqual(response.status, 403)
+        self.assertIsNotNone(await consume_download_token(self.db_path, token))
 
 
 if __name__ == "__main__":

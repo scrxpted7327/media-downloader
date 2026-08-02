@@ -81,13 +81,44 @@ For a channel, add the bot as an administrator so Telegram delivers
 `channel_post` updates. Put that channel's numeric chat ID (normally starting
 with `-100`) in `TELEGRAM_ALLOWED_CHAT_IDS`.
 
-The bot handles only URLs whose hostname belongs to an allowlist. Redirects,
-arbitrary downloader arguments, and arbitrary local paths are never accepted.
-Downloaded files live in a unique temporary directory and are deleted after the
-Telegram upload attempt. The default download timeout is one hour, and the
-default Telegram upload write timeout is 15 minutes. The default 47 MiB source
-limit leaves headroom below Telegram's 50 MB public Bot API upload limit. A
-local Bot API server is required for larger uploads.
+The bot handles only HTTPS URLs whose hostname belongs to an allowlist.
+Arbitrary downloader arguments and arbitrary local paths are never accepted.
+Completed files are persisted under `MEDIA_BOT_STORAGE_DIR`, associated with
+the requesting Telegram user, and removed by the configured retention cleanup.
+Downloads and renders use bounded worker queues with global and per-user
+capacity limits. Work interrupted by a restart is marked failed explicitly
+rather than remaining stuck in an active state.
+
+The default download timeout is one hour, and the default Telegram upload write
+timeout is 15 minutes. The default 47 MiB source limit leaves headroom below
+Telegram's 50 MB public Bot API upload limit. A local Bot API server is required
+for larger Telegram uploads.
+
+### Direct downloads
+
+Direct downloads are disabled unless
+`MEDIA_BOT_DOWNLOAD_PUBLIC_ORIGIN` is configured with an HTTPS origin. The
+embedded server binds to `127.0.0.1` by default; expose it through a TLS reverse
+proxy or private tunnel and set the public origin to that externally reachable
+address. For example:
+
+```sh
+MEDIA_BOT_DOWNLOAD_PUBLIC_ORIGIN=https://media.example.com
+MEDIA_BOT_DOWNLOAD_BIND_HOST=127.0.0.1
+MEDIA_BOT_DOWNLOAD_PORT=8080
+```
+
+Download links use random, expiring, one-time tokens. `HEAD`, missing files,
+paths outside storage, and symlink escapes do not consume a token. A successful
+`GET` consumes it atomically. Direct links therefore require an HTTPS proxy;
+do not bind the server publicly without an equivalent network boundary.
+
+Interactive settings, pool, and edit prompts are bound to the Telegram chat
+where they were opened, expire after 15 minutes, and can be cleared with
+`/cancel`. Authorized messages are audited structurally without storing their
+raw text. Diagnostic reports redact common credentials and URL query strings
+and include only the reporting user's events plus explicitly marked global
+health events.
 
 Only download media you are authorized to access and use, and comply with the
 source platform's terms and applicable law.
@@ -97,3 +128,8 @@ source platform's terms and applicable law.
 Run it under a service manager with a dedicated unprivileged user, a private
 data directory, and the environment variables above. Do not expose its token
 or the tools directory through a web server.
+
+The repository's `restart_bot.py` coordinates with `supervisor.py` before
+restarting the stack. Deployment and live Telegram acceptance testing are
+separate operator actions; local unit tests do not prove the Inspiron service is
+ready.

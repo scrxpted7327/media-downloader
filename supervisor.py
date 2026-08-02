@@ -30,6 +30,24 @@ SUPERVISOR_LOG = Path("runtime/supervisor.log")
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
 _LOCK_HANDLE = None
 _ERROR_LOG_PATTERN = re.compile(r"Error logged: (err_[A-Za-z0-9_]+)")
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b(?:bot\d+:[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{16,}|"
+    r"(?:token|secret|password|api[_-]?key)\s*[=:]\s*\S+)"
+)
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+
+
+def redact_sensitive(value: str, limit: int = 5000) -> str:
+    text = _SECRET_PATTERN.sub("[REDACTED]", str(value))
+
+    def clean_url(match: re.Match[str]) -> str:
+        try:
+            parts = urllib.parse.urlsplit(match.group(0))
+            return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except ValueError:
+            return "[REDACTED_URL]"
+
+    return _URL_PATTERN.sub(clean_url, text)[:limit]
 
 
 def load_dotenv() -> None:
@@ -102,9 +120,11 @@ async def notify_error(error_id: str, path: Path | None = None) -> bool:
     path = path or ERRORS_DIR / f"{error_id}.json"
     try:
         info = json.loads(path.read_text(encoding="utf-8"))
-        message = str(info.get("message") or "Unknown bot error")
+        message = redact_sensitive(info.get("message") or "Unknown bot error", 700)
         category = str(info.get("category") or "unknown")
-        traceback_text = str(info.get("traceback") or info.get("stderr") or "")
+        traceback_text = redact_sensitive(
+            info.get("traceback") or info.get("stderr") or "", 2800,
+        )
         update = info.get("update") or {}
         report = (
             "⚠️ Bot error reported by supervisor\n"
@@ -144,7 +164,7 @@ def append_event(kind: str, message: str, **context) -> None:
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "kind": kind,
-        "message": message[:5000],
+        "message": redact_sensitive(message),
         "source": "supervisor",
         **context,
     }
@@ -160,7 +180,10 @@ async def _capture_stream(stream, name: str, output: deque[str]) -> None:
         text = line.decode("utf-8", "replace").rstrip()
         output.append(text)
         with SUPERVISOR_LOG.open("a", encoding="utf-8") as log:
-            log.write(f"{datetime.now(timezone.utc).isoformat()} {name}: {text}\n")
+            log.write(
+                f"{datetime.now(timezone.utc).isoformat()} "
+                f"{name}: {redact_sensitive(text)}\n"
+            )
         if name == "stderr" or "error" in text.lower() or "failed" in text.lower():
             append_event("process_output", text, stream=name)
         match = _ERROR_LOG_PATTERN.search(text)

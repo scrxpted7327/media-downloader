@@ -31,7 +31,13 @@ class SupportedUrlTests(unittest.TestCase):
             self.assertTrue(is_supported_url(url), url)
 
     def test_rejects_lookalikes_and_non_urls(self):
-        for url in ("https://youtube.com.evil.test/x", "file:///tmp/a", "https://example.com/youtube.com", "yt-dlp --help"):
+        for url in (
+            "http://youtube.com/watch?v=abc",
+            "https://youtube.com.evil.test/x",
+            "file:///tmp/a",
+            "https://example.com/youtube.com",
+            "yt-dlp --help",
+        ):
             self.assertFalse(is_supported_url(url), url)
 
     def test_extracts_links_from_normal_message_text(self):
@@ -41,6 +47,9 @@ class SupportedUrlTests(unittest.TestCase):
     def test_identifies_tiktok_photo_posts(self):
         self.assertTrue(is_tiktok_photo_url("https://www.tiktok.com/@someone/photo/123456789"))
         self.assertFalse(is_tiktok_photo_url("https://www.tiktok.com/@someone/video/123456789"))
+
+    def test_rejects_insecure_tiktok_profile_url(self):
+        self.assertIsNone(normalize_tiktok_profile("http://www.tiktok.com/@creator"))
 
 
 if __name__ == "__main__":

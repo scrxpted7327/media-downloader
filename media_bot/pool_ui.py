@@ -9,6 +9,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
+from .access import ResourceNotFound, require_owned_job
 from .storage import (
     Classification,
     PoolItem,
@@ -553,8 +554,12 @@ async def _add_pool_from_job(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("No active edit job. Use /settings -> Edit Existing Video first.")
         return
 
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await update.message.reply_text("Not found or not authorized.")
+        return
+    if source.file_path is None:
         await update.message.reply_text("Source not found.")
         return
 

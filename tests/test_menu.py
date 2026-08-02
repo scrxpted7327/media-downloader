@@ -49,11 +49,21 @@ class MenuTests(unittest.TestCase):
             with patch.object(diagnostics, "EVENTS_PATH", events_path):
                 diagnostics.append_event("update", "mine", user_id=1)
                 diagnostics.append_event("update", "theirs", user_id=2)
-                diagnostics.append_event("process_exit", "global")
+                diagnostics.append_event("process_exit", "global", scope="global_health")
+                diagnostics.append_event("process_output", "unscoped")
 
                 events = diagnostics.recent_events(user_id=1)
 
             self.assertEqual([event["message"] for event in events], ["mine", "global"])
+
+    def test_diagnostics_redact_secrets_and_url_queries(self):
+        redacted = diagnostics.redact_sensitive(
+            "token=very-secret-value https://example.test/path?token=secret#fragment"
+        )
+        self.assertNotIn("very-secret-value", redacted)
+        self.assertNotIn("?token=", redacted)
+        self.assertNotIn("#fragment", redacted)
+        self.assertIn("https://example.test/path", redacted)
 
     def test_opencode_fix_accepts_provider_model(self):
         async def run():

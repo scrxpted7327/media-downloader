@@ -48,6 +48,7 @@ from media_bot.storage import (
     list_user_jobs,
     list_workflows,
     remove_pool_tag,
+    reconcile_interrupted_work,
     share_preset,
     stage_edit_source,
     update_edit_job,
@@ -102,6 +103,20 @@ class StorageTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_reconciles_interrupted_downloads_and_renders(self):
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            await update_job(self.db_path, job.id, status="downloading")
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            await update_edit_job(self.db_path, edit.id, status="rendering")
+
+            self.assertEqual(await reconcile_interrupted_work(self.db_path), (1, 1))
+            self.assertEqual((await get_job(self.db_path, job.id)).status, "failed")
+            self.assertEqual((await get_edit_job(self.db_path, edit.id)).status, "failed")
+
+        asyncio.run(run())
+
     def test_list_user_jobs(self):
         import asyncio
 
@@ -132,6 +147,35 @@ class StorageTests(unittest.TestCase):
 
             reused = await consume_download_token(self.db_path, token)
             self.assertIsNone(reused)
+
+        asyncio.run(run())
+
+    def test_download_token_has_exactly_one_concurrent_winner(self):
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            for _ in range(5):
+                token = await create_download_token(self.db_path, job.id, 1, 15)
+                results = await asyncio.gather(
+                    *(consume_download_token(self.db_path, token) for _ in range(20))
+                )
+                self.assertEqual(sum(result is not None for result in results), 1)
+
+        asyncio.run(run())
+
+    def test_download_token_rejects_job_and_edit_ownership_mismatch(self):
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com", 1, 2)
+            other_job = await create_job(self.db_path, "https://example.com/other", 2, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+
+            with self.assertRaises(ValueError):
+                await create_download_token(self.db_path, job.id, 2, 15)
+            with self.assertRaises(ValueError):
+                await create_download_token(
+                    self.db_path, other_job.id, 2, 15, edit_job_id=edit.id,
+                )
 
         asyncio.run(run())
 

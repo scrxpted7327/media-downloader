@@ -12,6 +12,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .diagnostics import redact_sensitive
+
 LOGGER = logging.getLogger(__name__)
 
 ERRORS_DIR = Path("runtime/errors")
@@ -138,8 +140,8 @@ async def invoke_opencode_fix(
     model: str | None = None,
 ) -> str | None:
     error_id = error_info.get("id", int(time.time()))
-    error_message = error_info.get("message", "")
-    traceback = error_info.get("traceback", "")
+    error_message = redact_sensitive(error_info.get("message", ""), 2000)
+    traceback = redact_sensitive(error_info.get("traceback", ""), 4000)
     category = error_info.get("category", "unknown")
 
     prompt = (

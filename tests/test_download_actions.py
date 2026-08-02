@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +36,7 @@ def _make_update(callback_data: str, user_id: int = 1):
     update = MagicMock()
     update.callback_query = query
     update.effective_user = SimpleNamespace(id=user_id)
-    update.effective_message = None
+    update.effective_message = query.message
     update.message = None
     return update, query
 
@@ -48,10 +49,15 @@ def _make_context(db_path: Path, storage_dir: Path, allowed_user_ids=None):
         timeout_seconds=120,
     )
     context = MagicMock()
+    inline_queue = SimpleNamespace(
+        submit=lambda **kwargs: asyncio.create_task(kwargs["factory"]()),
+    )
     context.application.bot_data = {
         "settings": settings,
         "db_path": db_path,
         "storage_dir": storage_dir,
+        "download_work": inline_queue,
+        "render_work": inline_queue,
     }
     context.user_data = {}
     return context
@@ -88,6 +94,77 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_authorized_group_member_cannot_download_another_users_job(self):
+        from media_bot.__main__ import download_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
+            source = self.storage_dir / "private.mp4"
+            source.write_bytes(b"private")
+            await update_job(self.db_path, job.id, file_path=str(source), status="uploaded")
+            update, query = _make_update(f"download:orig:{job.id}", user_id=2)
+            context = _make_context(
+                self.db_path, self.storage_dir, allowed_user_ids={1, 2},
+            )
+            context.bot.send_message = AsyncMock()
+
+            await download_callback(update, context)
+
+            context.bot.send_message.assert_not_awaited()
+            query.answer.assert_awaited_once()
+            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+
+        asyncio.run(run())
+
+    def test_authorized_group_member_cannot_mutate_another_users_edit(self):
+        from media_bot.__main__ import editconfig_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
+            edit = await create_edit_job(self.db_path, job.id, 1)
+            update, query = _make_update(
+                f"editcfg:{edit.id}:set:auto_captions:yes", user_id=2,
+            )
+            context = _make_context(
+                self.db_path, self.storage_dir, allowed_user_ids={1, 2},
+            )
+
+            await editconfig_callback(update, context)
+
+            unchanged = await get_edit_job(self.db_path, edit.id)
+            self.assertFalse(unchanged.auto_captions)
+            query.answer.assert_awaited_once()
+            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+
+        asyncio.run(run())
+
+    def test_settings_source_callback_cannot_select_another_users_job(self):
+        from media_bot.settings_ui import settings_callback
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(
+                self.db_path, "https://example.com/private", user_id=1, chat_id=2,
+            )
+            update, query = _make_update(f"edit:source:{job.id}", user_id=2)
+            context = _make_context(
+                self.db_path, self.storage_dir, allowed_user_ids={1, 2},
+            )
+            context.user_data["settings_flow"] = FlowState(
+                action=_State.EDIT_SOURCE,
+            )
+
+            await settings_callback(update, context)
+
+            self.assertNotIn(
+                "source_job_id", context.user_data["settings_flow"].data,
+            )
+            self.assertTrue(query.answer.await_args.kwargs["show_alert"])
+
+        asyncio.run(run())
+
     def test_active_text_input_consumes_url_before_downloader(self):
         from media_bot.__main__ import _message_router
 
@@ -106,6 +183,10 @@ class DownloadEditActionTests(unittest.TestCase):
             update = MagicMock()
             update.message = message
             update.effective_message = message
+            update.effective_user = SimpleNamespace(id=1)
+            update.effective_chat = SimpleNamespace(id=2)
+            context.user_data["_flow_chat_id"] = 2
+            context.user_data["_flow_expires_at"] = time.monotonic() + 60
 
             with (
                 patch("media_bot.__main__._authorized", return_value=True),
@@ -138,6 +219,9 @@ class DownloadEditActionTests(unittest.TestCase):
             update.message = message
             update.effective_message = message
             update.effective_user = SimpleNamespace(id=1)
+            update.effective_chat = SimpleNamespace(id=2)
+            context.user_data["_flow_chat_id"] = 2
+            context.user_data["_flow_expires_at"] = time.monotonic() + 60
 
             with (
                 patch("media_bot.__main__._authorized", return_value=True),
@@ -169,6 +253,10 @@ class DownloadEditActionTests(unittest.TestCase):
             update = MagicMock()
             update.message = message
             update.effective_message = message
+            update.effective_user = SimpleNamespace(id=1)
+            update.effective_chat = SimpleNamespace(id=2)
+            context.user_data["_flow_chat_id"] = 2
+            context.user_data["_flow_expires_at"] = time.monotonic() + 60
 
             with (
                 patch("media_bot.__main__._authorized", return_value=True),
@@ -178,6 +266,64 @@ class DownloadEditActionTests(unittest.TestCase):
 
             message.reply_text.assert_awaited_once()
             download.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_active_input_is_not_consumed_from_another_chat(self):
+        from media_bot.__main__ import _message_router
+
+        async def run():
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data.update({
+                "settings_flow": {
+                    "action": "editconfig",
+                    "edit_id": 1,
+                    "field_name": "voice_text",
+                },
+                "_flow_chat_id": 2,
+                "_flow_expires_at": time.monotonic() + 60,
+            })
+            message = MagicMock(text="https://www.youtube.com/watch?v=abc")
+            update = MagicMock(
+                effective_message=message,
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=3),
+            )
+            with (
+                patch("media_bot.__main__._authorized", return_value=True),
+                patch("media_bot.__main__._handle_active_input", new_callable=AsyncMock) as active,
+                patch("media_bot.__main__.handle_url", new_callable=AsyncMock) as download,
+            ):
+                await _message_router(update, context)
+            active.assert_not_awaited()
+            download.assert_awaited_once()
+
+        asyncio.run(run())
+
+    def test_expired_input_flow_is_cleared(self):
+        from media_bot.__main__ import _message_router
+
+        async def run():
+            context = _make_context(self.db_path, self.storage_dir)
+            context.user_data.update({
+                "settings_flow": {"action": "editconfig"},
+                "_flow_chat_id": 2,
+                "_flow_expires_at": time.monotonic() - 1,
+            })
+            update = MagicMock(
+                effective_message=MagicMock(text="hello"),
+                effective_user=SimpleNamespace(id=1),
+                effective_chat=SimpleNamespace(id=2),
+            )
+            with (
+                patch("media_bot.__main__._authorized", return_value=True),
+                patch("media_bot.__main__._handle_active_input", new_callable=AsyncMock) as active,
+                patch("media_bot.__main__.handle_url", new_callable=AsyncMock) as download,
+            ):
+                await _message_router(update, context)
+            active.assert_not_awaited()
+            download.assert_awaited_once()
+            self.assertNotIn("settings_flow", context.user_data)
 
         asyncio.run(run())
 
@@ -217,12 +363,13 @@ class DownloadEditActionTests(unittest.TestCase):
 
         async def run():
             await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
             status = MagicMock()
             status.edit_text = AsyncMock()
             with patch("media_bot.storage.list_presets", new_callable=AsyncMock, return_value=[]), \
                  patch("media_bot.storage.get_or_create_user_settings", new_callable=AsyncMock) as gus:
                 gus.return_value = SimpleNamespace(preset_name=None)
-                await _send_secure_link(status, 42, self.db_path, 1)
+                await _send_secure_link(status, job.id, self.db_path, 1)
 
             status.edit_text.assert_awaited_once()
             markup = status.edit_text.await_args.kwargs["reply_markup"]
@@ -414,6 +561,7 @@ class DownloadEditActionTests(unittest.TestCase):
             update.message = MagicMock()
             update.message.text = "@alexis.s5"
             update.message.reply_text = AsyncMock()
+            update.effective_user = SimpleNamespace(id=1)
 
             with patch(
                 "media_bot.__main__.show_editconfig_menu",
@@ -490,13 +638,14 @@ class DownloadEditActionTests(unittest.TestCase):
 
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=42, user_id=1)
+            job = await create_job(self.db_path, "https://example.com/source", 1, 2)
+            edit = await create_edit_job(self.db_path, source_job_id=job.id, user_id=1)
             update, _ = _make_update(f"editcfg:{edit.id}:download")
             context = _make_context(self.db_path, self.storage_dir)
 
             result = await handle_editconfig_callback(update, context)
 
-            self.assertEqual(result, ("download", 42))
+            self.assertEqual(result, ("download", job.id))
 
         asyncio.run(run())
 
@@ -505,7 +654,8 @@ class DownloadEditActionTests(unittest.TestCase):
 
         async def run():
             await init_db(self.db_path)
-            edit = await create_edit_job(self.db_path, source_job_id=42, user_id=1)
+            job = await create_job(self.db_path, "https://example.com/source", 1, 2)
+            edit = await create_edit_job(self.db_path, source_job_id=job.id, user_id=1)
             update, query = _make_update(f"editcfg:{edit.id}:set:auto_captions:yes")
             context = _make_context(self.db_path, self.storage_dir)
 
@@ -594,7 +744,8 @@ class DownloadEditActionTests(unittest.TestCase):
                 caption_color="white",
                 auto_captions=False,
             )
-            edit = await create_edit_job(self.db_path, source_job_id=42, user_id=1)
+            job = await create_job(self.db_path, "https://example.com/source", 1, 2)
+            edit = await create_edit_job(self.db_path, source_job_id=job.id, user_id=1)
             await update_edit_job(
                 self.db_path,
                 edit.id,

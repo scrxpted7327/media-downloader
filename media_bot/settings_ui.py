@@ -8,6 +8,12 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from .access import (
+    NOT_FOUND_OR_UNAUTHORIZED,
+    ResourceNotFound,
+    require_owned_edit,
+    require_owned_job,
+)
 from .colors import COLOR_HUES, color_emoji, color_label, shade_options
 from .menu import Menu
 from .storage import (
@@ -819,6 +825,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if query.data.startswith("edit:source:"):
         job_id = int(query.data.split(":")[-1])
+        user = update.effective_user
+        if user is None:
+            return
+        try:
+            await require_owned_job(
+                context.application.bot_data["db_path"], job_id, user.id,
+            )
+        except ResourceNotFound:
+            await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+            return
         flow.action = _State.EDIT_PRESET_SELECT
         flow.data["source_job_id"] = job_id
         await _show_edit_preset_select(update, context, job_id)
@@ -900,6 +916,16 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     if user is None:
         return False
+    if editconfig_upload:
+        edit_id = int(flow["edit_id"])
+        try:
+            await require_owned_edit(
+                context.application.bot_data["db_path"], edit_id, user.id,
+            )
+        except ResourceNotFound:
+            flow.clear()
+            await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+            return True
     storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
     banners_dir = storage_dir / "banners"
     banners_dir.mkdir(parents=True, exist_ok=True)
@@ -910,12 +936,11 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     await file.download_to_drive(dest)
 
     if editconfig_upload:
-        edit_id = int(flow["edit_id"])
         updated = await update_edit_job(
             context.application.bot_data["db_path"], edit_id, banner_path=str(dest),
         )
         if updated is None:
-            await message.reply_text("Edit job not found.")
+            await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
             return True
         flow.pop("field_name", None)
         await message.reply_text("Banner image saved.")
@@ -1351,8 +1376,12 @@ async def _show_edit_preset_select(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     if user is None:
         return
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await _edit_or_send(update, NOT_FOUND_OR_UNAUTHORIZED, InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="settings:edit_source")]]))
+        return
+    if source.file_path is None:
         await _edit_or_send(update, "Source video not found.", InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="settings:edit_source")]]))
         return
     presets = await list_presets(db_path, user.id)
@@ -1382,8 +1411,12 @@ async def _start_edit_process(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if user is None or source_job_id is None:
         return
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if source.file_path is None:
         await update.callback_query.answer("Source not found", show_alert=True)
         return
     source_path = Path(source.file_path)
@@ -1413,8 +1446,12 @@ async def _start_temp_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if user is None or source_job_id is None:
         return
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if source.file_path is None:
         await update.callback_query.answer("Source not found", show_alert=True)
         return
     source_path = Path(source.file_path)
@@ -1475,8 +1512,13 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     user = update.effective_user
     if user is None:
         return
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None or edit.file_path is None:
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+        await require_owned_job(db_path, edit.source_job_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if edit.file_path is None:
         await update.callback_query.answer("Edit not found", show_alert=True)
         return
     pool_item = await create_pool_item(
@@ -1511,9 +1553,14 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
 
 async def show_editconfig_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int, *, intro: str | None = None) -> None:
     db_path: Path = context.application.bot_data["db_path"]
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None:
-        await _edit_or_send(update, "Edit job not found.", None)
+    user = update.effective_user
+    if user is None:
+        return
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+        await require_owned_job(db_path, edit.source_job_id, user.id)
+    except ResourceNotFound:
+        await _edit_or_send(update, NOT_FOUND_OR_UNAUTHORIZED, None)
         return
     preset = None
     if edit.preset_id:
@@ -1524,9 +1571,13 @@ async def show_editconfig_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _start_editconfig_from_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
     db_path: Path = context.application.bot_data["db_path"]
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None:
-        await update.callback_query.answer("Edit not found", show_alert=True)
+    user = update.effective_user
+    if user is None:
+        return
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
         return
     flow = context.user_data.get("settings_flow")
     if flow is None:
@@ -1547,7 +1598,6 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     if query is None or query.data is None:
         return None
-    await query.answer()
     db_path: Path = context.application.bot_data["db_path"]
     data: str = query.data
 
@@ -1560,9 +1610,20 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     try:
         edit_id = int(parts[1])
     except ValueError:
-        await _edit_message(query, "Invalid edit ID.")
+        await query.answer("Invalid edit ID.", show_alert=True)
         return None
     rest = parts[2]
+
+    try:
+        owned_edit = await require_owned_edit(db_path, edit_id, query.from_user.id)
+        await require_owned_job(
+            db_path, owned_edit.source_job_id, query.from_user.id,
+        )
+    except ResourceNotFound:
+        await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return None
+
+    await query.answer()
 
     flow = context.user_data.get("settings_flow")
     if isinstance(flow, FlowState):

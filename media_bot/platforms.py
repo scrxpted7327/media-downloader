@@ -6,14 +6,14 @@ from urllib.parse import urlparse
 _DOMAINS = (
     "youtube.com", "youtu.be", "instagram.com", "tiktok.com", "facebook.com", "fb.watch",
 )
-_URL_PATTERN = re.compile(r"https?://[^\s<>\[\]{}\"']+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https://[^\s<>\[\]{}\"']+", re.IGNORECASE)
 _TRAILING_PUNCTUATION = ".,!?;:)"
 
 
 def is_supported_url(value: str) -> bool:
     """Accept HTTPS links to exact supported domains or their subdomains."""
     parsed = urlparse(value.strip())
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme != "https" or not parsed.netloc:
         return False
     host = (parsed.hostname or "").lower().rstrip(".")
     return any(host == domain or host.endswith("." + domain) for domain in _DOMAINS)
@@ -55,6 +55,8 @@ def normalize_tiktok_profile(value: str) -> str | None:
 
     candidate = raw if "://" in raw else f"https://{raw}"
     parsed = urlparse(candidate)
+    if parsed.scheme != "https":
+        return None
     host = (parsed.hostname or "").lower().rstrip(".").removeprefix("www.")
     if host != "tiktok.com":
         return None

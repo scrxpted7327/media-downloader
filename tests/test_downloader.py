@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 from media_bot.downloader import (
     DownloadError,
+    _enforce_size,
+    _run_checked,
     download_progress,
     download_tiktok_account,
     download_tiktok_slideshow,
@@ -30,10 +32,50 @@ class DownloadProgressTests(unittest.TestCase):
                 ("Clip title", "Source caption"),
             )
 
+    def test_final_size_check_removes_oversized_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large.bin"
+            path.write_bytes(b"x" * 2048)
+            with self.assertRaises(DownloadError):
+                _enforce_size(path, 0, "test output")
+            self.assertFalse(path.exists())
+
+    def test_checked_process_timeout_terminates_promptly(self):
+        async def run():
+            with self.assertRaises(DownloadError):
+                await _run_checked(
+                    [
+                        __import__("sys").executable,
+                        "-c",
+                        "import time; print('started', flush=True); time.sleep(30)",
+                    ],
+                    0.1,
+                    "test child timed out",
+                )
+
+        asyncio.run(run())
+
+    def test_checked_process_bounds_captured_output(self):
+        async def run():
+            stdout, _ = await _run_checked(
+                [
+                    __import__("sys").executable,
+                    "-c",
+                    "import sys\nfor i in range(5000): print(f'line-{i}')",
+                ],
+                10,
+                "test output failed",
+            )
+            self.assertNotIn(b"line-0\n", stdout)
+            self.assertIn(b"line-4999\n", stdout)
+            self.assertLess(len(stdout.splitlines()), 2001)
+
+        asyncio.run(run())
+
 
 class TikTokGalleryDlFallbackTests(unittest.TestCase):
     def test_downloads_tiktok_account_media_into_zip(self):
-        async def fake_run(cmd, timeout_seconds, error_prefix):
+        async def fake_run(cmd, timeout_seconds, error_prefix, **kwargs):
             directory = Path(cmd[cmd.index("--directory") + 1])
             (directory / "one.mp4").write_bytes(b"video")
             (directory / "two.jpg").write_bytes(b"image")

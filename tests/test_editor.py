@@ -99,6 +99,48 @@ def _create_test_image(path: Path) -> None:
 
 
 class RenderEditIntegrationTests(unittest.TestCase):
+    def test_auto_caption_burn_uses_short_beats_and_native_canvas(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+            captured_ass = []
+
+            async def fake_ffmpeg(command, *_args, **_kwargs):
+                ass_argument = command[command.index("-vf") + 1]
+                ass_path = Path(ass_argument.removeprefix("ass="))
+                captured_ass.append(ass_path.read_text(encoding="utf-8"))
+                output.write_bytes(b"rendered")
+
+            segments = [{
+                "start": 0.0, "end": 2.0, "text": "One two three four",
+                "words": [
+                    {"start": 0.0, "end": .4, "word": "One"},
+                    {"start": .5, "end": .9, "word": "two"},
+                    {"start": 1.0, "end": 1.4, "word": "three"},
+                    {"start": 1.5, "end": 2.0, "word": "four"},
+                ],
+            }]
+            with (
+                patch("media_bot.editor.shutil.which", return_value="/usr/bin/ffmpeg"),
+                patch("media_bot.editor.transcribe_audio", return_value=segments),
+                patch("media_bot.editor._get_video_dimensions", return_value=(720, 1280)),
+                patch("media_bot.editor._run_ffmpeg_with_progress", side_effect=fake_ffmpeg),
+            ):
+                asyncio.run(render_captions(
+                    source, output, style="bold", position="high",
+                    bottom_safe_area=.17,
+                ))
+
+            ass = captured_ass[0]
+            self.assertIn("PlayResX: 720", ass)
+            self.assertIn("PlayResY: 1280", ass)
+            self.assertIn(",One two\n", ass)
+            self.assertIn(",three four\n", ass)
+            self.assertNotIn("One two three four", ass)
+            self.assertIn(",228,1\n", ass)
+
     def test_auto_captions_preserve_video_when_no_speech_is_found(self):
         with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
             root = Path(directory)
