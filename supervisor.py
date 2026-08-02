@@ -10,6 +10,7 @@ import re
 import signal
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -37,6 +38,7 @@ EVENTS_MAX_BYTES = 5 * 1024 * 1024
 EVENTS_BACKUP_COUNT = 3
 SUPERVISOR_LOG_MAX_BYTES = 10 * 1024 * 1024
 SUPERVISOR_LOG_BACKUP_COUNT = 3
+MAX_CONSECUTIVE_CRASHES = 8
 GRACEFUL_STOP_SECONDS = 10
 FORCE_KILL_SECONDS = 5
 WEEKLY_RESTART_SECONDS = 86400 * 7
@@ -123,9 +125,22 @@ def _send_telegram_message(text: str, chat_id: str | None = None) -> None:
         data=urllib.parse.urlencode({"chat_id": chat_id, "text": text[:4096]}).encode(),
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
-        if response.status >= 400:
-            raise RuntimeError(f"Telegram returned HTTP {response.status}")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if response.status >= 400:
+                raise RuntimeError(f"Telegram returned HTTP {response.status}")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            payload = json.loads(exc.read(4096).decode("utf-8", "replace"))
+            if isinstance(payload, dict):
+                detail = str(payload.get("description") or "")
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        finally:
+            exc.close()
+        detail = redact_sensitive(detail or exc.reason or "unknown API error", 500)
+        raise RuntimeError(f"Telegram API rejected sendMessage (HTTP {exc.code}): {detail}") from exc
 
 
 async def notify_restart_shutdown() -> bool:
@@ -245,11 +260,22 @@ def classify_error(stderr: str) -> str:
         return "disk"
     if "address already in use" in lower:
         return "port_conflict"
-    if "module not found" in lower or "importerror" in lower.replace(" ", ""):
+    if (
+        "module not found" in lower
+        or "no module named" in lower
+        or "modulenotfounderror" in lower
+        or "importerror" in lower.replace(" ", "")
+    ):
         return "dependency"
     if "token" in lower and ("invalid" in lower or "expired" in lower):
         return "auth"
-    if "connection" in lower and ("refused" in lower or "reset" in lower):
+    if (
+        "connection" in lower and ("refused" in lower or "reset" in lower)
+        or "connecterror" in lower
+        or "temporary failure in name resolution" in lower
+        or "name or service not known" in lower
+        or "dns" in lower
+    ):
         return "network"
     if "timeout" in lower:
         return "timeout"
@@ -470,8 +496,32 @@ async def supervise(cwd: Path) -> None:
                 error_path = await write_error_file(error_id, stderr_text, category)
                 LOGGER.error("Crash #%d [%s]: %s…", crash_count, category, stderr_text[:250])
                 await notify_error(error_id, error_path)
+                if category == "dependency":
+                    LOGGER.critical(
+                        "Stopping supervisor after dependency failure; run restart_bot.py "
+                        "to install requirements before starting the stack"
+                    )
+                    append_event(
+                        "supervisor_stopped",
+                        "Supervisor stopped after a dependency failure",
+                        category=category,
+                        error_id=error_id,
+                    )
+                    return
             else:
                 LOGGER.info("No actionable error output (exit=%d), restarting...", exit_code)
+
+            if crash_count >= MAX_CONSECUTIVE_CRASHES:
+                LOGGER.critical(
+                    "Stopping supervisor after %d consecutive bot crashes; operator intervention required",
+                    crash_count,
+                )
+                append_event(
+                    "supervisor_stopped",
+                    "Supervisor stopped after repeated bot crashes",
+                    crash_count=crash_count,
+                )
+                return
 
             delay = min(RESTART_DELAY * (2 ** min(crash_count - 1, 6)), MAX_RESTART_DELAY)
             if await _wait_for_stop(stop_event, delay):

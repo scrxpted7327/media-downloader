@@ -10,6 +10,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -23,6 +24,12 @@ from telegram.ext import (
     MessageHandler,
     TypeHandler,
     filters,
+)
+from .auto_hashtags import (
+    CodexUnavailable,
+    MetadataError,
+    MetadataResult,
+    generate_metadata,
 )
 from .access import (
     NOT_FOUND_OR_UNAUTHORIZED,
@@ -83,6 +90,7 @@ from .storage import (
     cleanup_edit_artifacts,
     cleanup_expired_tokens,
     cleanup_old_jobs,
+    claim_metadata_job,
     create_durable_pool_item,
     create_download_token,
     create_edit_job,
@@ -91,10 +99,13 @@ from .storage import (
     delete_durable_pool_item,
     delete_job_with_artifacts,
     foreign_key_violations,
+    get_edit_job,
     get_job,
     get_saved_edit_pool_item,
     get_saved_source_pool_item,
     init_db,
+    list_metadata_jobs,
+    list_resumable_metadata_jobs,
     list_all_jobs,
     list_presets,
     list_user_jobs,
@@ -104,6 +115,7 @@ from .storage import (
     reset_source_edits,
     stage_edit_source,
     store_download_message,
+    queue_metadata_job,
     update_edit_job,
     update_job,
 )
@@ -135,7 +147,7 @@ HELP_TEXT = (
     "/cleanup - delete bot status messages from recent jobs\n"
     "/voices - list available TTS voices\n"
     "/queue - show your queued and running work\n"
-    "/canceljob <download|render>:<id> - cancel queued or running work\n"
+    "/canceljob <download|render|metadata>:<id> - cancel queued or running work\n"
     "/report <issue> - save a diagnostic ticket for the operator\n"
     "/skip - skip the current optional input\n"
     "/cancel - cancel the current interactive flow\n\n"
@@ -215,12 +227,12 @@ async def _send_document_with_retry(
     caption: str,
     timeout: int,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+) -> object:
     """Send a document, honoring Telegram's requested flood-control delay."""
     for attempt in range(2):
         try:
             with path.open("rb") as document:
-                await message.reply_document(
+                sent_message = await message.reply_document(
                     document=document,
                     caption=caption,
                     reply_markup=reply_markup,
@@ -229,7 +241,7 @@ async def _send_document_with_retry(
                     connect_timeout=timeout,
                     pool_timeout=timeout,
                 )
-            return
+            return sent_message
         except RetryAfter as exc:
             if attempt:
                 raise
@@ -385,7 +397,9 @@ async def _send_render_download_link(
     edit,
     settings: Settings,
     db_path: Path,
-) -> str:
+    *,
+    return_message: bool = False,
+) -> str | object:
     """Send a usable edit link before attempting the slower Telegram upload."""
     if not settings.download_public_origin:
         raise RuntimeError("Direct downloads are not configured.")
@@ -418,7 +432,7 @@ async def _send_render_download_link(
             "msg_record_id": record_id,
         },
     )
-    return url
+    return link_message if return_message else url
 
 
 def _build_download_url(settings: Settings, token: str) -> str:
@@ -1291,14 +1305,18 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     download_work: WorkQueue = context.application.bot_data["download_work"]
     render_work: WorkQueue = context.application.bot_data["render_work"]
+    metadata_work: WorkQueue | None = context.application.bot_data.get("metadata_work")
     lines = [
         "⏳ Your work queue",
         f"Downloads queued/running: {download_work.pending_for_user(user.id)}",
         f"Renders queued/running: {render_work.pending_for_user(user.id)}",
     ]
+    if metadata_work is not None:
+        lines.append(f"Metadata queued/running: {metadata_work.pending_for_user(user.id)}")
     items = (
         download_work.items_for_user(user.id)
         + render_work.items_for_user(user.id)
+        + (metadata_work.items_for_user(user.id) if metadata_work is not None else ())
     )
     if items:
         lines.extend(["", *(f"• {label} — {state}" for label, state in items)])
@@ -1310,7 +1328,15 @@ async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Global downloads: active={download_work.active}, queued={download_work.queued}",
             f"Global renders: active={render_work.active}, queued={render_work.queued}",
         ])
-    lines.append("Use /canceljob download:<id> or /canceljob render:<id> to cancel work.")
+        if metadata_work is not None:
+            lines.insert(
+                -1,
+                f"Global metadata: active={metadata_work.active}, queued={metadata_work.queued}",
+            )
+    lines.append(
+        "Use /canceljob download:<id>, /canceljob render:<id>, or "
+        "/canceljob metadata:<edit_id> to cancel work."
+    )
     await message.reply_text("\n".join(lines))
 
 
@@ -1322,30 +1348,41 @@ async def cancel_job_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     value = context.args[0].strip().lower() if len(context.args or []) == 1 else ""
     if ":" not in value:
-        await message.reply_text("Usage: /canceljob <download|render>:<id>")
+        await message.reply_text("Usage: /canceljob <download|render|metadata>:<id>")
         return
     kind, raw_id = value.split(":", 1)
-    if kind not in {"download", "render"} or not raw_id.isdigit():
-        await message.reply_text("Usage: /canceljob <download|render>:<id>")
+    if kind not in {"download", "render", "metadata"} or not raw_id.isdigit():
+        await message.reply_text("Usage: /canceljob <download|render|metadata>:<id>")
         return
     item_id = int(raw_id)
     db_path: Path = context.application.bot_data["db_path"]
 
-    if kind == "render":
+    if kind in {"render", "metadata"}:
         try:
             edit = await require_owned_edit(db_path, item_id, user.id)
         except ResourceNotFound:
             await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
             return
-        work: WorkQueue = context.application.bot_data["render_work"]
-        label = f"render:{item_id}"
+        work: WorkQueue = context.application.bot_data[
+            "render_work" if kind == "render" else "metadata_work"
+        ]
+        label = f"{kind}:{item_id}"
         was_active = work.is_active(label)
         cancelled = work.cancel(user_id=user.id, label=label)
         if cancelled:
-            await update_edit_job(
-                db_path, edit.id, status="failed", error_message="cancelled by user",
-            )
-            if not was_active:
+            if kind == "render":
+                await update_edit_job(
+                    db_path, edit.id, status="failed", error_message="cancelled by user",
+                )
+            else:
+                await update_edit_job(
+                    db_path,
+                    edit.id,
+                    metadata_status="cancelled",
+                    metadata_error="cancelled by user",
+                    metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+            if kind == "render" and not was_active:
                 await cleanup_edit_artifacts(
                     db_path,
                     context.application.bot_data["storage_dir"],
@@ -1701,6 +1738,261 @@ async def _enqueue_render(
     return True
 
 
+def _telegram_message_id(message: object | None) -> int | None:
+    value = getattr(message, "message_id", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _metadata_settings(settings: Settings) -> tuple[str, str, str, int, Path | None]:
+    model = str(
+        getattr(settings, "metadata_model", "")
+        or getattr(settings, "auto_hashtags_model", "")
+        or getattr(settings, "codex_model", "")
+        or "gpt-5.6-luna"
+    )
+    reasoning = str(
+        getattr(settings, "metadata_reasoning_effort", "")
+        or getattr(settings, "auto_hashtags_reasoning_effort", "")
+        or getattr(settings, "codex_reasoning_effort", "")
+        or "max"
+    )
+    executable = str(
+        getattr(settings, "metadata_codex_executable", "")
+        or getattr(settings, "auto_hashtags_codex_executable", "")
+        or getattr(settings, "codex_executable", "")
+        or "codex"
+    )
+    timeout = int(
+        getattr(settings, "metadata_timeout_seconds", 0)
+        or getattr(settings, "auto_hashtags_timeout_seconds", 0)
+        or 1800
+    )
+    codex_home = (
+        getattr(settings, "metadata_codex_home", None)
+        or getattr(settings, "auto_hashtags_codex_home", None)
+    )
+    return model, reasoning, executable, timeout, Path(codex_home) if codex_home else None
+
+
+async def _metadata_progress(
+    context: ContextTypes.DEFAULT_TYPE,
+    edit_id: int,
+    stage: str,
+    percent: int,
+) -> None:
+    """Best-effort persisted Telegram progress for a metadata worker."""
+    db_path: Path = context.application.bot_data["db_path"]
+    edit = await get_edit_job(db_path, edit_id)
+    if edit is None:
+        return
+    source = await get_job(db_path, edit.source_job_id)
+    if source is None:
+        return
+    text = f"📝 {stage}: {max(0, min(100, int(percent)))}%\nJob #{edit_id}"
+    message_id = edit.metadata_progress_message_id
+    try:
+        if message_id is None:
+            progress_message = await context.bot.send_message(
+                chat_id=source.chat_id,
+                text=text,
+                reply_to_message_id=edit.render_delivery_message_id,
+            )
+            message_id = _telegram_message_id(progress_message)
+            if message_id is not None:
+                await update_edit_job(
+                    db_path,
+                    edit_id,
+                    metadata_progress_message_id=message_id,
+                )
+        else:
+            await context.bot.edit_message_text(
+                chat_id=source.chat_id,
+                message_id=message_id,
+                text=text,
+            )
+    except Exception:
+        LOGGER.debug("Could not update metadata progress for edit %s", edit_id, exc_info=True)
+
+
+async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    db_path: Path = context.application.bot_data["db_path"]
+    work: WorkQueue | None = context.application.bot_data.get("metadata_work")
+    label = f"metadata:{edit_id}"
+    edit = await claim_metadata_job(db_path, edit_id)
+    if edit is None:
+        return
+    source = await get_job(db_path, edit.source_job_id)
+    if source is None or not edit.file_path:
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="failed",
+            metadata_error="rendered video or source job is missing",
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return
+
+    async def progress(stage: str, percent: int) -> None:
+        await _metadata_progress(context, edit_id, stage, percent)
+
+    model, reasoning, executable, timeout, codex_home = _metadata_settings(settings)
+    try:
+        result: MetadataResult = await generate_metadata(
+            Path(edit.file_path),
+            model=model,
+            reasoning_effort=reasoning,
+            codex_executable=executable,
+            timeout_seconds=timeout,
+            codex_home=codex_home,
+            progress_callback=progress,
+        )
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_description=result.description,
+            metadata_hashtags=json.dumps(list(result.hashtags), ensure_ascii=False),
+        )
+        current = await get_edit_job(db_path, edit_id)
+        if (
+            current is None
+            or current.metadata_status != "running"
+            or (work is not None and work.cancellation_requested(label))
+        ):
+            raise asyncio.CancelledError
+        await progress("metadata delivery", 0)
+        if work is not None and work.cancellation_requested(label):
+            raise asyncio.CancelledError
+        hashtags = " ".join(result.hashtags)
+        reply_kwargs: dict[str, object] = {
+            "chat_id": source.chat_id,
+            "text": f"📝 Description and hashtags for job #{edit_id}\n\n"
+            f"{result.description}\n\n{hashtags}",
+        }
+        if edit.render_delivery_message_id is not None:
+            reply_kwargs["reply_to_message_id"] = edit.render_delivery_message_id
+        reply_message = await context.bot.send_message(**reply_kwargs)
+        reply_message_id = _telegram_message_id(reply_message)
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="generated",
+            metadata_error=None,
+            metadata_reply_message_id=reply_message_id,
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await progress("metadata delivery", 100)
+    except asyncio.CancelledError:
+        # WorkQueue.stop() cancels active tasks during a restart. Leave those
+        # durable rows running so startup recovery can resume them; only an
+        # explicit /canceljob request marks the metadata permanently cancelled.
+        if work is not None and work.cancellation_requested(label):
+            await update_edit_job(
+                db_path,
+                edit_id,
+                metadata_status="cancelled",
+                metadata_error="cancelled by user",
+                metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+        raise
+    except CodexUnavailable as exc:
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="skipped",
+            metadata_error=str(exc)[:500],
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await _metadata_progress(context, edit_id, "metadata skipped", 100)
+    except MetadataError as exc:
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="failed",
+            metadata_error=str(exc)[:500],
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await _metadata_progress(context, edit_id, "metadata failed", 100)
+    except Exception as exc:
+        LOGGER.exception("Unexpected metadata failure for edit %s", edit_id)
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="failed",
+            metadata_error=str(exc)[:500],
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await _metadata_progress(context, edit_id, "metadata failed", 100)
+
+
+async def _enqueue_metadata(
+    context: ContextTypes.DEFAULT_TYPE,
+    edit_id: int,
+    delivery_message: object | None,
+) -> bool:
+    """Create durable metadata work after a successful video delivery."""
+    settings: Settings = context.application.bot_data["settings"]
+    db_path: Path = context.application.bot_data["db_path"]
+    edit = await get_edit_job(db_path, edit_id)
+    if edit is None or edit.status != "rendered" or not edit.file_path:
+        return False
+    source = await get_job(db_path, edit.source_job_id)
+    if source is None:
+        return False
+    delivery_message_id = _telegram_message_id(delivery_message)
+    progress_message = None
+    try:
+        progress_kwargs: dict[str, object] = {
+            "chat_id": source.chat_id,
+            "text": f"📝 Generating description and hashtags for job #{edit_id}…",
+        }
+        if delivery_message_id is not None:
+            progress_kwargs["reply_to_message_id"] = delivery_message_id
+        progress_message = await context.bot.send_message(**progress_kwargs)
+    except Exception:
+        LOGGER.warning("Could not create metadata progress message for edit %s", edit_id)
+
+    model, reasoning, _, _, _ = _metadata_settings(settings)
+    queued = await queue_metadata_job(
+        db_path,
+        edit_id,
+        model=model,
+        reasoning_effort=reasoning,
+        progress_message_id=_telegram_message_id(progress_message),
+        render_delivery_message_id=delivery_message_id,
+    )
+    if queued is None:
+        return False
+    work: WorkQueue | None = context.application.bot_data.get("metadata_work")
+    if work is None:
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="skipped",
+            metadata_error="metadata queue is unavailable",
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return False
+    try:
+        work.submit(
+            user_id=edit.user_id,
+            label=f"metadata:{edit_id}",
+            factory=lambda: _metadata_job(context, edit_id),
+        )
+    except WorkAlreadyQueued:
+        return True
+    except WorkRejected as exc:
+        await update_edit_job(
+            db_path,
+            edit_id,
+            metadata_status="failed",
+            metadata_error=str(exc)[:500],
+            metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return False
+    return True
+
+
 async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
     settings: Settings = context.application.bot_data["settings"]
     db_path: Path = context.application.bot_data["db_path"]
@@ -1920,8 +2212,9 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         if getattr(reporter, "watermark_fallback_used", False) else ""
     )
     await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…{fallback_note}")
+    delivery_message = None
     try:
-        await _send_document_with_retry(
+        delivery_message = await _send_document_with_retry(
             update.effective_message,
             out_path,
             f"✅ Render complete. Job #{edit.id} ready.{fallback_note}",
@@ -1931,15 +2224,34 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
     except Exception as exc:
         LOGGER.warning("Telegram upload failed for edit %s: %s", edit.id, exc)
         try:
-            await _send_render_download_link(
+            delivery_message = await _send_render_download_link(
                 update.effective_message, context, edit, settings, db_path,
+                return_message=True,
             )
         except Exception as link_exc:
-            await update.effective_message.reply_text(
+            delivery_message = await update.effective_message.reply_text(
                 f"✅ Render complete. Job #{edit.id} ready.{fallback_note}\n"
                 f"⚠️ Could not send the file ({exc}) or fallback link ({link_exc}).",
                 reply_markup=_render_pool_keyboard(edit.id, saved=False),
             )
+    delivery_message_id = _telegram_message_id(delivery_message)
+    if delivery_message_id is not None:
+        try:
+            await update_edit_job(
+                db_path,
+                edit.id,
+                render_delivery_message_id=delivery_message_id,
+                metadata_result_message_id=delivery_message_id,
+            )
+        except Exception:
+            LOGGER.exception("Could not persist render delivery for edit %s", edit.id)
+    try:
+        if not await _enqueue_metadata(context, edit.id, delivery_message):
+            LOGGER.info("Metadata work was not queued for rendered edit %s", edit.id)
+    except Exception:
+        # Metadata is explicitly post-delivery and must never turn a successful
+        # render into a failed render.
+        LOGGER.exception("Could not enqueue metadata for rendered edit %s", edit.id)
     if subtitles_path:
         try:
             await _send_document_with_retry(
@@ -2048,6 +2360,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     db_health = "unavailable"
     fk_violations: int | str = "unknown"
     job_states: list[str] = []
+    metadata_states: list[str] = []
     try:
         async with open_database(settings.db_path) as db:
             async with db.execute("PRAGMA quick_check") as cursor:
@@ -2057,6 +2370,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status"
             ) as cursor:
                 job_states = [f"{state}={count}" for state, count in await cursor.fetchall()]
+            async with db.execute(
+                "SELECT metadata_status, count(*) FROM edit_jobs "
+                "GROUP BY metadata_status ORDER BY metadata_status"
+            ) as cursor:
+                metadata_states = [
+                    f"{state}={count}" for state, count in await cursor.fetchall()
+                ]
         fk_violations = len(await foreign_key_violations(settings.db_path))
     except Exception as exc:
         LOGGER.warning("Status database check failed: %s", exc)
@@ -2072,6 +2392,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     download_work: WorkQueue | None = context.application.bot_data.get("download_work")
     render_work: WorkQueue | None = context.application.bot_data.get("render_work")
+    metadata_work: WorkQueue | None = context.application.bot_data.get("metadata_work")
     uptime = _format_duration(time.monotonic() - STARTED_MONOTONIC)
 
     lines = [
@@ -2079,6 +2400,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Uptime: {uptime}",
         f"Database: {db_health}; foreign-key violations={fk_violations}",
         f"Jobs: {', '.join(job_states) if job_states else 'none'}",
+        f"Metadata: {', '.join(metadata_states) if metadata_states else 'none'}",
         (
             f"Download queue: active={download_work.active}, queued={download_work.queued}"
             if download_work else "Download queue: unavailable"
@@ -2086,6 +2408,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         (
             f"Render queue: active={render_work.active}, queued={render_work.queued}"
             if render_work else "Render queue: unavailable"
+        ),
+        (
+            f"Metadata queue: active={metadata_work.active}, queued={metadata_work.queued}"
+            if metadata_work else "Metadata queue: unavailable"
         ),
         disk_line,
         f"AI repair execution: {'enabled' if settings.repair_enabled else 'disabled'}",
@@ -2202,6 +2528,49 @@ async def _notify_restart_online(application: Application, settings: Settings) -
         return False
 
 
+async def _resume_metadata_work(application: Application) -> None:
+    """Re-admit only durable metadata jobs whose final delivery is usable."""
+    db_path: Path = application.bot_data["db_path"]
+    work: WorkQueue = application.bot_data["metadata_work"]
+    pending = await list_metadata_jobs(db_path)
+    resumable = {
+        edit.id
+        for edit in await list_resumable_metadata_jobs(db_path)
+        if edit.file_path and Path(edit.file_path).is_file()
+    }
+    context = SimpleNamespace(application=application, bot=application.bot)
+    for edit in pending:
+        if edit.id not in resumable:
+            await update_edit_job(
+                db_path,
+                edit.id,
+                metadata_status="failed",
+                metadata_error=(
+                    "metadata work was not resumed because the final video "
+                    "or successful delivery message is missing"
+                ),
+                metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            continue
+        try:
+            work.submit(
+                user_id=edit.user_id,
+                label=f"metadata:{edit.id}",
+                factory=lambda edit_id=edit.id: _metadata_job(context, edit_id),
+            )
+        except WorkAlreadyQueued:
+            continue
+        except WorkRejected as exc:
+            LOGGER.warning("Could not resume metadata edit %s: %s", edit.id, exc)
+            await update_edit_job(
+                db_path,
+                edit.id,
+                metadata_status="failed",
+                metadata_error=f"metadata recovery queue rejected work: {exc}"[:500],
+                metadata_completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+
 async def _post_init(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
     db_path: Path = application.bot_data["db_path"]
@@ -2226,6 +2595,8 @@ async def _post_init(application: Application) -> None:
         )
     application.bot_data["download_work"].start()
     application.bot_data["render_work"].start()
+    application.bot_data["metadata_work"].start()
+    await _resume_metadata_work(application)
 
     cleaned = await cleanup_download_messages(db_path, application.bot)
     if cleaned:
@@ -2235,7 +2606,7 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
-    for key in ("download_work", "render_work"):
+    for key in ("download_work", "render_work", "metadata_work"):
         work = application.bot_data.get(key)
         if work is not None:
             await work.stop()
@@ -2288,6 +2659,12 @@ def main() -> None:
     application.bot_data["render_work"] = WorkQueue(
         name="render",
         workers=settings.render_workers,
+        capacity=settings.work_queue_capacity,
+        per_user_capacity=settings.per_user_work_capacity,
+    )
+    application.bot_data["metadata_work"] = WorkQueue(
+        name="metadata",
+        workers=settings.metadata_workers,
         capacity=settings.work_queue_capacity,
         per_user_capacity=settings.per_user_work_capacity,
     )

@@ -74,6 +74,33 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "MEDIA_BOT_ENABLE_REPAIR"):
                 Settings.from_environment()
 
+    def test_metadata_defaults_are_isolated_from_global_codex_config(self):
+        with self._environment():
+            settings = Settings.from_environment()
+        self.assertEqual(settings.metadata_model, "gpt-5.6-luna")
+        self.assertEqual(settings.metadata_reasoning_effort, "max")
+        self.assertEqual(settings.metadata_codex_executable, "codex")
+        self.assertEqual(settings.metadata_workers, 1)
+        self.assertEqual(settings.metadata_timeout_seconds, 1800)
+        self.assertIsNone(settings.metadata_codex_home)
+
+    def test_metadata_settings_can_be_overridden_without_api_credentials(self):
+        with self._environment(
+            MEDIA_BOT_AUTO_HASHTAGS_MODEL="test-model",
+            MEDIA_BOT_AUTO_HASHTAGS_REASONING_EFFORT="high",
+            MEDIA_BOT_AUTO_HASHTAGS_CODEX_EXECUTABLE="/opt/codex",
+            MEDIA_BOT_AUTO_HASHTAGS_WORKERS="2",
+            MEDIA_BOT_AUTO_HASHTAGS_TIMEOUT_SECONDS="120",
+            MEDIA_BOT_AUTO_HASHTAGS_CODEX_HOME="~/.codex-test",
+        ):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.metadata_model, "test-model")
+        self.assertEqual(settings.metadata_reasoning_effort, "high")
+        self.assertEqual(settings.metadata_codex_executable, "/opt/codex")
+        self.assertEqual(settings.metadata_workers, 2)
+        self.assertEqual(settings.metadata_timeout_seconds, 120)
+        self.assertEqual(settings.metadata_codex_home.name, ".codex-test")
+
 
 if __name__ == "__main__":
     unittest.main()
