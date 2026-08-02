@@ -122,6 +122,20 @@ class EditJob:
     created_at: datetime
     updated_at: datetime
     error_message: str | None
+    metadata_status: str
+    metadata_description: str | None
+    metadata_hashtags: str | None
+    metadata_error: str | None
+    metadata_attempt_count: int
+    metadata_requested_at: datetime | None
+    metadata_started_at: datetime | None
+    metadata_completed_at: datetime | None
+    metadata_model: str | None
+    metadata_reasoning_effort: str | None
+    metadata_progress_message_id: int | None
+    metadata_result_message_id: int | None
+    metadata_reply_message_id: int | None
+    render_delivery_message_id: int | None
 
 
 @dataclass(frozen=True)
@@ -214,7 +228,7 @@ class UnsafeStoragePath(ValueError):
 
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 _JOB_UPDATE_FIELDS = frozenset({
     "status", "file_path", "file_size", "local_api_used", "status_message_id",
@@ -239,6 +253,12 @@ _EDIT_UPDATE_FIELDS = frozenset({
     "watermark_analysis", "watermark_confidence", "watermark_candidates",
     "watermark_preview_path", "channel_banner", "subtitles_path", "status",
     "file_path", "file_size", "error_message",
+    "metadata_status", "metadata_description", "metadata_hashtags",
+    "metadata_error", "metadata_attempt_count", "metadata_requested_at",
+    "metadata_started_at", "metadata_completed_at", "metadata_model",
+    "metadata_reasoning_effort", "metadata_progress_message_id",
+    "metadata_result_message_id", "metadata_reply_message_id",
+    "render_delivery_message_id",
 })
 _POOL_UPDATE_FIELDS = frozenset({"title", "status"})
 _WORKFLOW_UPDATE_FIELDS = frozenset({
@@ -339,7 +359,21 @@ _SCHEMA_SQL = """
         file_size INTEGER,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        error_message TEXT
+        error_message TEXT,
+        metadata_status TEXT NOT NULL DEFAULT 'not_requested',
+        metadata_description TEXT,
+        metadata_hashtags TEXT,
+        metadata_error TEXT,
+        metadata_attempt_count INTEGER NOT NULL DEFAULT 0,
+        metadata_requested_at TEXT,
+        metadata_started_at TEXT,
+        metadata_completed_at TEXT,
+        metadata_model TEXT,
+        metadata_reasoning_effort TEXT,
+        metadata_progress_message_id INTEGER,
+        metadata_result_message_id INTEGER,
+        metadata_reply_message_id INTEGER,
+        render_delivery_message_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS download_tokens (
         token_hash TEXT PRIMARY KEY,
@@ -458,6 +492,7 @@ _SCHEMA_SQL = """
     CREATE INDEX IF NOT EXISTS idx_presets_user ON presets(user_id);
     CREATE INDEX IF NOT EXISTS idx_edit_jobs_source ON edit_jobs(source_job_id);
     CREATE INDEX IF NOT EXISTS idx_edit_jobs_user ON edit_jobs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_edit_jobs_metadata_status ON edit_jobs(metadata_status);
     CREATE INDEX IF NOT EXISTS idx_shared_presets_code ON shared_presets(share_code);
     CREATE INDEX IF NOT EXISTS idx_pool_user ON pool_items(user_id);
     CREATE INDEX IF NOT EXISTS idx_pool_status ON pool_items(status);
@@ -522,6 +557,23 @@ _LEGACY_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 
+_METADATA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("metadata_status", "TEXT NOT NULL DEFAULT 'not_requested'"),
+    ("metadata_description", "TEXT"),
+    ("metadata_hashtags", "TEXT"),
+    ("metadata_error", "TEXT"),
+    ("metadata_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("metadata_requested_at", "TEXT"),
+    ("metadata_started_at", "TEXT"),
+    ("metadata_completed_at", "TEXT"),
+    ("metadata_model", "TEXT"),
+    ("metadata_reasoning_effort", "TEXT"),
+    ("metadata_progress_message_id", "INTEGER"),
+    ("metadata_result_message_id", "INTEGER"),
+    ("metadata_reply_message_id", "INTEGER"),
+    ("render_delivery_message_id", "INTEGER"),
+)
+
 
 async def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -555,6 +607,18 @@ async def _apply_migrations(db: aiosqlite.Connection) -> None:
     if 3 not in applied:
         await _repair_legacy_foreign_keys(db)
         await _mark_migration(db, 3, "repair legacy foreign keys")
+    if 4 not in applied:
+        existing = await _column_names(db, "edit_jobs")
+        for column, definition in _METADATA_COLUMNS:
+            if column not in existing:
+                await db.execute(
+                    f'ALTER TABLE "edit_jobs" ADD COLUMN "{column}" {definition}'
+                )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edit_jobs_metadata_status "
+            "ON edit_jobs(metadata_status)"
+        )
+        await _mark_migration(db, 4, "add automatic metadata state")
 
 
 async def _mark_migration(db: aiosqlite.Connection, version: int, name: str) -> None:
@@ -1129,6 +1193,96 @@ async def get_edit_job(db_path: Path, edit_id: int) -> EditJob | None:
         async with db.execute("SELECT * FROM edit_jobs WHERE id = ?", (edit_id,)) as cur:
             row = await cur.fetchone()
         return _row_to_edit_job(row) if row else None
+
+
+async def queue_metadata_job(
+    db_path: Path,
+    edit_id: int,
+    *,
+    model: str,
+    reasoning_effort: str,
+    progress_message_id: int | None = None,
+    render_delivery_message_id: int | None = None,
+) -> EditJob | None:
+    """Persist a metadata request after the final video has been delivered."""
+    async with open_database(db_path) as db:
+        cursor = await db.execute(
+            "UPDATE edit_jobs SET metadata_status = 'queued', "
+            "metadata_description = NULL, metadata_hashtags = NULL, "
+            "metadata_error = NULL, metadata_requested_at = datetime('now'), "
+            "metadata_started_at = NULL, metadata_completed_at = NULL, "
+            "metadata_model = ?, metadata_reasoning_effort = ?, "
+            "metadata_progress_message_id = ?, metadata_result_message_id = ?, "
+            "metadata_reply_message_id = NULL, render_delivery_message_id = ?, "
+            "updated_at = datetime('now') "
+            "WHERE id = ? AND status = 'rendered' AND file_path IS NOT NULL",
+            (
+                model,
+                reasoning_effort,
+                progress_message_id,
+                render_delivery_message_id,
+                render_delivery_message_id,
+                edit_id,
+            ),
+        )
+        await db.commit()
+        if cursor.rowcount <= 0:
+            return None
+        async with db.execute("SELECT * FROM edit_jobs WHERE id = ?", (edit_id,)) as cur:
+            row = await cur.fetchone()
+        return _row_to_edit_job(row) if row else None
+
+
+async def claim_metadata_job(db_path: Path, edit_id: int) -> EditJob | None:
+    """Atomically claim queued/recovered metadata work for one worker."""
+    async with open_database(db_path) as db:
+        cursor = await db.execute(
+            "UPDATE edit_jobs SET metadata_status = 'running', "
+            "metadata_attempt_count = COALESCE(metadata_attempt_count, 0) + 1, "
+            "metadata_started_at = datetime('now'), metadata_error = NULL, "
+            "updated_at = datetime('now') "
+            "WHERE id = ? AND metadata_status IN ('queued', 'running') "
+            "AND status = 'rendered' AND file_path IS NOT NULL",
+            (edit_id,),
+        )
+        await db.commit()
+        if cursor.rowcount <= 0:
+            return None
+        async with db.execute("SELECT * FROM edit_jobs WHERE id = ?", (edit_id,)) as cur:
+            row = await cur.fetchone()
+        return _row_to_edit_job(row) if row else None
+
+
+async def list_metadata_jobs(
+    db_path: Path,
+    statuses: tuple[str, ...] = ("queued", "running"),
+) -> list[EditJob]:
+    """List durable metadata jobs for queue recovery and operator reporting."""
+    if not statuses:
+        return []
+    placeholders = ", ".join("?" for _ in statuses)
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT * FROM edit_jobs "
+            f"WHERE metadata_status IN ({placeholders}) ORDER BY created_at, id",
+            statuses,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_edit_job(row) for row in rows]
+
+
+async def list_resumable_metadata_jobs(db_path: Path) -> list[EditJob]:
+    """Return only jobs with the durable prerequisites needed after restart."""
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT * FROM edit_jobs "
+            "WHERE metadata_status IN ('queued', 'running') "
+            "AND status = 'rendered' AND file_path IS NOT NULL "
+            "AND render_delivery_message_id IS NOT NULL "
+            "ORDER BY created_at, id"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_edit_job(row) for row in rows]
 
 
 async def list_source_jobs_for_user(db_path: Path, user_id: int, limit: int = 20) -> list[JobRecord]:
@@ -2160,6 +2314,20 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         error_message=row["error_message"],
+        metadata_status=row["metadata_status"],
+        metadata_description=row["metadata_description"],
+        metadata_hashtags=row["metadata_hashtags"],
+        metadata_error=row["metadata_error"],
+        metadata_attempt_count=int(row["metadata_attempt_count"] or 0),
+        metadata_requested_at=_optional_datetime(row, "metadata_requested_at"),
+        metadata_started_at=_optional_datetime(row, "metadata_started_at"),
+        metadata_completed_at=_optional_datetime(row, "metadata_completed_at"),
+        metadata_model=row["metadata_model"],
+        metadata_reasoning_effort=row["metadata_reasoning_effort"],
+        metadata_progress_message_id=_safe_int(row, "metadata_progress_message_id"),
+        metadata_result_message_id=_safe_int(row, "metadata_result_message_id"),
+        metadata_reply_message_id=_safe_int(row, "metadata_reply_message_id"),
+        render_delivery_message_id=_safe_int(row, "render_delivery_message_id"),
     )
 
 
@@ -2216,15 +2384,23 @@ def _row_to_workflow(row: aiosqlite.Row) -> Workflow:
 def _safe_int(row: aiosqlite.Row, key: str) -> int | None:
     try:
         return row[key]
-    except IndexError:
+    except (IndexError, KeyError):
         return None
 
 
 def _safe_bool(row: aiosqlite.Row, key: str) -> bool:
     try:
         return bool(row[key])
-    except IndexError:
+    except (IndexError, KeyError):
         return False
+
+
+def _optional_datetime(row: aiosqlite.Row, key: str) -> datetime | None:
+    try:
+        value = row[key]
+    except (IndexError, KeyError):
+        return None
+    return datetime.fromisoformat(value) if value else None
 
 
 def _row_to_workflow_run(row: aiosqlite.Row) -> WorkflowRun:

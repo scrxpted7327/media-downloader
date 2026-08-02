@@ -127,12 +127,31 @@ def _project_python() -> Path:
     return Path(sys.executable)
 
 
+def _install_requirements(python: Path) -> None:
+    """Reconcile the project environment before touching the live stack."""
+    requirements = PROJECT_DIR / "requirements.txt"
+    if not requirements.is_file():
+        raise FileNotFoundError(f"project requirements file is missing: {requirements}")
+    print(f"Installing project requirements with {python}...")
+    # Keep the install tied to the interpreter that will run supervisor.py.
+    # This is the equivalent of: pip install -r requirements.txt
+    subprocess.run(
+        [str(python), "-m", "pip", "install", "-r", "requirements.txt"],
+        cwd=PROJECT_DIR,
+        check=True,
+    )
+
+
 def main() -> None:
+    python = _project_python()
+    # Install first so a failed dependency reconciliation leaves a healthy
+    # existing stack running instead of turning a restart into downtime.
+    _install_requirements(python)
     _request_restart_notification()
     _stop_existing()
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
-        [str(_project_python()), str(PROJECT_DIR / "supervisor.py")],
+        [str(python), str(PROJECT_DIR / "supervisor.py")],
         cwd=PROJECT_DIR,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,

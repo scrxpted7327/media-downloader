@@ -66,6 +66,45 @@ class Settings:
     per_user_work_capacity: int = 4
     admin_user_ids: frozenset[int] = field(default_factory=frozenset)
     repair_enabled: bool = False
+    metadata_model: str = "gpt-5.6-luna"
+    metadata_reasoning_effort: str = "max"
+    metadata_codex_executable: str = "codex"
+    metadata_workers: int = 1
+    metadata_timeout_seconds: int = 1800
+    metadata_codex_home: Path | None = None
+
+    @property
+    def auto_hashtags_model(self) -> str:
+        """Compatibility name for callers that refer to the feature directly."""
+        return self.metadata_model
+
+    @property
+    def codex_model(self) -> str:
+        return self.metadata_model
+
+    @property
+    def auto_hashtags_reasoning_effort(self) -> str:
+        return self.metadata_reasoning_effort
+
+    @property
+    def codex_reasoning_effort(self) -> str:
+        return self.metadata_reasoning_effort
+
+    @property
+    def auto_hashtags_codex_executable(self) -> str:
+        return self.metadata_codex_executable
+
+    @property
+    def codex_executable(self) -> str:
+        return self.metadata_codex_executable
+
+    @property
+    def auto_hashtags_timeout_seconds(self) -> int:
+        return self.metadata_timeout_seconds
+
+    @property
+    def auto_hashtags_codex_home(self) -> Path | None:
+        return self.metadata_codex_home
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -118,6 +157,43 @@ class Settings:
         render_workers = int(os.getenv("MEDIA_BOT_RENDER_WORKERS") or "1")
         work_queue_capacity = int(os.getenv("MEDIA_BOT_WORK_QUEUE_CAPACITY") or "32")
         per_user_work_capacity = int(os.getenv("MEDIA_BOT_PER_USER_WORK_CAPACITY") or "4")
+        metadata_model = (
+            os.getenv("MEDIA_BOT_AUTO_HASHTAGS_CODEX_MODEL", "").strip()
+            or os.getenv("MEDIA_BOT_AUTO_HASHTAGS_MODEL", "").strip()
+            or os.getenv("MEDIA_BOT_METADATA_MODEL", "").strip()
+            or "gpt-5.6-luna"
+        )
+        metadata_reasoning_effort = (
+            os.getenv("MEDIA_BOT_AUTO_HASHTAGS_CODEX_REASONING_EFFORT", "").strip()
+            or os.getenv("MEDIA_BOT_AUTO_HASHTAGS_REASONING_EFFORT", "").strip()
+            or os.getenv("MEDIA_BOT_METADATA_REASONING_EFFORT", "").strip()
+            or "max"
+        )
+        metadata_codex_executable = (
+            os.getenv("MEDIA_BOT_AUTO_HASHTAGS_CODEX_EXECUTABLE", "").strip()
+            or os.getenv("MEDIA_BOT_CODEX_EXECUTABLE", "").strip()
+            or os.getenv("MEDIA_BOT_METADATA_CODEX_EXECUTABLE", "").strip()
+            or "codex"
+        )
+        metadata_workers = int(
+            os.getenv("MEDIA_BOT_AUTO_HASHTAGS_WORKERS", "")
+            or os.getenv("MEDIA_BOT_AUTO_HASHTAGS_METADATA_WORKERS", "")
+            or os.getenv("MEDIA_BOT_METADATA_WORKERS", "")
+            or "1"
+        )
+        metadata_timeout_seconds = int(
+            os.getenv("MEDIA_BOT_AUTO_HASHTAGS_CODEX_TIMEOUT_SECONDS", "")
+            or os.getenv("MEDIA_BOT_AUTO_HASHTAGS_TIMEOUT_SECONDS", "")
+            or os.getenv("MEDIA_BOT_METADATA_TIMEOUT_SECONDS", "")
+            or "1800"
+        )
+        metadata_codex_home_raw = os.getenv(
+            "MEDIA_BOT_AUTO_HASHTAGS_CODEX_HOME", ""
+        ).strip()
+        metadata_codex_home = (
+            Path(metadata_codex_home_raw).expanduser()
+            if metadata_codex_home_raw else None
+        )
         if max_size < 1 or timeout < 1 or upload_timeout < 1:
             raise ValueError("download size and timeouts must be positive")
         if not (1 <= download_port <= 65535):
@@ -129,10 +205,15 @@ class Settings:
             mass_download_max_mb,
             download_workers,
             render_workers,
+            metadata_workers,
             work_queue_capacity,
             per_user_work_capacity,
         ) < 1:
             raise ValueError("retention, size, worker, and queue limits must be positive")
+        if not metadata_model or not metadata_reasoning_effort or not metadata_codex_executable:
+            raise ValueError("metadata model, reasoning effort, and Codex executable cannot be empty")
+        if not (1 <= metadata_timeout_seconds <= 1800):
+            raise ValueError("metadata timeout must be between 1 and 1800 seconds")
         return cls(
             token=token,
             allowed_user_ids=users,
@@ -159,4 +240,10 @@ class Settings:
             per_user_work_capacity=per_user_work_capacity,
             admin_user_ids=admins,
             repair_enabled=repair_enabled,
+            metadata_model=metadata_model,
+            metadata_reasoning_effort=metadata_reasoning_effort,
+            metadata_codex_executable=metadata_codex_executable,
+            metadata_workers=metadata_workers,
+            metadata_timeout_seconds=metadata_timeout_seconds,
+            metadata_codex_home=metadata_codex_home,
         )

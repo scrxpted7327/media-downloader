@@ -95,6 +95,10 @@ class WorkQueue:
     def is_active(self, label: str) -> bool:
         return label in self._active
 
+    def cancellation_requested(self, label: str) -> bool:
+        """Return whether an active item was explicitly cancelled by its owner."""
+        return label in self._cancelled
+
     def items_for_user(self, user_id: int) -> tuple[tuple[str, str], ...]:
         """Return stable labels and states for one user's admitted work."""
         return tuple(

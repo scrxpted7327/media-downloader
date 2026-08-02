@@ -93,7 +93,17 @@ capacity limits. Work interrupted by a restart is marked failed explicitly
 rather than remaining stuck in an active state.
 
 Use `/queue` to see your queued/running job IDs and
-`/canceljob download:<id>` or `/canceljob render:<id>` to request cancellation.
+`/canceljob download:<id>`, `/canceljob render:<id>`, or
+`/canceljob metadata:<edit_id>` to request cancellation.
+
+After a rendered video is delivered, the bot queues evidence-bound description
+and hashtag generation in the authenticated local Codex CLI. It transcribes
+the final video audio, samples eight frames, and sends both to Codex; the
+result is delivered as a separate Telegram message. The default runtime
+settings are `gpt-5.6-luna`, `max` reasoning, one metadata worker, and a
+1,800-second subprocess limit. Set `MEDIA_BOT_AUTO_HASHTAGS_CODEX_HOME` when
+Codex authentication is stored in a non-default home. A missing or unavailable
+Codex installation never fails the rendered video delivery.
 Pool saves are durable copies: source retention, Reset, and `/delete` do not
 invalidate media explicitly saved in the Pool.
 Shared preset codes can be imported from Settings; another user's private
@@ -146,9 +156,11 @@ data directory, and the environment variables above. Do not expose its token
 or the tools directory through a web server.
 
 The repository's `restart_bot.py` coordinates with `supervisor.py` before
-restarting the stack. Deployment and live Telegram acceptance testing are
-separate operator actions; local unit tests do not prove the Inspiron service is
-ready.
+restarting the stack and runs `pip install -r requirements.txt` through the
+project virtualenv before stopping the existing processes. If dependency
+installation fails, the current stack is left running. Deployment and live
+Telegram acceptance testing are separate operator actions; local unit tests do
+not prove the Inspiron service is ready.
 
 The embedded loopback HTTP service exposes `/healthz` for a local service
 manager or reverse proxy. Diagnostic event and supervisor logs rotate with

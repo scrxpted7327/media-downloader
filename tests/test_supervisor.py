@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import tempfile
 import unittest
@@ -99,6 +100,37 @@ class SupervisorReportingTests(unittest.TestCase):
             self.assertIn("pool callback failed", sent[0])
             self.assertIn("Traceback here", sent[0])
             self.assertIn("reported by supervisor", sent[0])
+
+    def test_telegram_http_error_includes_api_description(self):
+        error = supervisor.urllib.error.HTTPError(
+            "https://api.telegram.org/bot[REDACTED]/sendMessage",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(
+                b'{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}'
+            ),
+        )
+        env = {
+            "TELEGRAM_BOT_TOKEN": "test-token",
+            "TELEGRAM_ERROR_CHAT_ID": "-1008",
+        }
+        with (
+            patch.dict(supervisor.os.environ, env, clear=True),
+            patch.object(supervisor.urllib.request, "urlopen", side_effect=error),
+            self.assertRaisesRegex(RuntimeError, "chat not found"),
+        ):
+            supervisor._send_telegram_message("test")
+
+    def test_classify_error_recognizes_missing_dependencies_and_dns(self):
+        self.assertEqual(
+            supervisor.classify_error("ModuleNotFoundError: No module named 'numpy'"),
+            "dependency",
+        )
+        self.assertEqual(
+            supervisor.classify_error("telegram.error.NetworkError: temporary failure in name resolution"),
+            "network",
+        )
 
     def test_supervisor_error_file_redacts_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,6 +296,27 @@ class SupervisorReportingTests(unittest.TestCase):
                 selected = restart_bot._project_python()
 
         self.assertEqual(selected, python)
+
+    def test_restart_installs_requirements_with_project_python(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            python = root / ".venv" / "bin" / "python"
+            python.parent.mkdir(parents=True)
+            python.write_text("#!/bin/sh\n", encoding="utf-8")
+            python.chmod(0o755)
+            (root / "requirements.txt").write_text("example==1\n", encoding="utf-8")
+
+            with (
+                patch.object(restart_bot, "PROJECT_DIR", root),
+                patch.object(restart_bot.subprocess, "run") as run,
+            ):
+                restart_bot._install_requirements(python)
+
+        run.assert_called_once_with(
+            [str(python), "-m", "pip", "install", "-r", "requirements.txt"],
+            cwd=root,
+            check=True,
+        )
 
     def test_restart_targets_managed_process_groups_without_its_own_group(self):
         with (
