@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -24,18 +25,25 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
+from .access import (
+    NOT_FOUND_OR_UNAUTHORIZED,
+    ResourceNotFound,
+    require_owned_edit,
+    require_owned_job,
+)
 from .config import Settings
 from .downloader import (
     DownloadError,
     create_thumbnail,
     download_instagram,
     download_media,
+    download_tiktok_account,
     download_tiktok_slideshow,
     persist_download,
     read_source_metadata,
 )
 from .download_server import create_download_app
-from .diagnostics import append_event, install_event_logging, recent_events
+from .diagnostics import append_event, install_event_logging, recent_events, redact_sensitive
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
 from .fix_agent import (
@@ -48,10 +56,18 @@ from .fix_agent import (
     run_fix_script,
     validate_model,
 )
-from .platforms import extract_supported_urls, is_instagram_url, is_tiktok_photo_url, is_tiktok_url
+from .platforms import (
+    extract_supported_urls,
+    is_instagram_url,
+    is_tiktok_photo_url,
+    is_tiktok_url,
+    normalize_tiktok_profile,
+)
 from .settings_ui import (
+    _edit_message,
     _effective_edit_snapshot,
     handle_editconfig_callback,
+    presets_command,
     settings_callback,
     settings_command,
     settings_photo_handler,
@@ -79,6 +95,7 @@ from .storage import (
     list_source_jobs_for_user,
     list_user_jobs,
     mark_download_message_deleted,
+    reconcile_interrupted_work,
     stage_edit_source,
     store_download_message,
     update_edit_job,
@@ -86,17 +103,24 @@ from .storage import (
 )
 from .tools import prefer_ffmpeg_full, provision_ytdlp
 from .watermark import WatermarkAnalysis, analyze_video, create_preview
+from .work_queue import WorkQueue, WorkRejected
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 LOGGER = logging.getLogger(__name__)
 install_event_logging()
 
+RESTART_MARKER = Path("runtime/restart-requested")
+RESTART_ACK = Path("runtime/restart-shutdown-notified")
+FLOW_TTL_SECONDS = 15 * 60
+
 HELP_TEXT = (
     "Commands:\n"
     "/start - show this help message\n"
     "/help - show this message\n"
     "/settings - video presets and customization\n"
+    "/presets - list and manage presets\n"
+    "/tiktokaccount <username> [50|all] - download a TikTok account archive\n"
     "/pool - manage video pool and workflows\n"
     "/jobs - list your recent downloads\n"
     "/editconfig - set options for the current edit job\n"
@@ -314,17 +338,17 @@ def _render_pool_keyboard(edit_id: int, *, saved: bool) -> InlineKeyboardMarkup:
 
 
 async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
+    job = await require_owned_job(db_path, job_id, user_id)
     keyboard = await _download_actions_keyboard(job_id, db_path, user_id)
-    job = await get_job(db_path, job_id)
     details = []
-    if job and job.title:
+    if job.title:
         details.append(job.title[:200])
-    if job and job.source_caption:
+    if job.source_caption:
         caption = " ".join(job.source_caption.split())
         details.append(caption[:300] + ("…" if len(caption) > 300 else ""))
     suffix = "\n\n" + "\n".join(details) if details else ""
     text = f"✅ Download complete. Choose an action:{suffix}"
-    thumbnail = Path(job.thumbnail_path) if job and job.thumbnail_path else None
+    thumbnail = Path(job.thumbnail_path) if job.thumbnail_path else None
     if thumbnail is not None and thumbnail.is_file():
         with thumbnail.open("rb") as photo:
             await status_message.reply_photo(
@@ -348,12 +372,16 @@ async def _send_render_download_link(
     db_path: Path,
 ) -> str:
     """Send a usable edit link before attempting the slower Telegram upload."""
+    if not settings.download_public_origin:
+        raise RuntimeError("Direct downloads are not configured.")
+    owned_edit = await require_owned_edit(db_path, edit.id, edit.user_id)
+    await require_owned_job(db_path, owned_edit.source_job_id, owned_edit.user_id)
     token = await create_download_token(
         db_path,
-        edit.source_job_id,
-        edit.user_id,
+        owned_edit.source_job_id,
+        owned_edit.user_id,
         settings.token_expiry_minutes,
-        edit_job_id=edit.id,
+        edit_job_id=owned_edit.id,
     )
     url = _build_download_url(settings, token)
     link_message = await message.reply_text(
@@ -379,8 +407,10 @@ async def _send_render_download_link(
 
 
 def _build_download_url(settings: Settings, token: str) -> str:
-    domain = settings.download_domain or "localhost"
-    return f"https://{domain}/download/{token}"
+    origin = settings.download_public_origin
+    if not origin:
+        raise RuntimeError("Direct downloads are not configured.")
+    return f"{origin}/download/{token}"
 
 
 async def _delete_expired_link(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -401,19 +431,90 @@ async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         LOGGER.warning("Rejected update for unapproved chat/user")
         return
 
-    handled = await settings_text_entry(update, context)
-    if handled:
+    user = update.effective_user
+    if user is None:
         return
-    handled = await editconfig_text(update, context)
-    if handled:
+    locks = context.application.bot_data.setdefault("input_locks", {})
+    lock = locks.setdefault(user.id, asyncio.Lock())
+    async with lock:
+        if _flow_is_current(update, context) and await _handle_active_input(update, context):
+            return
+        await handle_url(update, context)
+
+
+def _bind_flow_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
         return
-    handled = await pool_text_entry(update, context)
-    if handled:
-        return
-    handled = await settings_photo_entry(update, context)
-    if handled:
-        return
-    await handle_url(update, context)
+    context.user_data["_flow_chat_id"] = chat.id
+    context.user_data["_flow_expires_at"] = time.monotonic() + FLOW_TTL_SECONDS
+
+
+def _clear_flow_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("settings_flow", None)
+    context.user_data.pop("pool_flow", None)
+    context.user_data.pop("_flow_chat_id", None)
+    context.user_data.pop("_flow_expires_at", None)
+
+
+def _flow_is_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    has_flow = "settings_flow" in context.user_data or "pool_flow" in context.user_data
+    if not has_flow:
+        return False
+    expires_at = context.user_data.get("_flow_expires_at", 0)
+    if not isinstance(expires_at, (int, float)) or expires_at <= time.monotonic():
+        _clear_flow_context(context)
+        return False
+    chat = update.effective_chat
+    if chat is None or context.user_data.get("_flow_chat_id") != chat.id:
+        return False
+    context.user_data["_flow_expires_at"] = time.monotonic() + FLOW_TTL_SECONDS
+    return True
+
+
+async def _handle_active_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Give an active text/image prompt exclusive ownership of the next message."""
+    settings_flow = context.user_data.get("settings_flow")
+    action = (
+        settings_flow.get("action") if isinstance(settings_flow, dict)
+        else getattr(settings_flow, "action", None)
+    )
+    field_name = settings_flow.get("field_name") if isinstance(settings_flow, dict) else None
+    settings_text_actions = {
+        "preset_create_name", "preset_create_voice", "preset_create_voice_text",
+        "preset_create_voice_speed", "preset_create_banner", "preset_edit_field",
+        "set_profile_banner",
+    }
+    editconfig_input = action == "editconfig" and field_name not in (None, "voice_menu", "banner_menu")
+    settings_input = action in settings_text_actions
+
+    pool_flow = context.user_data.get("pool_flow")
+    pool_action = getattr(pool_flow, "action", None)
+    pool_input = pool_action in {
+        "pool_add_name", "workflow_create_name", "workflow_create_trigger",
+        "workflow_create_action",
+    }
+    if not (editconfig_input or settings_input or pool_input):
+        return False
+
+    # Images must be offered to the upload parser before text parsers inspect
+    # their caption (or the downloader inspects it as a URL).
+    if await settings_photo_entry(update, context):
+        return True
+    if editconfig_input and await editconfig_text(update, context):
+        return True
+    if settings_input and await settings_text_entry(update, context):
+        return True
+    if pool_input and await pool_text_entry(update, context):
+        return True
+
+    message = update.effective_message
+    if message is not None:
+        expected = "an image or text value" if field_name == "banner_path" or action in {
+            "preset_create_banner", "set_profile_banner",
+        } else "a text value"
+        await message.reply_text(f"That input could not be read. Please send {expected}, or use Back/Skip.")
+    return True
 
 
 async def settings_photo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -443,15 +544,30 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("Send one supported YouTube, Instagram, TikTok, or Facebook URL.")
         return
 
+    work: WorkQueue = context.application.bot_data["download_work"]
     results = []
     for idx, url in enumerate(urls[:8]):
         if idx > 0:
-            await asyncio.sleep(2)
-        result = await _process_single_url(
-            update, context, url, user_id, chat_id,
-            settings, ytdlp, gallerydl, db_path, storage_dir,
+            await asyncio.sleep(0.2)
+        status = await message.reply_text("⏳ Download queued…")
+        job = await create_job(db_path, url, user_id, chat_id)
+        await update_job(
+            db_path, job.id, status="queued", status_message_id=status.message_id,
         )
-        results.append(result)
+        try:
+            work.submit(
+                user_id=user_id,
+                label=f"download:{job.id}",
+                factory=lambda job=job, status=status, url=url: _process_single_url(
+                    update, context, job, status, url, user_id, chat_id,
+                    settings, ytdlp, gallerydl, db_path, storage_dir,
+                ),
+            )
+            results.append(f"#{job.id}: QUEUED")
+        except WorkRejected as exc:
+            await update_job(db_path, job.id, status="failed", error_message=str(exc))
+            await status.edit_text(f"❌ Download not queued: {exc}")
+            results.append(f"#{job.id}: REJECTED")
 
     if len(urls) > 1:
         lines = [f"Processed {len(results)}/{len(urls)} URLs:"]
@@ -462,13 +578,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def _process_single_url(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
-    url: str, user_id: int, chat_id: int,
+    job, status, url: str, user_id: int, chat_id: int,
     settings: Settings, ytdlp: Path, gallerydl: Path,
     db_path: Path, storage_dir: Path,
 ) -> str:
-    status = await update.effective_message.reply_text("🔍 Searching…")
-    job = await create_job(db_path, url, user_id, chat_id)
-    await update_job(db_path, job.id, status_message_id=status.message_id)
+    await update_job(db_path, job.id, status="downloading")
+    await status.edit_text("🔍 Searching…")
     temporary = None
     try:
         if is_tiktok_photo_url(url):
@@ -557,9 +672,13 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     current_user_id = query.from_user.id
 
     if action in {"editsave", "editunsaveconfirm", "editunsave", "editunsavecancel"}:
-        edit = await get_edit_job(db_path, job_id)
-        if edit is None or edit.user_id != current_user_id or not edit.file_path:
-            await query.answer("Rendered edit not found", show_alert=True)
+        try:
+            edit = await require_owned_edit(db_path, job_id, current_user_id)
+        except ResourceNotFound:
+            await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+            return
+        if not edit.file_path:
+            await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
             return
         saved = await get_saved_edit_pool_item(db_path, current_user_id, edit.id)
         if action == "editsave":
@@ -607,9 +726,13 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    job = await get_job(db_path, job_id)
-    if job is None or job.file_path is None:
-        await query.answer("File not found", show_alert=True)
+    try:
+        job = await require_owned_job(db_path, job_id, current_user_id)
+    except ResourceNotFound:
+        await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if job.file_path is None:
+        await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
         return
 
     if action == "poolsave":
@@ -670,9 +793,10 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 callback_data=f"download:preset:{job_id}:{p.id}",
             )])
         rows.append([InlineKeyboardButton("← Back", callback_data=f"download:actions:{job_id}")])
-        await query.edit_message_text(
+        await _edit_message(
+            query,
             "📦 Choose a preset to render with:",
-            reply_markup=InlineKeyboardMarkup(rows),
+            InlineKeyboardMarkup(rows),
         )
         return
 
@@ -685,6 +809,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "orig":
         await query.answer()
+        if not settings.download_public_origin:
+            await query.answer("Direct downloads are not configured.", show_alert=True)
+            return
         token = await create_download_token(db_path, job.id, current_user_id, settings.token_expiry_minutes)
         url = _build_download_url(settings, token)
         msg = await context.bot.send_message(
@@ -716,6 +843,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "edit_id": edit.id,
             "source_job_id": job_id,
         }
+        _bind_flow_context(update, context)
         await show_editconfig_menu(
             update,
             context,
@@ -733,7 +861,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         flow_action = flow.get("action") if isinstance(flow, dict) else getattr(flow, "action", None)
         if flow_action == "editconfig":
             context.user_data.pop("settings_flow", None)
-        await query.edit_message_text("Edit config reset for this download.")
+        await _edit_message(query, "Edit config reset for this download.")
         return
 
     if action == "preset":
@@ -742,11 +870,11 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         from .storage import list_presets
         preset = next((p for p in await list_presets(db_path, current_user_id) if p.id == preset_id), None)
         if preset is None:
-            await query.edit_message_text("Preset not found.")
+            await _edit_message(query, "Preset not found.")
             return
         source_path = Path(job.file_path)
         if not source_path.is_file():
-            await query.edit_message_text("Source file missing.")
+            await _edit_message(query, "Source file missing.")
             return
         edit = await create_edit_job(db_path, job_id, current_user_id, preset_id)
         dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
@@ -758,8 +886,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             watermark_removal=preset.watermark_removal,
             channel_banner=preset.channel_banner,
         )
-        await query.edit_message_text(f"🎬 Rendering with \"{preset.name}\"…")
-        asyncio.create_task(_render_edit_job(update, context, edit.id))
+        await _edit_message(query, f"🎬 Rendering with \"{preset.name}\"…")
+        await _enqueue_render(update, context, edit.id)
         return
 
 
@@ -801,6 +929,136 @@ async def voices_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text(full, disable_web_page_preview=True)
 
 
+async def tiktok_account_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        LOGGER.warning("Rejected TikTok account request for unapproved chat/user")
+        return
+    args = context.args or []
+    if not args:
+        await message.reply_text(
+            "Usage: /tiktokaccount username [50|all]\n"
+            "You can also send @username or the full TikTok profile URL.\n"
+            "The default is the newest 50 posts; 'all' downloads the entire public account."
+        )
+        return
+    profile_url = normalize_tiktok_profile(args[0])
+    if profile_url is None:
+        await message.reply_text(
+            "Send a TikTok username, @username, or profile URL like https://www.tiktok.com/@username"
+        )
+        return
+    limit: int | None = 50
+    if len(args) > 1:
+        if args[1].lower() == "all":
+            if not settings.allow_mass_download_all:
+                await message.reply_text(
+                    "Whole-account downloads are disabled by the operator. "
+                    "Choose a limit from 1 to 500."
+                )
+                return
+            limit = None
+        else:
+            try:
+                limit = int(args[1])
+            except ValueError:
+                limit = 0
+            if not (1 <= limit <= 500):
+                await message.reply_text("The post limit must be 1-500, or 'all'.")
+                return
+    user = update.effective_user
+    if user is None:
+        return
+    status = await message.reply_text("📥 TikTok account download queued…")
+    job = await create_job(settings.db_path, profile_url, user.id, message.chat_id)
+    await update_job(
+        settings.db_path, job.id, status="queued", status_message_id=status.message_id,
+    )
+    work: WorkQueue = context.application.bot_data["download_work"]
+    try:
+        work.submit(
+            user_id=user.id,
+            label=f"tiktok-account:{job.id}",
+            factory=lambda: _run_tiktok_account_job(
+                context, settings, status, job, profile_url, user.id, limit,
+            ),
+        )
+    except WorkRejected as exc:
+        await update_job(
+            settings.db_path, job.id, status="failed", error_message=str(exc),
+        )
+        await status.edit_text(f"❌ TikTok account download not queued: {exc}")
+
+
+async def _run_tiktok_account_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+    status,
+    job,
+    profile_url: str,
+    user_id: int,
+    limit: int | None,
+) -> None:
+    temporary = None
+    try:
+        await update_job(settings.db_path, job.id, status="downloading")
+        await status.edit_text(
+            f"📥 Downloading {'the entire account' if limit is None else f'up to {limit} posts'}\n"
+            "This can take several minutes."
+        )
+        timeout = max(settings.timeout_seconds, 6 * 60 * 60 if limit is None else (limit or 1) * 30)
+        temporary, archive, media_count = await download_tiktok_account(
+            context.application.bot_data["gallerydl"], profile_url,
+            settings.mass_download_max_mb, timeout, limit,
+        )
+        persisted = await persist_download(archive, job.id, settings.storage_dir)
+        await update_job(
+            settings.db_path, job.id, status="uploaded", file_path=str(persisted),
+            file_size=persisted.stat().st_size,
+            title=f"TikTok account archive ({media_count} media files)",
+        )
+        if not settings.download_public_origin:
+            await status.edit_text(
+                f"✅ TikTok account archive ready: {media_count} media files\n"
+                "Direct download delivery is not configured; ask the operator to "
+                "configure MEDIA_BOT_DOWNLOAD_PUBLIC_ORIGIN."
+            )
+            return
+        token = await create_download_token(
+            settings.db_path, job.id, user_id, settings.token_expiry_minutes,
+        )
+        url = _build_download_url(settings, token)
+        await status.edit_text(
+            f"✅ TikTok account archive ready: {media_count} media files\n"
+            f"One-time download ({settings.token_expiry_minutes} min):\n{url}",
+            disable_web_page_preview=True,
+        )
+        record_id = await store_download_message(
+            settings.db_path,
+            status.chat_id,
+            status.message_id,
+            settings.token_expiry_minutes,
+        )
+        context.job_queue.run_once(
+            _delete_expired_link,
+            settings.token_expiry_minutes * 60,
+            data={
+                "chat_id": status.chat_id,
+                "message_id": status.message_id,
+                "db_path": str(settings.db_path),
+                "msg_record_id": record_id,
+            },
+        )
+    except Exception as exc:
+        LOGGER.warning("TikTok account download failed for %s: %s", profile_url, exc)
+        await update_job(settings.db_path, job.id, status="failed", error_message=str(exc))
+        await status.edit_text(f"❌ TikTok account download failed: {exc}")
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     message = update.effective_message
@@ -821,6 +1079,17 @@ async def settings_command_entry(update: Update, context: ContextTypes.DEFAULT_T
         LOGGER.warning("Rejected settings request for unapproved chat/user")
         return
     await settings_command(update, context)
+    _bind_flow_context(update, context)
+
+
+async def presets_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        LOGGER.warning("Rejected presets request for unapproved chat/user")
+        return
+    await presets_command(update, context)
+    _bind_flow_context(update, context)
 
 
 async def pool_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -831,6 +1100,7 @@ async def pool_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     from .pool_ui import pool_command
     await pool_command(update, context)
+    _bind_flow_context(update, context)
 
 
 async def settings_callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -841,6 +1111,8 @@ async def settings_callback_entry(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("Not authorized", show_alert=True)
         return
     await settings_callback(update, context)
+    if "settings_flow" in context.user_data:
+        _bind_flow_context(update, context)
 
 
 async def pool_callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -852,6 +1124,8 @@ async def pool_callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     from .pool_ui import pool_callback
     await pool_callback(update, context)
+    if "pool_flow" in context.user_data:
+        _bind_flow_context(update, context)
 
 
 async def settings_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -871,6 +1145,18 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if update.effective_message:
         await update.effective_message.reply_text("There is no active input to skip.")
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
+        return
+    if not _flow_is_current(update, context):
+        await message.reply_text("There is no active input to cancel in this chat.")
+        return
+    _clear_flow_context(context)
+    await message.reply_text("Cancelled the active input.")
 
 
 async def pool_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1004,22 +1290,39 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "edit_id": edit_id,
         "source_job_id": source_job_id,
     }
+    _bind_flow_context(update, context)
     await show_editconfig_menu(update, context, edit_id)
 
 
 async def editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    query = update.callback_query
+    if query is None:
+        return
+    if not _authorized(update, settings):
+        await query.answer("Not authorized", show_alert=True)
+        return
     result = await handle_editconfig_callback(update, context)
+    if "settings_flow" in context.user_data:
+        _bind_flow_context(update, context)
     if isinstance(result, tuple) and result[0] == "render":
-        asyncio.create_task(_render_edit_job(update, context, result[1]))
+        await _enqueue_render(update, context, result[1])
     elif isinstance(result, tuple) and result[0] == "download":
-        query = update.callback_query
-        if query is not None:
-            await _send_secure_link(
-                query.message,
-                result[1],
+        try:
+            await require_owned_job(
                 context.application.bot_data["db_path"],
+                result[1],
                 query.from_user.id,
             )
+        except ResourceNotFound:
+            await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+            return
+        await _send_secure_link(
+            query.message,
+            result[1],
+            context.application.bot_data["db_path"],
+            query.from_user.id,
+        )
 
 
 async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1032,24 +1335,30 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return False
     if field in ("voice_menu", "banner_menu"):
         return False
+    user = update.effective_user
+    if user is None:
+        return False
+    db_path: Path = context.application.bot_data["db_path"]
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+    except ResourceNotFound:
+        flow.clear()
+        await update.message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+        return True
     text = update.message.text.strip()
     if field == "save_preset_name":
         if text.lower() == "/skip":
             flow.pop("field_name", None)
             await show_editconfig_menu(update, context, edit_id)
             return True
-        edit = await get_edit_job(context.application.bot_data["db_path"], edit_id)
-        if edit is None:
-            await update.message.reply_text("Edit job not found.")
-            return True
-        existing = await list_presets(context.application.bot_data["db_path"], edit.user_id)
+        existing = await list_presets(db_path, edit.user_id)
         if any(preset.name.casefold() == text.casefold() for preset in existing):
             await update.message.reply_text(
                 "That preset name already exists. Choose it from Save Config to Preset to overwrite it."
             )
             return True
         preset = await create_preset(
-            context.application.bot_data["db_path"],
+            db_path,
             edit.user_id,
             text,
             **_effective_edit_snapshot(
@@ -1098,7 +1407,7 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text("Enter a number between 0.5 and 2.0")
             return True
 
-    await update_edit_job(context.application.bot_data["db_path"], edit_id, **{field: value})
+    await update_edit_job(db_path, edit_id, **{field: value})
     flow.pop("field_name", None)
     await show_editconfig_menu(update, context, edit_id)
     return True
@@ -1145,9 +1454,10 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except ValueError:
         return
     db_path: Path = context.application.bot_data["db_path"]
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None or edit.user_id != query.from_user.id:
-        await query.answer("This review belongs to another user.", show_alert=True)
+    try:
+        edit = await require_owned_edit(db_path, edit_id, query.from_user.id)
+    except ResourceNotFound:
+        await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
         return
     if edit.status != "awaiting_watermark_review" or not edit.watermark_analysis:
         await query.answer("This watermark review is no longer active.", show_alert=True)
@@ -1180,22 +1490,57 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_caption("Selection accepted. Resuming render…")
     else:
         return
-    asyncio.create_task(_render_edit_job(update, context, edit_id))
+    await _enqueue_render(update, context, edit_id)
+
+
+async def _enqueue_render(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int,
+) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return False
+    db_path: Path = context.application.bot_data["db_path"]
+    try:
+        await require_owned_edit(db_path, edit_id, user.id)
+    except ResourceNotFound:
+        await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+        return False
+    await update_edit_job(db_path, edit_id, status="queued", error_message=None)
+    work: WorkQueue = context.application.bot_data["render_work"]
+    try:
+        work.submit(
+            user_id=user.id,
+            label=f"render:{edit_id}",
+            factory=lambda: _render_edit_job(update, context, edit_id),
+        )
+    except WorkRejected as exc:
+        await update_edit_job(
+            db_path, edit_id, status="failed", error_message=str(exc),
+        )
+        await message.reply_text(f"❌ Render not queued: {exc}")
+        return False
+    return True
 
 
 async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
     settings: Settings = context.application.bot_data["settings"]
     db_path: Path = context.application.bot_data["db_path"]
     storage_dir: Path = context.application.bot_data["storage_dir"]
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None or edit.file_path is None:
-        await update.effective_message.reply_text("Edit job not found.")
+    user = update.effective_user
+    if user is None:
         return
-    source = await get_job(db_path, edit.source_job_id)
-    if source is None:
-        await update.effective_message.reply_text("Source job not found.")
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+        source = await require_owned_job(db_path, edit.source_job_id, user.id)
+    except ResourceNotFound:
+        await update.effective_message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+        return
+    if edit.file_path is None:
+        await update.effective_message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
         return
 
+    await update_edit_job(db_path, edit.id, status="rendering", error_message=None)
     msg = await update.effective_message.reply_text("🎬 Preparing render...")
     out_path = storage_dir / f"edit-{edit.id}-final.mp4"
     try:
@@ -1207,7 +1552,9 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                 None,
             )
 
-        cap_text = edit.caption_text if edit.caption_text is not None else (preset.caption_text if preset else None)
+        # Manual caption text is intentionally ignored; captions come only from
+        # automatic transcription when Auto Captions is enabled.
+        cap_text = None
         cap_color = edit.caption_color if edit.caption_color is not None else (preset.caption_color or "white" if preset else "white")
         cap_style = edit.caption_style if edit.caption_style is not None else (preset.caption_style or "basic" if preset else "basic")
         cap_pos = edit.caption_position if edit.caption_position is not None else (preset.caption_position or "bottom" if preset else "bottom")
@@ -1289,7 +1636,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                     asdict(candidate) for candidate in analysis.candidates
                     if candidate.id in selected_ids
                 ]
-                if not wm_candidates:
+                if analysis.candidates and not wm_candidates:
                     wm_removal = False
         ch_banner = edit.channel_banner
 
@@ -1336,6 +1683,12 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             watermark_mode=wm_mode,
             watermark_text=wm_text,
         )
+        if out_path.stat().st_size > settings.max_filesize_mb * 1024 * 1024:
+            out_path.unlink(missing_ok=True)
+            raise DownloadError(
+                f"rendered output exceeds the configured "
+                f"{settings.max_filesize_mb} MB size limit"
+            )
     except DownloadError as exc:
         await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
         await msg.edit_text(f"❌ Render failed: {exc}")
@@ -1345,17 +1698,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         "\n⚠️ LaMa was unavailable; adaptive FFmpeg removal was used."
         if getattr(reporter, "watermark_fallback_used", False) else ""
     )
-    try:
-        await _send_render_download_link(
-            update.effective_message, context, edit, settings, db_path,
-        )
-        delivery_status = "Direct download ready; uploading a Telegram copy"
-    except Exception as exc:
-        LOGGER.warning("Could not send direct edit link for job %s: %s", edit.id, exc)
-        delivery_status = "Uploading"
-    await _safe_status_edit(
-        msg, f"✅ Render complete. {delivery_status} for job #{edit.id}…{fallback_note}",
-    )
+    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…{fallback_note}")
     try:
         await _send_document_with_retry(
             update.effective_message,
@@ -1365,10 +1708,17 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             _render_pool_keyboard(edit.id, saved=False),
         )
     except Exception as exc:
-        await update.effective_message.reply_text(
-            f"✅ Render complete. Job #{edit.id} ready.{fallback_note}\n⚠️ Could not send file: {exc}",
-            reply_markup=_render_pool_keyboard(edit.id, saved=False),
-        )
+        LOGGER.warning("Telegram upload failed for edit %s: %s", edit.id, exc)
+        try:
+            await _send_render_download_link(
+                update.effective_message, context, edit, settings, db_path,
+            )
+        except Exception as link_exc:
+            await update.effective_message.reply_text(
+                f"✅ Render complete. Job #{edit.id} ready.{fallback_note}\n"
+                f"⚠️ Could not send the file ({exc}) or fallback link ({link_exc}).",
+                reply_markup=_render_pool_keyboard(edit.id, saved=False),
+            )
     if subtitles_path:
         try:
             await _send_document_with_retry(
@@ -1477,16 +1827,23 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def audit_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    if not _authorized(update, settings):
+        return
     user = update.effective_user
     chat = update.effective_chat
     message = update.effective_message
+    body = (message.text or message.caption or "") if message else ""
+    callback = update.callback_query.data if update.callback_query else None
     append_event(
         "update",
-        (message.text or message.caption or "")[:500] if message else "",
+        "authorized update received",
         update_id=update.update_id,
         user_id=user.id if user else None,
         chat_id=chat.id if chat else None,
-        callback_data=update.callback_query.data if update.callback_query else None,
+        message_length=len(body),
+        has_photo=bool(message and message.photo),
+        callback_prefix=callback.split(":", 1)[0] if callback else None,
     )
 
 
@@ -1496,7 +1853,7 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     if message is None or user is None or not _authorized(update, settings):
         return
-    issue = " ".join(context.args).strip()
+    issue = redact_sensitive(" ".join(context.args).strip(), 2000)
     if not issue:
         await message.reply_text("Usage: /report <what went wrong>")
         return
@@ -1581,6 +1938,32 @@ async def cleanup_task(context: ContextTypes.DEFAULT_TYPE) -> None:
         LOGGER.info("Cleaned up %d expired download messages", dl_removed)
 
 
+async def _notify_restart_online(application: Application, settings: Settings) -> bool:
+    if not RESTART_MARKER.is_file():
+        return False
+    explicit_chat = (
+        os.getenv("TELEGRAM_RESTART_CHAT_ID", "").strip()
+        or os.getenv("TELEGRAM_ERROR_CHAT_ID", "").strip()
+    )
+    chat_id = int(explicit_chat) if explicit_chat else next(
+        iter(sorted(settings.allowed_chat_ids or settings.allowed_user_ids)), None,
+    )
+    if chat_id is None:
+        return False
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text="🟢 MediaDL bot is back online.",
+        )
+        RESTART_MARKER.unlink(missing_ok=True)
+        RESTART_ACK.unlink(missing_ok=True)
+        append_event("restart_online_notified", "Restart online notification sent")
+        return True
+    except Exception as exc:
+        LOGGER.warning("Could not send restart online notification: %s", exc)
+        return False
+
+
 async def _post_init(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
     db_path: Path = application.bot_data["db_path"]
@@ -1589,14 +1972,36 @@ async def _post_init(application: Application) -> None:
     app = create_download_app(db_path, storage_dir)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", settings.download_port)
+    site = web.TCPSite(runner, settings.download_bind_host, settings.download_port)
     await site.start()
     application.bot_data["download_runner"] = runner
     LOGGER.info("Download server started on port %d", settings.download_port)
 
+    interrupted_jobs, interrupted_edits = await reconcile_interrupted_work(db_path)
+    if interrupted_jobs or interrupted_edits:
+        LOGGER.warning(
+            "Reconciled interrupted work after restart: %d downloads, %d renders",
+            interrupted_jobs,
+            interrupted_edits,
+        )
+    application.bot_data["download_work"].start()
+    application.bot_data["render_work"].start()
+
     cleaned = await cleanup_download_messages(db_path, application.bot)
     if cleaned:
         LOGGER.info("Startup: cleaned up %d expired download messages", cleaned)
+
+    await _notify_restart_online(application, settings)
+
+
+async def _post_shutdown(application: Application) -> None:
+    for key in ("download_work", "render_work"):
+        work = application.bot_data.get(key)
+        if work is not None:
+            await work.stop()
+    runner = application.bot_data.get("download_runner")
+    if runner is not None:
+        await runner.cleanup()
 
 
 def main() -> None:
@@ -1625,7 +2030,7 @@ def main() -> None:
         builder = builder.base_url(settings.local_api_url)
         LOGGER.info("Using local Telegram Bot API at %s", settings.local_api_url)
 
-    application = builder.post_init(_post_init).build()
+    application = builder.post_init(_post_init).post_shutdown(_post_shutdown).build()
     application.bot_data["settings"] = settings
     application.bot_data["ytdlp"] = ytdlp
     gallerydl_path = shutil.which("gallery-dl")
@@ -1634,17 +2039,32 @@ def main() -> None:
     application.bot_data["gallerydl"] = Path(gallerydl_path)
     application.bot_data["db_path"] = db_path
     application.bot_data["storage_dir"] = storage_dir
+    application.bot_data["download_work"] = WorkQueue(
+        name="download",
+        workers=settings.download_workers,
+        capacity=settings.work_queue_capacity,
+        per_user_capacity=settings.per_user_work_capacity,
+    )
+    application.bot_data["render_work"] = WorkQueue(
+        name="render",
+        workers=settings.render_workers,
+        capacity=settings.work_queue_capacity,
+        per_user_capacity=settings.per_user_work_capacity,
+    )
 
     application.add_handler(TypeHandler(Update, audit_update, block=False), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("voices", voices_command))
+    application.add_handler(CommandHandler("tiktokaccount", tiktok_account_command))
     application.add_handler(CommandHandler("settings", settings_command_entry))
+    application.add_handler(CommandHandler("presets", presets_command_entry))
     application.add_handler(CommandHandler("pool", pool_command_entry))
     application.add_handler(CommandHandler("fix", fix_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("skip", skip_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^settings:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^preset:"))
     application.add_handler(CallbackQueryHandler(settings_callback_entry, pattern=r"^edit:"))
@@ -1658,18 +2078,16 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(editconfig_callback, pattern=r"^editcfg:"))
     application.add_handler(CallbackQueryHandler(watermark_callback, pattern=r"^watermark:"))
     application.add_handler(CallbackQueryHandler(download_callback, pattern=r"^download:"))
-    application.add_handler(
-        MessageHandler(filters.PHOTO | filters.Document.IMAGE, _message_router)
-    )
-    application.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.CAPTION, _message_router))
+    application.add_handler(MessageHandler(~filters.COMMAND, _message_router))
 
     application.add_error_handler(error_handler)
 
     application.job_queue.run_repeating(cleanup_task, interval=6 * 60 * 60, first=60)
 
-    if settings.download_domain:
+    if settings.download_public_origin:
         LOGGER.info(
-            "Secure downloads enabled at https://%s/download/<token>", settings.download_domain,
+            "Secure downloads enabled at %s/download/<token>",
+            settings.download_public_origin,
         )
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -461,6 +461,17 @@ async def create_download_token(
     *,
     edit_job_id: int | None = None,
 ) -> str:
+    job = await get_job(db_path, job_id)
+    if job is None or job.user_id != user_id:
+        raise ValueError("download token job ownership mismatch")
+    if edit_job_id is not None:
+        edit = await get_edit_job(db_path, edit_job_id)
+        if (
+            edit is None
+            or edit.user_id != user_id
+            or edit.source_job_id != job_id
+        ):
+            raise ValueError("download token edit ownership mismatch")
     raw_token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=expiry_minutes)
@@ -474,24 +485,65 @@ async def create_download_token(
     return raw_token
 
 
-async def consume_download_token(db_path: Path, raw_token: str) -> DownloadToken | None:
+async def lookup_download_token(db_path: Path, raw_token: str) -> DownloadToken | None:
+    """Return an unused, unexpired token without consuming it."""
     token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        now = datetime.now(timezone.utc).isoformat()
         async with db.execute(
-            "SELECT * FROM download_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+            "SELECT * FROM download_tokens "
+            "WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
             (token_hash, now),
         ) as cur:
             row = await cur.fetchone()
-        if row is None:
-            return None
-        await db.execute(
-            "UPDATE download_tokens SET used_at = ? WHERE token_hash = ?",
-            (now, token_hash),
-        )
-        await db.commit()
-    return _row_to_token(row)
+    return _row_to_token(row) if row else None
+
+
+async def consume_download_token(db_path: Path, raw_token: str) -> DownloadToken | None:
+    """Atomically claim a one-time token. Exactly one concurrent caller wins."""
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "UPDATE download_tokens "
+                "SET used_at = ? "
+                "WHERE token_hash = ? AND used_at IS NULL AND expires_at > ? "
+                "RETURNING *",
+                (now, token_hash, now),
+            ) as cur:
+                row = await cur.fetchone()
+            await db.commit()
+            return _row_to_token(row) if row else None
+        except aiosqlite.OperationalError:
+            # Fallback for SQLite builds without UPDATE RETURNING.
+            # A failed statement leaves the connection in an aborted transaction;
+            # roll back before starting the conditional-update path.
+            await db.rollback()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "UPDATE download_tokens "
+                    "SET used_at = ? "
+                    "WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+                    (now, token_hash, now),
+                )
+                if cursor.rowcount != 1:
+                    await db.rollback()
+                    return None
+                async with db.execute(
+                    "SELECT * FROM download_tokens WHERE token_hash = ?",
+                    (token_hash,),
+                ) as cur:
+                    row = await cur.fetchone()
+                await db.commit()
+                return _row_to_token(row) if row else None
+            except Exception:
+                await db.rollback()
+                raise
 
 
 async def get_or_create_user_settings(db_path: Path, user_id: int) -> UserSettings:
@@ -1090,6 +1142,26 @@ async def cleanup_expired_tokens(db_path: Path) -> int:
         )
         await db.commit()
         return cursor.rowcount
+
+
+async def reconcile_interrupted_work(db_path: Path) -> tuple[int, int]:
+    """Mark non-durable in-flight work interrupted after a process restart."""
+    message = "interrupted by bot restart; submit the job again"
+    async with aiosqlite.connect(db_path) as db:
+        jobs = await db.execute(
+            "UPDATE jobs SET status = 'failed', error_message = ?, "
+            "updated_at = datetime('now') "
+            "WHERE status IN ('queued', 'downloading')",
+            (message,),
+        )
+        edits = await db.execute(
+            "UPDATE edit_jobs SET status = 'failed', error_message = ?, "
+            "updated_at = datetime('now') "
+            "WHERE status IN ('queued', 'rendering')",
+            (message,),
+        )
+        await db.commit()
+        return jobs.rowcount, edits.rowcount
 
 
 async def cleanup_old_jobs(db_path: Path, storage_dir: Path, retention_days: int) -> int:

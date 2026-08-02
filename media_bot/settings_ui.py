@@ -8,6 +8,12 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from .access import (
+    NOT_FOUND_OR_UNAUTHORIZED,
+    ResourceNotFound,
+    require_owned_edit,
+    require_owned_job,
+)
 from .colors import COLOR_HUES, color_emoji, color_label, shade_options
 from .menu import Menu
 from .storage import (
@@ -104,7 +110,7 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
 }
 
 _TEXT_FIELDS = frozenset({
-    "voice_over_voice", "voice_text", "caption_text", "banner_path",
+    "voice_over_voice", "voice_text", "banner_path",
     "watermark_text",
 })
 
@@ -184,7 +190,8 @@ def _choice_keyboard(field: str, back_data: str, set_prefix: str) -> InlineKeybo
 def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
     return {
         "auto_captions": cfg.auto_captions,
-        "caption_text": cfg.caption_text,
+        # Manual caption text is retired; captions always come from transcription.
+        "caption_text": None,
         "caption_color": cfg.caption_color,
         "caption_style": cfg.caption_style,
         "caption_position": cfg.caption_position,
@@ -240,13 +247,14 @@ def _tts_engine_overview(engine: str) -> str:
     return (
         f"🎤 Voice settings\n\n"
         f"Current TTS engine: {engine}\n{detail}\n\n"
-        "AI visual narration is not available yet, so manual Voice Text is deprecated."
+        "Set Voice Text to the narration you want generated."
     )
 
 
 def _voice_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{back_data}:voice_over_voice")],
+        [InlineKeyboardButton("📝 Voice Text", callback_data=f"{back_data}:voice_text")],
         [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{back_data}:voice_quality")],
         [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{back_data}:voice_speed")],
         [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{back_data}:tts_engine")],
@@ -288,7 +296,6 @@ def _build_config_rows(
     toggle_prefix: str,
     include_watermark_position: bool = False,
 ) -> list[list[InlineKeyboardButton]]:
-    cap_text = _fmt_current(values.get("caption_text"))
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
     pos = _fmt_current(values.get("caption_position"))
@@ -296,7 +303,6 @@ def _build_config_rows(
     v_quality = _fmt_current(values.get("voice_quality") or "basic")
     b_path = _fmt_current(values.get("banner_path"))
     rows = [
-        [InlineKeyboardButton(f"💬 Caption Text [{cap_text}]", callback_data=f"{field_prefix}:caption_text")],
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
@@ -638,6 +644,12 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _show_menu(update, context)
 
 
+async def presets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the user's preset list directly."""
+    context.user_data["settings_flow"] = FlowState(action=_State.PRESET_LIST)
+    await _show_preset_list(update, context)
+
+
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or query.data is None:
@@ -813,6 +825,16 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if query.data.startswith("edit:source:"):
         job_id = int(query.data.split(":")[-1])
+        user = update.effective_user
+        if user is None:
+            return
+        try:
+            await require_owned_job(
+                context.application.bot_data["db_path"], job_id, user.id,
+            )
+        except ResourceNotFound:
+            await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+            return
         flow.action = _State.EDIT_PRESET_SELECT
         flow.data["source_job_id"] = job_id
         await _show_edit_preset_select(update, context, job_id)
@@ -851,11 +873,20 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     flow = context.user_data.get("settings_flow")
-    if not isinstance(flow, FlowState) or not update.message:
+    if not update.message:
         return False
-    if flow.action not in (_State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD):
+    editconfig_upload = (
+        isinstance(flow, dict)
+        and flow.get("action") == "editconfig"
+        and flow.get("field_name") == "banner_path"
+        and flow.get("edit_id") is not None
+    )
+    settings_upload = isinstance(flow, FlowState) and flow.action in (
+        _State.PRESET_CREATE_BANNER, "set_profile_banner", _State.PRESET_EDIT_FIELD,
+    )
+    if not editconfig_upload and not settings_upload:
         return False
-    if (
+    if isinstance(flow, FlowState) and (
         flow.action == _State.PRESET_EDIT_FIELD
         and flow.data.get("field_name") != "banner_path"
     ):
@@ -885,13 +916,36 @@ async def settings_photo_handler(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     if user is None:
         return False
+    if editconfig_upload:
+        edit_id = int(flow["edit_id"])
+        try:
+            await require_owned_edit(
+                context.application.bot_data["db_path"], edit_id, user.id,
+            )
+        except ResourceNotFound:
+            flow.clear()
+            await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+            return True
     storage_dir: Path = context.application.bot_data.get("storage_dir", Path("runtime/jobs"))
     banners_dir = storage_dir / "banners"
     banners_dir.mkdir(parents=True, exist_ok=True)
 
     file = await upload.get_file()
-    dest = banners_dir / f"banner_{user.id}{suffix}"
+    filename_suffix = f"_{flow['edit_id']}" if editconfig_upload else ""
+    dest = banners_dir / f"banner_{user.id}{filename_suffix}{suffix}"
     await file.download_to_drive(dest)
+
+    if editconfig_upload:
+        updated = await update_edit_job(
+            context.application.bot_data["db_path"], edit_id, banner_path=str(dest),
+        )
+        if updated is None:
+            await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+            return True
+        flow.pop("field_name", None)
+        await message.reply_text("Banner image saved.")
+        await show_editconfig_menu(update, context, edit_id)
+        return True
 
     if flow.action == "set_profile_banner":
         flow.action = _State.MENU
@@ -996,7 +1050,9 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if preset_id is None or field_name is None:
             return False
         value = None if text.lower() == "/skip" else text
-        text_only_fields = {"voice_over_voice", "voice_text", "caption_text", "banner_path", "voice_speed"}
+        text_only_fields = {
+            "voice_over_voice", "voice_text", "watermark_text", "banner_path", "voice_speed",
+        }
         if field_name in text_only_fields:
             if field_name in ("voice_speed",):
                 if value is not None:
@@ -1061,7 +1117,7 @@ async def _show_preset_list(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     rows = []
     for p in page:
         mark = "⭐ " if active_name and p.name == active_name else ""
-        color = color_emoji(p.caption_color)
+        color = color_emoji(p.caption_color or "white")
         label = f"{mark}{p.name} ({color} {p.caption_style or 'none'})"
         rows.append([InlineKeyboardButton(label, callback_data=f"preset:edit:{p.id}")])
     rows.append([InlineKeyboardButton("➕ Create new", callback_data="settings:create_preset")])
@@ -1110,7 +1166,9 @@ async def _show_preset_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     status = "⭐ Active " if is_active else ""
     text = (
         f"{status}Preset: {preset.name}\n"
-        f"Tap any setting to change it."
+        "Tap any setting to change it.\n\n"
+        "Set as Active puts this preset first (with a ⭐) on each new download's "
+        "quick-render buttons. It does not render automatically."
     )
     await _edit_or_send(update, text, InlineKeyboardMarkup(rows))
 
@@ -1318,8 +1376,12 @@ async def _show_edit_preset_select(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     if user is None:
         return
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await _edit_or_send(update, NOT_FOUND_OR_UNAUTHORIZED, InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="settings:edit_source")]]))
+        return
+    if source.file_path is None:
         await _edit_or_send(update, "Source video not found.", InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="settings:edit_source")]]))
         return
     presets = await list_presets(db_path, user.id)
@@ -1349,8 +1411,12 @@ async def _start_edit_process(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     if user is None or source_job_id is None:
         return
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if source.file_path is None:
         await update.callback_query.answer("Source not found", show_alert=True)
         return
     source_path = Path(source.file_path)
@@ -1380,8 +1446,12 @@ async def _start_temp_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if user is None or source_job_id is None:
         return
-    source = await get_job(db_path, source_job_id)
-    if source is None or source.file_path is None:
+    try:
+        source = await require_owned_job(db_path, source_job_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if source.file_path is None:
         await update.callback_query.answer("Source not found", show_alert=True)
         return
     source_path = Path(source.file_path)
@@ -1442,8 +1512,13 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     user = update.effective_user
     if user is None:
         return
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None or edit.file_path is None:
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+        await require_owned_job(db_path, edit.source_job_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return
+    if edit.file_path is None:
         await update.callback_query.answer("Edit not found", show_alert=True)
         return
     pool_item = await create_pool_item(
@@ -1468,10 +1543,6 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
         toggle_prefix=f"{prefix}:set",
         include_watermark_position=True,
     )
-    rows = [
-        row for row in rows
-        if not row[0].callback_data.endswith(":caption_text")
-    ]
     menu = Menu()
     menu.rows.extend(rows)
     menu.action("💾 Save Config to Preset", f"{prefix}:save_preset")
@@ -1482,9 +1553,14 @@ def build_editconfig_keyboard(edit: EditJob, preset: Preset | None = None) -> In
 
 async def show_editconfig_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int, *, intro: str | None = None) -> None:
     db_path: Path = context.application.bot_data["db_path"]
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None:
-        await _edit_or_send(update, "Edit job not found.", None)
+    user = update.effective_user
+    if user is None:
+        return
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+        await require_owned_job(db_path, edit.source_job_id, user.id)
+    except ResourceNotFound:
+        await _edit_or_send(update, NOT_FOUND_OR_UNAUTHORIZED, None)
         return
     preset = None
     if edit.preset_id:
@@ -1495,9 +1571,13 @@ async def show_editconfig_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _start_editconfig_from_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> None:
     db_path: Path = context.application.bot_data["db_path"]
-    edit = await get_edit_job(db_path, edit_id)
-    if edit is None:
-        await update.callback_query.answer("Edit not found", show_alert=True)
+    user = update.effective_user
+    if user is None:
+        return
+    try:
+        edit = await require_owned_edit(db_path, edit_id, user.id)
+    except ResourceNotFound:
+        await update.callback_query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
         return
     flow = context.user_data.get("settings_flow")
     if flow is None:
@@ -1518,7 +1598,6 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     if query is None or query.data is None:
         return None
-    await query.answer()
     db_path: Path = context.application.bot_data["db_path"]
     data: str = query.data
 
@@ -1531,9 +1610,20 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
     try:
         edit_id = int(parts[1])
     except ValueError:
-        await _edit_message(query, "Invalid edit ID.")
+        await query.answer("Invalid edit ID.", show_alert=True)
         return None
     rest = parts[2]
+
+    try:
+        owned_edit = await require_owned_edit(db_path, edit_id, query.from_user.id)
+        await require_owned_job(
+            db_path, owned_edit.source_job_id, query.from_user.id,
+        )
+    except ResourceNotFound:
+        await query.answer(NOT_FOUND_OR_UNAUTHORIZED, show_alert=True)
+        return None
+
+    await query.answer()
 
     flow = context.user_data.get("settings_flow")
     if isinstance(flow, FlowState):
@@ -1673,6 +1763,7 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             flow["field_name"] = "voice_menu"
         rows = [
             [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{prefix}:voice_menu:voice_over_voice")],
+            [InlineKeyboardButton("📝 Voice Text", callback_data=f"{prefix}:voice_menu:voice_text")],
             [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{prefix}:voice_menu:voice_quality")],
             [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"{prefix}:voice_menu:voice_speed")],
             [InlineKeyboardButton("🔊 TTS Engine", callback_data=f"{prefix}:voice_menu:tts_engine")],

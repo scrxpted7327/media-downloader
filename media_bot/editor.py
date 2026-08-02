@@ -25,6 +25,8 @@ _VOICE_PRESETS = {
     "premium": {"ar": "44100", "ac": "2", "codec": "aac"},
 }
 
+_CHANNEL_BANNER_HEIGHT_RATIO = .15
+
 _VIDEO_ENCODER: str | None = None
 
 def _detect_video_encoder() -> str:
@@ -73,10 +75,11 @@ async def _get_whisper_model_async():
         if _WHISPER_MODEL is not None:
             return _WHISPER_MODEL
         from faster_whisper import WhisperModel
-        LOGGER.info("Loading faster-whisper tiny model in thread...")
+        model_name = os.getenv("WHISPER_MODEL", "base.en").strip() or "base.en"
+        LOGGER.info("Loading faster-whisper %s model in thread...", model_name)
         loop = asyncio.get_running_loop()
         _WHISPER_MODEL = await loop.run_in_executor(
-            None, lambda: WhisperModel("tiny", device="cpu", compute_type="int8"),
+            None, lambda: WhisperModel(model_name, device="cpu", compute_type="int8"),
         )
         LOGGER.info("faster-whisper model loaded")
     return _WHISPER_MODEL
@@ -210,6 +213,11 @@ async def list_tts_voices(engine: str | None = None) -> list[dict[str, str]]:
 
 
 def resolve_voice(voice: str, engine: str | None = None) -> str:
+    # Neural voice names are Edge-specific. Preserve the language when auto
+    # mode falls back to eSpeak instead of passing an invalid voice name.
+    if engine == "espeak-ng" and voice and voice.endswith("Neural"):
+        locale = voice.split("-", 2)
+        return "-".join(locale[:2]).lower() if len(locale) >= 2 else "en"
     if voice and voice not in ("default", "male", "female", ""):
         return voice
     if engine == "edge-tts":
@@ -317,8 +325,11 @@ tmp.write(data)
 tmp.close()
 try:
     from faster_whisper import WhisperModel
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(tmp.name, beam_size=1, word_timestamps=True)
+    model = WhisperModel(os.environ.get("WHISPER_MODEL", "base.en"), device="cpu", compute_type="int8")
+    segments, info = model.transcribe(
+        tmp.name, beam_size=5, word_timestamps=True, vad_filter=True,
+        condition_on_previous_text=True,
+    )
     result = [{
         "start": round(s.start, 3),
         "end": round(s.end, 3),
@@ -404,9 +415,11 @@ async def transcribe_audio(
                 None,
                 lambda: model.transcribe(
                     str(wav_path),
-                    beam_size=1,
+                    beam_size=5,
                     language=language,
                     word_timestamps=True,
+                    vad_filter=True,
+                    condition_on_previous_text=True,
                 ),
             )
             segments = await loop.run_in_executor(None, lambda: list(segments_gen))
@@ -482,6 +495,15 @@ def _segments_to_srt(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _ass_timestamp(seconds: float) -> str:
+    """Format an ASS timestamp using its required centisecond precision."""
+    centiseconds = max(0, round(float(seconds) * 100))
+    hours, remainder = divmod(centiseconds, 360_000)
+    minutes, remainder = divmod(remainder, 6_000)
+    whole_seconds, fraction = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{fraction:02d}"
+
+
 async def render_captions(
     input_path: Path,
     output_path: Path,
@@ -493,6 +515,7 @@ async def render_captions(
     timeout_seconds: int = 600,
     progress_callback: ProgressCallback | None = None,
     srt_output_path: Path | None = None,
+    bottom_safe_area: float = 0.0,
 ) -> Path:
     if not input_path.is_file():
         raise DownloadError(f"input file not found for caption rendering ({input_path.name})")
@@ -502,7 +525,14 @@ async def render_captions(
     if auto_captions or not caption_text:
         segments = await transcribe_audio(input_path, timeout_seconds=timeout_seconds)
         if not segments:
-            raise DownloadError(f"transcription produced no segments for {input_path.name}")
+            # Silence and music-only clips are valid inputs. Auto captions have
+            # nothing to add, so preserve the video and let later edit steps run.
+            LOGGER.info("No speech segments found in %s; skipping captions", input_path.name)
+            if output_path != input_path:
+                shutil.copy2(input_path, output_path)
+            if progress_callback:
+                await progress_callback(100)
+            return output_path
         srt_content = _segments_to_srt(segments)
         tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-srt-")
         srt_path = Path(tmpdir.name) / "captions.srt"
@@ -510,29 +540,34 @@ async def render_captions(
         if srt_output_path:
             srt_output_path.write_text(srt_content, encoding="utf-8")
 
-        ass_style = _build_ass_style(color, style, position)
+        video_width, video_height = _get_video_dimensions(input_path)
+        ass_style = _build_ass_style(
+            color, style, position, video_height=video_height,
+            bottom_safe_area=bottom_safe_area,
+        )
         ass_header = (
             "[Script Info]\n"
             "ScriptType: v4.00+\n"
             "WrapStyle: 0\n"
             "PlayDepth: 0\n"
+            f"PlayResX: {video_width}\n"
+            f"PlayResY: {video_height}\n"
             "[V4+ Styles]\n"
             f"Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            f"Style: Default,Arial,{ass_style['fontsize']},{ass_style['color']},&H00000000,&H00000000,{ass_style['backcolour']},{ass_style['bold']},0,0,0,100,100,0,0,{ass_style['borderstyle']},{ass_style['outline']},{ass_style['shadow']},{ass_style['alignment']},10,10,10,1\n"
+            f"Style: Default,Arial,{ass_style['fontsize']},{ass_style['color']},&H00000000,&H00000000,{ass_style['backcolour']},{ass_style['bold']},0,0,0,100,100,0,0,{ass_style['borderstyle']},{ass_style['outline']},{ass_style['shadow']},{ass_style['alignment']},10,10,{ass_style['margin_v']},1\n"
             "[Events]\n"
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
-        for seg in segments:
-            start_h = int(seg["start"] // 3600)
-            start_m = int((seg["start"] % 3600) // 60)
-            start_s = seg["start"] % 60
-            end_h = int(seg["end"] // 3600)
-            end_m = int((seg["end"] % 3600) // 60)
-            end_s = seg["end"] % 60
-            safe_text = seg["text"].replace("{", "\\{").replace("}", "\\}")
+        for seg in _caption_chunks(segments):
+            start = _ass_timestamp(seg["start"])
+            end = _ass_timestamp(seg["end"])
+            safe_text = (
+                seg["text"].replace("\\", "\\\\")
+                .replace("{", "\\{").replace("}", "\\}")
+                .replace("\n", " ")
+            )
             ass_header += (
-                f"Dialogue: 0,{start_h:02d}:{start_m:02d}:{start_s:06.3f},"
-                f"{end_h:02d}:{end_m:02d}:{end_s:06.3f},Default,,0,0,0,,{safe_text}\n"
+                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{safe_text}\n"
             )
 
         ass_path = Path(tmpdir.name) / "captions.ass"
@@ -550,7 +585,10 @@ async def render_captions(
                 timeout_seconds,
                 f"closed caption burn failed for {input_path.name}",
                 total_duration_us=duration_us,
-                progress_callback=lambda p: progress_callback(50 + p // 2) if progress_callback else None,
+                progress_callback=(
+                    (lambda p: progress_callback(50 + p // 2))
+                    if progress_callback else None
+                ),
             )
         finally:
             tmpdir.cleanup()
@@ -603,7 +641,13 @@ async def render_captions(
     return output_path
 
 
-def _build_ass_style(color: str, style: str, position: str) -> dict:
+def _build_ass_style(
+    color: str,
+    style: str,
+    position: str,
+    video_height: int = 720,
+    bottom_safe_area: float = 0.0,
+) -> dict:
     from .colors import resolve_ass_color
     style_map = {
         "bold": {"fontsize": 24, "bold": 1, "borderstyle": 1, "outline": 3, "shadow": 2},
@@ -612,10 +656,15 @@ def _build_ass_style(color: str, style: str, position: str) -> dict:
         "filled": {"fontsize": 18, "bold": 0, "borderstyle": 3, "outline": 1, "shadow": 0, "backcolour": "&H80000000"},
     }
     default = {"fontsize": 18, "bold": 0, "borderstyle": 1, "outline": 2, "shadow": 1}
-    s = style_map.get(style.lower(), default)
+    s = dict(style_map.get(style.lower(), default))
+    s["fontsize"] = max(16, round(s["fontsize"] * max(.8, video_height / 720)))
     s.setdefault("backcolour", "&H00000000")
     align_map = {"low": 8, "middle": 5, "high": 2}
     s["alignment"] = align_map.get(position.lower(), 2)
+    s["margin_v"] = (
+        max(10, round(video_height * bottom_safe_area) + 10)
+        if s["alignment"] in (1, 2, 3) else 10
+    )
     s["color"] = resolve_ass_color(color)
     return s
 
@@ -651,7 +700,19 @@ async def render_voice_over(
     try:
         if progress_callback:
             await progress_callback(10)
-        await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
+        try:
+            await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
+        except Exception as exc:
+            # Auto mode should remain usable when the network-backed Edge TTS
+            # service is unavailable on the bot host.
+            if (tts_engine in (None, "auto") and engine == "edge-tts"
+                    and shutil.which("espeak-ng")):
+                LOGGER.warning("Edge TTS failed; falling back to eSpeak NG: %s", exc)
+                engine = "espeak-ng"
+                tmp_audio.unlink(missing_ok=True)
+                await _tts_espeak(voice_text, tmp_audio, voice, speed, timeout_seconds)
+            else:
+                raise
         if progress_callback:
             await progress_callback(30)
 
@@ -668,8 +729,7 @@ async def render_voice_over(
                 "-i", str(input_video),
                 "-i", str(tmp_audio),
                 "-filter_complex",
-                f"[1:a]asetrate={preset['ar']},aresample={preset['ar']}:filter_type=kaiser,"
-                f"atempo={speed:.2f}[aout]",
+                f"[1:a]aresample={preset['ar']}:filter_type=kaiser[aout]",
                 "-map", "0:v", "-map", "[aout]",
                 "-c:v", "copy",
                 "-c:a", preset["codec"],
@@ -804,7 +864,7 @@ async def remove_watermark(
                          fallback_used=True, error=str(exc),
                          duration_seconds=round(time.monotonic() - started, 3))
             return await _remove_watermark_regions(
-                input_path, output_path, [item.box for item in selected],
+                input_path, output_path, selected,
                 timeout_seconds, progress_callback,
             )
 
@@ -861,19 +921,41 @@ async def remove_watermark(
 async def _remove_watermark_regions(
     input_path: Path,
     output_path: Path,
-    regions: list[tuple[int, int, int, int]],
+    regions: list,
     timeout_seconds: int,
     progress_callback: ProgressCallback | None,
 ) -> Path:
     """Fallback for irregular masks: use one tightly bounded delogo per candidate."""
     vid_w, vid_h = _get_video_dimensions(input_path)
     filters = []
-    for x, y, width, height in regions:
+    for region in regions:
+        if hasattr(region, "box"):
+            x, y, width, height = region.box
+            start_seconds = getattr(region, "start_seconds", None)
+            end_seconds = getattr(region, "end_seconds", None)
+            active_ranges = getattr(region, "active_ranges", ())
+        else:
+            x, y, width, height = region
+            start_seconds = end_seconds = None
+            active_ranges = ()
         x = max(1, min(int(x), vid_w - 4))
         y = max(1, min(int(y), vid_h - 4))
         width = max(2, min(int(width), vid_w - x - 2))
         height = max(2, min(int(height), vid_h - y - 2))
-        filters.append(f"delogo=x={x}:y={y}:w={width}:h={height}:show=0")
+        enable = ""
+        if active_ranges:
+            expressions = [
+                f"between(t\\,{float(start):.3f}\\,{float(end):.3f})"
+                for start, end in active_ranges
+            ]
+            enable = f":enable='{'+'.join(expressions)}'"
+        elif start_seconds is not None or end_seconds is not None:
+            start = max(0.0, float(start_seconds or 0.0))
+            end = float(end_seconds if end_seconds is not None else 86400.0)
+            enable = f":enable='between(t\\,{start:.3f}\\,{end:.3f})'"
+        filters.append(
+            f"delogo=x={x}:y={y}:w={width}:h={height}:show=0{enable}"
+        )
     if not filters:
         return input_path
     filters.append("format=yuv420p")
@@ -984,45 +1066,19 @@ async def render_channel_banner(
         raise DownloadError("ffmpeg is required for channel banner overlay")
 
     vid_w, vid_h = _get_video_dimensions(input_path)
-    if vid_w <= vid_h:
-        LOGGER.info("Video is portrait/square (%dx%d), skipping channel banner", vid_w, vid_h)
-        if output_path != input_path:
-            shutil.copy2(str(input_path), str(output_path))
-        return output_path
-
     avatar_path: Path | None = None
     channel_title = ""
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-channel-")
     try:
         try:
-            import yt_dlp
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                info = ydl.extract_info(source_url, download=False)
-                channel_title = info.get("channel", info.get("uploader", info.get("creator", ""))) or ""
-                avatar_url = (
-                    info.get("channel_url") or info.get("uploader_url") or ""
-                )
-                if avatar_url:
-                    try:
-                        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl2:
-                            chan_info = ydl2.extract_info(avatar_url, download=False)
-                            thumb = chan_info.get("thumbnails", [])
-                            if thumb:
-                                av_url = thumb[-1].get("url", "")
-                                if av_url:
-                                    import urllib.request
-                                    avatar_path = Path(tmpdir.name) / "avatar.png"
-                                    urllib.request.urlretrieve(av_url, avatar_path)
-                    except Exception:
-                        pass
-                if not avatar_path:
-                    thumbs = info.get("thumbnails", [])
-                    if thumbs:
-                        av_url = thumbs[-1].get("url", "")
-                        if av_url:
-                            import urllib.request
-                            avatar_path = Path(tmpdir.name) / "avatar.png"
-                            urllib.request.urlretrieve(av_url, avatar_path)
+            metadata_timeout = min(30, max(5, timeout_seconds))
+            channel_title, avatar_bytes = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_channel_identity, source_url),
+                timeout=metadata_timeout,
+            )
+            if avatar_bytes:
+                avatar_path = Path(tmpdir.name) / "avatar.img"
+                avatar_path.write_bytes(avatar_bytes)
         except Exception as exc:
             LOGGER.warning("Could not fetch channel info: %s", exc)
 
@@ -1031,9 +1087,8 @@ async def render_channel_banner(
         )
 
         duration_us = _get_duration_us(input_path)
-        position_map = {
-            "bottom": f"0:{vid_h - int(vid_h * 0.18)}",
-        }
+        banner_height = int(vid_h * _CHANNEL_BANNER_HEIGHT_RATIO)
+        position_map = {"bottom": f"0:{vid_h - banner_height}"}
         pos = position_map["bottom"]
 
         cmd = [
@@ -1041,7 +1096,8 @@ async def render_channel_banner(
             "-i", str(input_path),
             "-i", str(banner_img_path),
             "-filter_complex",
-            f"[1:v]scale={vid_w}:{int(vid_h * 0.18)}[b];[0:v][b]overlay=0:{vid_h - int(vid_h * 0.18)}",
+            f"[1:v]scale={vid_w}:{banner_height}[b];"
+            f"[0:v][b]overlay=0:{vid_h - banner_height}",
             "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
             "-c:a", "copy",
             "-movflags", "+faststart",
@@ -1060,6 +1116,42 @@ async def render_channel_banner(
     return output_path
 
 
+def _fetch_channel_identity(source_url: str) -> tuple[str, bytes | None]:
+    """Fetch channel text/avatar with bounded network operations."""
+    import urllib.request
+    import yt_dlp
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 10,
+        "retries": 1,
+        "extractor_retries": 1,
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(source_url, download=False)
+    channel_title = info.get("channel", info.get("uploader", info.get("creator", ""))) or ""
+    avatar_url = info.get("channel_url") or info.get("uploader_url") or ""
+    thumbnails = []
+    if avatar_url:
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                channel_info = ydl.extract_info(avatar_url, download=False)
+            thumbnails = channel_info.get("thumbnails", [])
+        except Exception:
+            pass
+    if not thumbnails:
+        thumbnails = info.get("thumbnails", [])
+    image_url = thumbnails[-1].get("url", "") if thumbnails else ""
+    if not image_url:
+        return channel_title, None
+    with urllib.request.urlopen(image_url, timeout=10) as response:
+        avatar = response.read(10 * 1024 * 1024 + 1)
+    if len(avatar) > 10 * 1024 * 1024:
+        raise DownloadError("channel avatar exceeds 10 MB")
+    return channel_title, avatar
+
+
 async def _compose_channel_banner_image(
     tmpdir: Path,
     vid_w: int,
@@ -1070,7 +1162,7 @@ async def _compose_channel_banner_image(
 ) -> Path:
     from PIL import Image, ImageDraw, ImageFont
 
-    banner_h = int(vid_h * 0.18)
+    banner_h = int(vid_h * _CHANNEL_BANNER_HEIGHT_RATIO)
     img = Image.new("RGBA", (vid_w, banner_h), (0, 0, 0, 180))
     draw = ImageDraw.Draw(img)
 
@@ -1257,6 +1349,9 @@ async def render_edit(
             caption_text, caption_color, caption_style, caption_position, auto_captions, timeout_seconds,
             srt_output_path=output_path.with_suffix(".srt"),
             progress_callback=progress_callback,
+            bottom_safe_area=(
+                .17 if channel_banner or (banner_path and banner_position == "bottom") else 0.0
+            ),
         )
         if auto_captions:
             srt_path = output_path.with_suffix(".srt")

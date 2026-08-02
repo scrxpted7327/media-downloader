@@ -10,6 +10,8 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 LOG_PATH = PROJECT_DIR / "runtime" / "supervisor.log"
+RESTART_MARKER = PROJECT_DIR / "runtime" / "restart-requested"
+RESTART_ACK = PROJECT_DIR / "runtime" / "restart-shutdown-notified"
 
 
 def _managed_processes() -> list[int]:
@@ -33,6 +35,35 @@ def _managed_processes() -> list[int]:
     return managed
 
 
+def _supervisor_pid() -> int | None:
+    for pid in _managed_processes():
+        try:
+            args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        decoded = [arg.decode("utf-8", "replace") for arg in args if arg]
+        if any(Path(arg).name == "supervisor.py" for arg in decoded[1:]):
+            return pid
+    return None
+
+
+def _request_restart_notification() -> None:
+    """Signal the live supervisor and wait briefly for its Telegram acknowledgment."""
+    RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    RESTART_MARKER.write_text(f"requested_at={time.time()}\n", encoding="utf-8")
+    RESTART_ACK.unlink(missing_ok=True)
+    supervisor_pid = _supervisor_pid()
+    if supervisor_pid is None:
+        return
+    try:
+        os.kill(supervisor_pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not RESTART_ACK.exists():
+        time.sleep(0.1)
+
+
 def _stop_existing() -> None:
     pids = _managed_processes()
     for pid in pids:
@@ -52,6 +83,7 @@ def _stop_existing() -> None:
 
 
 def main() -> None:
+    _request_restart_notification()
     _stop_existing()
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as log:

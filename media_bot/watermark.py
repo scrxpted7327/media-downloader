@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import tempfile
 import time
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,8 +19,22 @@ LOGGER = logging.getLogger(__name__)
 LAMA_MODEL_URL = "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx"
 LAMA_MODEL_SHA256 = "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6"
 AUTO_ACCEPT_CONFIDENCE = 0.78
-SAMPLE_COUNT = 28
+SAMPLE_COUNT = 72
 LAMA_KEYFRAME_FPS = 2.0
+
+
+def select_onnx_providers(available: list[str]) -> list[str]:
+    """Use CPU by default; accelerators are an explicit, validated opt-in."""
+    requested = os.getenv("MEDIA_BOT_ONNX_PROVIDER", "CPUExecutionProvider").strip()
+    if requested in available:
+        return [requested]
+    if "CPUExecutionProvider" in available:
+        LOGGER.warning(
+            "Requested ONNX provider %s is unavailable; using CPUExecutionProvider",
+            requested,
+        )
+        return ["CPUExecutionProvider"]
+    raise RuntimeError(f"no usable ONNX execution provider (available: {available})")
 
 
 @dataclass(frozen=True)
@@ -32,6 +47,9 @@ class WatermarkCandidate:
     confidence: float
     persistence: float
     border_score: float
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+    active_ranges: tuple[tuple[float, float], ...] = ()
 
     @property
     def box(self) -> tuple[int, int, int, int]:
@@ -54,7 +72,17 @@ class WatermarkAnalysis:
     @classmethod
     def from_json(cls, value: str) -> "WatermarkAnalysis":
         data = json.loads(value)
-        data["candidates"] = tuple(WatermarkCandidate(**item) for item in data["candidates"])
+        data["candidates"] = tuple(
+            WatermarkCandidate(
+                **{
+                    **item,
+                    "active_ranges": tuple(
+                        tuple(pair) for pair in item.get("active_ranges", ())
+                    ),
+                }
+            )
+            for item in data["candidates"]
+        )
         data["selected"] = tuple(data.get("selected", ()))
         return cls(**data)
 
@@ -68,7 +96,7 @@ def _cv2():
 
 
 def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnalysis:
-    """Find small, spatially persistent edge clusters across the middle 90%."""
+    """Find static and time-windowed edge watermarks throughout a video."""
     started = time.monotonic()
     cv2 = _cv2()
     capture = cv2.VideoCapture(str(path))
@@ -77,6 +105,7 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     if frame_count < 2 or width < 8 or height < 8:
         capture.release()
         return WatermarkAnalysis(width, height, 0, (), (), False, time.monotonic() - started)
@@ -87,22 +116,104 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
                           min(sample_count, frame_count), dtype=int)
     edges: list[np.ndarray] = []
     grays: list[np.ndarray] = []
+    positions: list[float] = []
+    sample_seconds: list[float] = []
+    tiktok_observations: list[tuple[str, tuple[int, int, int, int]] | None] = []
     for index in indices:
         capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
         ok, frame = capture.read()
         if not ok:
             continue
+        tiktok_observations.append(_detect_tiktok_watermark(frame, cv2))
         small = cv2.resize(frame, (sw, sh), interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         grays.append(gray)
         edges.append(cv2.Canny(gray, 50, 140) > 0)
+        positions.append(index / max(1, frame_count - 1))
+        sample_seconds.append(index / fps)
     capture.release()
     if len(edges) < 4:
         return WatermarkAnalysis(width, height, len(edges), (), (), False, time.monotonic() - started)
 
+    duration = frame_count / max(1.0, fps)
+    candidates = _find_candidates(edges, grays, width, height, sw, sh, cv2)
+    candidates.extend(_tiktok_candidates(
+        tiktok_observations, sample_seconds, duration,
+    ))
+    for start, end in ((0.0, .55), (.45, 1.0)):
+        selected_indices = [
+            index for index, position in enumerate(positions)
+            if start <= position <= end
+        ]
+        if len(selected_indices) < 4:
+            continue
+        window_candidates = _find_candidates(
+            [edges[index] for index in selected_indices],
+            [grays[index] for index in selected_indices],
+            width, height, sw, sh, cv2, threshold=.55,
+        )
+        candidates.extend(
+            replace(
+                candidate,
+                start_seconds=round(duration * start, 3),
+                end_seconds=round(duration * end, 3),
+            )
+            for candidate in window_candidates
+        )
+
+    candidates.sort(
+        key=lambda item: (item.start_seconds is None, item.confidence), reverse=True,
+    )
+    accepted: list[WatermarkCandidate] = []
+    for candidate in candidates:
+        overlap = next((
+            (index, other) for index, other in enumerate(accepted)
+            if _intersection_ratio(candidate.box, other.box) > .25
+        ), None)
+        if overlap:
+            index, other = overlap
+            if (
+                candidate.start_seconds is not None
+                and other.start_seconds is not None
+                and candidate.start_seconds != other.start_seconds
+            ):
+                better = candidate if candidate.confidence > other.confidence else other
+                combined_start = min(candidate.start_seconds, other.start_seconds)
+                combined_end = max(
+                    candidate.end_seconds or duration,
+                    other.end_seconds or duration,
+                )
+                covers_video = combined_start <= duration * .05 and combined_end >= duration * .95
+                accepted[index] = replace(
+                    better,
+                    start_seconds=None if covers_video else combined_start,
+                    end_seconds=None if covers_video else combined_end,
+                )
+            continue
+        if len(accepted) < 6:
+            accepted.append(candidate)
+
+    accepted.sort(key=lambda item: item.confidence, reverse=True)
+    numbered = tuple(replace(item, id=index + 1) for index, item in enumerate(accepted))
+    selected = tuple(item.id for item in numbered if item.confidence >= AUTO_ACCEPT_CONFIDENCE)
+    requires_review = bool(numbered) and len(selected) != len(numbered)
+    return WatermarkAnalysis(width, height, len(edges), numbered, selected, requires_review,
+                             round(time.monotonic() - started, 3))
+
+
+def _find_candidates(
+    edges: list[np.ndarray],
+    grays: list[np.ndarray],
+    width: int,
+    height: int,
+    sw: int,
+    sh: int,
+    cv2,
+    threshold: float = .58,
+) -> list[WatermarkCandidate]:
     edge_stack = np.stack(edges)
     persistence_map = edge_stack.mean(axis=0)
-    persistent = (persistence_map >= .58).astype(np.uint8) * 255
+    persistent = (persistence_map >= threshold).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3))
     persistent = cv2.morphologyEx(persistent, cv2.MORPH_CLOSE, kernel, iterations=2)
     persistent = cv2.dilate(persistent, kernel, iterations=2)
@@ -113,6 +224,15 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
     frame_area = sw * sh
     for component in range(1, count):
         x, y, w, h, area = (int(v) for v in stats[component])
+        # A TV corner bug often touches a full-width lower-third/ticker and is
+        # therefore returned as one oversized component. Isolate the compact
+        # upper-left brand block instead of discarding the entire component.
+        if w > sw * .45 and x < sw * .1 and y < sh * .2 and h < sh * .22:
+            x = max(x, round(sw * .05))
+            y = max(y, round(sh * .035))
+            w = min(round(sw * .22), sw - x)
+            h = min(round(sh * .07), sh - y)
+            area = int(np.count_nonzero(persistent[y:y + h, x:x + w]))
         box_area = w * h
         if area < 12 or box_area > frame_area * .08 or w > sw * .45 or h > sh * .30:
             continue
@@ -124,7 +244,7 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
         # region. Measuring the expanded background would dilute a genuinely
         # persistent logo (especially a small pill-shaped username), so score
         # only the edge pixels that formed the component.
-        persistent_core = component_persistence[component_persistence >= .58]
+        persistent_core = component_persistence[component_persistence >= threshold]
         persistence = float(persistent_core.mean()) if persistent_core.size else 0.0
         region_std = float(temporal_std[y1:y2, x1:x2].mean())
         # Static scenery has low variance but generally lacks a compact persistent
@@ -143,21 +263,7 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
             round(confidence, 3), round(persistence, 3), round(border_score, 3),
         ))
 
-    candidates.sort(key=lambda item: item.confidence, reverse=True)
-    accepted: list[WatermarkCandidate] = []
-    for candidate in candidates:
-        if len(accepted) == 3:
-            break
-        if any(_intersection_ratio(candidate.box, other.box) > .25 for other in accepted):
-            continue
-        accepted.append(candidate)
-    numbered = tuple(WatermarkCandidate(i + 1, *item.box, item.confidence,
-                                         item.persistence, item.border_score)
-                     for i, item in enumerate(accepted))
-    selected = tuple(item.id for item in numbered if item.confidence >= AUTO_ACCEPT_CONFIDENCE)
-    requires_review = bool(numbered) and len(selected) != len(numbered)
-    return WatermarkAnalysis(width, height, len(edges), numbered, selected, requires_review,
-                             round(time.monotonic() - started, 3))
+    return candidates
 
 
 def _intersection_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -169,10 +275,110 @@ def _intersection_ratio(a: tuple[int, int, int, int], b: tuple[int, int, int, in
     return overlap / area
 
 
+def _detect_tiktok_watermark(frame, cv2) -> tuple[str, tuple[int, int, int, int]] | None:
+    """Locate TikTok's distinctive cyan/red musical-note mark in one frame."""
+    height, width = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    cyan = (
+        (hsv[..., 0] >= 75) & (hsv[..., 0] <= 105)
+        & (hsv[..., 1] >= 80) & (hsv[..., 2] >= 140)
+    ).astype(np.uint8) * 255
+    count, _, stats, _ = cv2.connectedComponentsWithStats(cyan, 8)
+    options: list[tuple[int, tuple[int, int, int, int]]] = []
+    for component in range(1, count):
+        x, y, box_width, box_height, area = (int(v) for v in stats[component])
+        center_x = x + box_width / 2
+        if width * .18 < center_x < width * .82:
+            continue
+        if not (height * .012 <= box_height <= height * .16):
+            continue
+        if box_height < box_width * 1.25 or area < max(5, width * height * .000004):
+            continue
+        pad = max(5, round(box_height * .8))
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(width, x + box_width + pad), min(height, y + box_height + pad)
+        nearby = hsv[y1:y2, x1:x2]
+        red = (
+            ((nearby[..., 0] <= 12) | (nearby[..., 0] >= 170))
+            & (nearby[..., 1] >= 90) & (nearby[..., 2] >= 130)
+        )
+        white = (nearby[..., 1] <= 80) & (nearby[..., 2] >= 170)
+        if np.count_nonzero(red) < 3 or np.count_nonzero(white) < 8:
+            continue
+        # Include the "TikTok" label and @username below/beside the note, not
+        # only the colored glyph that made the location easy to identify.
+        mark_width = round(width * .22)
+        mark_height = round(height * .095)
+        mark_x = max(0, min(width - mark_width, round(center_x - mark_width / 2)))
+        mark_y = max(0, min(height - mark_height, y - round(height * .005)))
+        options.append((area, (mark_x, mark_y, mark_width, mark_height)))
+    if not options:
+        return None
+    box = max(options, key=lambda item: item[0])[1]
+    side = "left" if box[0] + box[2] / 2 < width / 2 else "right"
+    return side, box
+
+
+def _tiktok_candidates(
+    observations: list[tuple[str, tuple[int, int, int, int]] | None],
+    sample_seconds: list[float],
+    duration: float,
+) -> list[WatermarkCandidate]:
+    candidates: list[WatermarkCandidate] = []
+    for side in ("left", "right"):
+        boxes = [item[1] for item in observations if item and item[0] == side]
+        if len(boxes) < 2:
+            continue
+        values = np.asarray(boxes)
+        box = tuple(int(round(value)) for value in np.median(values, axis=0))
+        present = [bool(item and item[0] == side) for item in observations]
+        ranges = _presence_ranges(present, sample_seconds, duration)
+        if not ranges:
+            continue
+        persistence = len(boxes) / max(1, len(observations))
+        candidates.append(WatermarkCandidate(
+            id=0, x=box[0], y=box[1], width=box[2], height=box[3],
+            confidence=.92, persistence=round(persistence, 3), border_score=1.0,
+            active_ranges=tuple(ranges),
+        ))
+    return candidates
+
+
+def _presence_ranges(
+    present: list[bool], sample_seconds: list[float], duration: float,
+) -> list[tuple[float, float]]:
+    ranges: list[tuple[float, float]] = []
+    start_index: int | None = None
+    for index, is_present in enumerate([*present, False]):
+        if is_present and start_index is None:
+            start_index = index
+        elif not is_present and start_index is not None:
+            end_index = index - 1
+            start = 0.0 if start_index == 0 else (
+                sample_seconds[start_index - 1] + sample_seconds[start_index]
+            ) / 2
+            end = duration if end_index == len(present) - 1 else (
+                sample_seconds[end_index] + sample_seconds[end_index + 1]
+            ) / 2
+            ranges.append((float(round(start, 3)), float(round(end, 3))))
+            start_index = None
+    return ranges
+
+
+def candidate_active(candidate: WatermarkCandidate, seconds: float) -> bool:
+    if candidate.active_ranges:
+        return any(start <= seconds <= end for start, end in candidate.active_ranges)
+    return (
+        (candidate.start_seconds is None or seconds >= candidate.start_seconds)
+        and (candidate.end_seconds is None or seconds <= candidate.end_seconds)
+    )
+
+
 def create_preview(path: Path, analysis: WatermarkAnalysis, output: Path) -> Path:
     cv2 = _cv2()
     capture = cv2.VideoCapture(str(path))
     frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     tiles: list[np.ndarray] = []
     for index in np.linspace(frames * .15, max(frames * .15, frames * .85 - 1), 6, dtype=int):
         capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
@@ -180,6 +386,8 @@ def create_preview(path: Path, analysis: WatermarkAnalysis, output: Path) -> Pat
         if not ok:
             continue
         for candidate in analysis.candidates:
+            if not candidate_active(candidate, index / fps):
+                continue
             color = (40, 220, 40) if candidate.id in analysis.selected else (30, 180, 255)
             cv2.rectangle(frame, (candidate.x, candidate.y),
                           (candidate.x + candidate.width, candidate.y + candidate.height), color, 3)
@@ -234,7 +442,7 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
     import onnxruntime as ort
     cv2 = _cv2()
     started = time.monotonic()
-    providers = ort.get_available_providers()
+    providers = select_onnx_providers(ort.get_available_providers())
     session = ort.InferenceSession(str(model_path), providers=providers)
     inputs = session.get_inputs()
     if len(inputs) < 2:
@@ -251,8 +459,9 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
         anchor_gray = None
         anchor_result = None
         frame_index = 0
-        region_mask = np.zeros((height, width), np.uint8)
+        candidate_masks: dict[int, np.ndarray] = {}
         for candidate in candidates:
+            region_mask = np.zeros((height, width), np.uint8)
             inset_x = round(candidate.width * .06)
             inset_y = round(candidate.height * .06)
             left, top = candidate.x + inset_x, candidate.y + inset_y
@@ -268,15 +477,30 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
                 (right - radius, bottom - radius),
             ):
                 cv2.circle(region_mask, center, radius, 255, -1)
-        region_alpha = (
-            cv2.GaussianBlur(region_mask, (0, 0), 3).astype(np.float32) / 255
-        )[..., None]
+            candidate_masks[candidate.id] = region_mask
+        active_ids: tuple[int, ...] = ()
         while True:
             if time.monotonic() - started > timeout_seconds:
                 raise TimeoutError("LaMa watermark removal timed out")
             ok, frame = capture.read()
             if not ok:
                 break
+            frame_seconds = frame_index / fps
+            active_candidates = [
+                item for item in candidates
+                if candidate_active(item, frame_seconds)
+            ]
+            current_ids = tuple(item.id for item in active_candidates)
+            if current_ids != active_ids:
+                active_ids = current_ids
+                anchor_gray = None
+                anchor_result = None
+            region_mask = np.zeros((height, width), np.uint8)
+            for candidate in active_candidates:
+                region_mask = cv2.bitwise_or(region_mask, candidate_masks[candidate.id])
+            region_alpha = (
+                cv2.GaussianBlur(region_mask, (0, 0), 3).astype(np.float32) / 255
+            )[..., None]
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             scene_cut = previous_gray is not None and float(cv2.absdiff(gray, previous_gray).mean()) > 32
             is_keyframe = (
@@ -285,7 +509,7 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
                 or frame_index % keyframe_interval == 0
             )
             if is_keyframe:
-                for candidate in candidates:
+                for candidate in active_candidates:
                     frame = _inpaint_candidate(frame, candidate, session, inputs, cv2)
                 anchor_gray, anchor_result = gray.copy(), frame.copy()
             elif anchor_result is not None and anchor_gray is not None:

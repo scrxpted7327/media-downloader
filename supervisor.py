@@ -27,8 +27,27 @@ RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
 EVENTS_PATH = Path("runtime/events.jsonl")
 SUPERVISOR_LOG = Path("runtime/supervisor.log")
+RESTART_ACK = Path("runtime/restart-shutdown-notified")
 _LOCK_HANDLE = None
 _ERROR_LOG_PATTERN = re.compile(r"Error logged: (err_[A-Za-z0-9_]+)")
+_SECRET_PATTERN = re.compile(
+    r"(?i)\b(?:bot\d+:[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9_-]{16,}|"
+    r"(?:token|secret|password|api[_-]?key)\s*[=:]\s*\S+)"
+)
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+
+
+def redact_sensitive(value: str, limit: int = 5000) -> str:
+    text = _SECRET_PATTERN.sub("[REDACTED]", str(value))
+
+    def clean_url(match: re.Match[str]) -> str:
+        try:
+            parts = urllib.parse.urlsplit(match.group(0))
+            return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except ValueError:
+            return "[REDACTED_URL]"
+
+    return _URL_PATTERN.sub(clean_url, text)[:limit]
 
 
 def load_dotenv() -> None:
@@ -54,9 +73,13 @@ def _notification_chat_id() -> str | None:
     return None
 
 
-def _send_telegram_message(text: str) -> None:
+def _restart_notification_chat_id() -> str | None:
+    return os.getenv("TELEGRAM_RESTART_CHAT_ID", "").strip() or _notification_chat_id()
+
+
+def _send_telegram_message(text: str, chat_id: str | None = None) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = _notification_chat_id()
+    chat_id = chat_id or _notification_chat_id()
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_BOT_TOKEN and an error destination must be configured")
     api_base = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip().rstrip("/") or "https://api.telegram.org"
@@ -70,13 +93,38 @@ def _send_telegram_message(text: str) -> None:
             raise RuntimeError(f"Telegram returned HTTP {response.status}")
 
 
+async def notify_restart_shutdown() -> bool:
+    """Handle restart_bot.py's SIGUSR1 shutdown-notification handshake."""
+    success = False
+    try:
+        chat_id = _restart_notification_chat_id()
+        if not chat_id:
+            raise RuntimeError("a Telegram restart destination must be configured")
+        await asyncio.to_thread(
+            _send_telegram_message,
+            "🔴 MediaDL bot is shutting down for a restart…",
+            chat_id,
+        )
+        append_event("restart_shutdown_notified", "Restart shutdown notification sent")
+        success = True
+    except Exception as exc:
+        LOGGER.error("Could not send restart shutdown notification: %s", exc)
+        append_event("restart_shutdown_notification_failed", str(exc))
+    finally:
+        RESTART_ACK.parent.mkdir(parents=True, exist_ok=True)
+        RESTART_ACK.write_text("sent\n" if success else "failed\n", encoding="utf-8")
+    return success
+
+
 async def notify_error(error_id: str, path: Path | None = None) -> bool:
     path = path or ERRORS_DIR / f"{error_id}.json"
     try:
         info = json.loads(path.read_text(encoding="utf-8"))
-        message = str(info.get("message") or "Unknown bot error")
+        message = redact_sensitive(info.get("message") or "Unknown bot error", 700)
         category = str(info.get("category") or "unknown")
-        traceback_text = str(info.get("traceback") or info.get("stderr") or "")
+        traceback_text = redact_sensitive(
+            info.get("traceback") or info.get("stderr") or "", 2800,
+        )
         update = info.get("update") or {}
         report = (
             "⚠️ Bot error reported by supervisor\n"
@@ -116,7 +164,7 @@ def append_event(kind: str, message: str, **context) -> None:
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "kind": kind,
-        "message": message[:5000],
+        "message": redact_sensitive(message),
         "source": "supervisor",
         **context,
     }
@@ -132,7 +180,10 @@ async def _capture_stream(stream, name: str, output: deque[str]) -> None:
         text = line.decode("utf-8", "replace").rstrip()
         output.append(text)
         with SUPERVISOR_LOG.open("a", encoding="utf-8") as log:
-            log.write(f"{datetime.now(timezone.utc).isoformat()} {name}: {text}\n")
+            log.write(
+                f"{datetime.now(timezone.utc).isoformat()} "
+                f"{name}: {redact_sensitive(text)}\n"
+            )
         if name == "stderr" or "error" in text.lower() or "failed" in text.lower():
             append_event("process_output", text, stream=name)
         match = _ERROR_LOG_PATTERN.search(text)
@@ -191,6 +242,10 @@ async def write_error_file(error_id: str, stderr: str, category: str) -> Path:
 
 
 async def supervise(cwd: Path) -> None:
+    asyncio.get_running_loop().add_signal_handler(
+        signal.SIGUSR1,
+        lambda: asyncio.create_task(notify_restart_shutdown()),
+    )
     bot_args = [sys.executable, "-m", "media_bot"]
     crash_count = 0
     last_crash_time = 0.0

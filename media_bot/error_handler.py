@@ -11,7 +11,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from .fix_agent import ERRORS_DIR, categorize_error
-from .diagnostics import append_event
+from .diagnostics import append_event, redact_sensitive
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,8 +41,8 @@ async def error_handler(update: Update | None, context: ContextTypes.DEFAULT_TYP
     if error is None:
         return
 
-    tb_str = "".join(tb.format_exception(None, error, error.__traceback__))
-    error_msg = str(error)[:500]
+    tb_str = redact_sensitive("".join(tb.format_exception(None, error, error.__traceback__)))
+    error_msg = redact_sensitive(str(error), 500)
     error_id = f"err_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{id(error)}"
 
     update_data = None
@@ -52,7 +52,10 @@ async def error_handler(update: Update | None, context: ContextTypes.DEFAULT_TYP
                 "update_id": update.update_id,
                 "effective_user": str(update.effective_user.id) if update.effective_user else None,
                 "effective_chat": str(update.effective_chat.id) if update.effective_chat else None,
-                "effective_message": update.effective_message.text if update.effective_message and update.effective_message.text else None,
+                "effective_message_length": (
+                    len(update.effective_message.text)
+                    if update.effective_message and update.effective_message.text else 0
+                ),
             }
         except Exception:
             pass
