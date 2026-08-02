@@ -545,6 +545,9 @@ async def render_captions(
             color, style, position, video_height=video_height,
             bottom_safe_area=bottom_safe_area,
         )
+        position_override = _caption_position_override(
+            position, video_width, video_height,
+        )
         ass_header = (
             "[Script Info]\n"
             "ScriptType: v4.00+\n"
@@ -567,7 +570,8 @@ async def render_captions(
                 .replace("\n", " ")
             )
             ass_header += (
-                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{safe_text}\n"
+                f"Dialogue: 0,{start},{end},Default,,0,0,0,,"
+                f"{position_override}{safe_text}\n"
             )
 
         ass_path = Path(tmpdir.name) / "captions.ass"
@@ -597,7 +601,9 @@ async def render_captions(
             raise DownloadError("caption_text is required when auto_captions is off")
         from .colors import resolve_drawtext_color
         font_color = resolve_drawtext_color(color, "white")
-        if style == "bold":
+        if style == "small":
+            fontsize, borderw, shadow = "12", "2", "1"
+        elif style == "bold":
             fontsize, borderw, shadow = "24", "3", "2"
         elif style == "bubble":
             fontsize, borderw, shadow = "20", "4", "3"
@@ -612,7 +618,11 @@ async def render_captions(
             "middle": "(h-text_h)/2",
             "high": "h-text_h-20",
         }
-        y_expr = position_map.get(position.lower(), "h-text_h-20")
+        position_key = position.lower()
+        if len(position_key) == 3 and position_key.startswith("y") and position_key[1:].isdigit():
+            y_expr = f"h*{int(position_key[1:]) / 100:.2f}-text_h/2"
+        else:
+            y_expr = position_map.get(position_key, "h-text_h-20")
         safe_text = caption_text.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")
         box_param = ":box=1:boxcolor=black@0.5" if style == "filled" else ""
         drawtext = (
@@ -650,6 +660,7 @@ def _build_ass_style(
 ) -> dict:
     from .colors import resolve_ass_color
     style_map = {
+        "small": {"fontsize": 12, "bold": 1, "borderstyle": 1, "outline": 2, "shadow": 1},
         "bold": {"fontsize": 24, "bold": 1, "borderstyle": 1, "outline": 3, "shadow": 2},
         "bubble": {"fontsize": 20, "bold": 0, "borderstyle": 3, "outline": 4, "shadow": 3},
         "border": {"fontsize": 18, "bold": 0, "borderstyle": 1, "outline": 3, "shadow": 1},
@@ -657,16 +668,27 @@ def _build_ass_style(
     }
     default = {"fontsize": 18, "bold": 0, "borderstyle": 1, "outline": 2, "shadow": 1}
     s = dict(style_map.get(style.lower(), default))
-    s["fontsize"] = max(16, round(s["fontsize"] * max(.8, video_height / 720)))
+    s["fontsize"] = max(12, round(s["fontsize"] * max(.8, video_height / 720)))
     s.setdefault("backcolour", "&H00000000")
     align_map = {"low": 8, "middle": 5, "high": 2}
-    s["alignment"] = align_map.get(position.lower(), 2)
+    position_key = position.lower()
+    is_exact = len(position_key) == 3 and position_key.startswith("y") and position_key[1:].isdigit()
+    s["alignment"] = 5 if is_exact else align_map.get(position_key, 2)
     s["margin_v"] = (
         max(10, round(video_height * bottom_safe_area) + 10)
         if s["alignment"] in (1, 2, 3) else 10
     )
     s["color"] = resolve_ass_color(color)
     return s
+
+
+def _caption_position_override(position: str, width: int, height: int) -> str:
+    """Return an ASS override for an exact percentage-based caption centerline."""
+    key = position.lower()
+    if len(key) != 3 or not key.startswith("y") or not key[1:].isdigit():
+        return ""
+    percent = max(0, min(100, int(key[1:])))
+    return f"{{\\an5\\pos({width // 2},{round(height * percent / 100)})}}"
 
 
 async def render_voice_over(
