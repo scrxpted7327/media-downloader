@@ -11,7 +11,7 @@ audio, then `ffmpeg` to render the video.
 
 ## Setup
 
-1. Use Python 3.10+ and install the application dependency:
+1. Use Python 3.11+ and install the application dependencies:
 
    ```sh
    python3 -m venv .venv
@@ -29,10 +29,12 @@ audio, then `ffmpeg` to render the video.
    python3 -m media_bot
    ```
 
-On first start the bot downloads the platform-appropriate `yt-dlp` executable
+When no verified cache exists, the bot downloads the platform-appropriate `yt-dlp` executable
 to `MEDIA_BOT_TOOLS_DIR` (by default a per-user application-data directory).
 No downloader binary is bundled with this project. The release checksum is
 downloaded from the same official yt-dlp release and verified before use.
+Later restarts reuse that verified binary, including while offline. Set
+`YTDLP_VERSION` when an operator wants startup to require a particular release.
 
 `ffmpeg` is optional for ordinary downloads, but required for TikTok photo
 posts and for merging some separate audio/video streams. Install it using your
@@ -40,7 +42,8 @@ OS package manager (`brew install ffmpeg`, `apt install ffmpeg`, etc.). The bot
 detects it and tells the operator when it is missing; it does not silently
 package or execute an unverified ffmpeg build.
 
-Automatic watermark removal samples the middle 90% of a video for persistent
+Watermark removal is opt-in and new presets keep the original video by default.
+When enabled, automatic detection samples the middle 90% of a video for persistent
 logos or text. Confident regions render immediately; uncertain regions are
 shown as numbered Telegram buttons and remain reviewable after a bot restart.
 The pinned Apache-2.0 LaMa ONNX model is downloaded lazily to
@@ -89,6 +92,13 @@ Downloads and renders use bounded worker queues with global and per-user
 capacity limits. Work interrupted by a restart is marked failed explicitly
 rather than remaining stuck in an active state.
 
+Use `/queue` to see your queued/running job IDs and
+`/canceljob download:<id>` or `/canceljob render:<id>` to request cancellation.
+Pool saves are durable copies: source retention, Reset, and `/delete` do not
+invalidate media explicitly saved in the Pool.
+Shared preset codes can be imported from Settings; another user's private
+banner asset is intentionally omitted from the imported copy.
+
 The default download timeout is one hour, and the default Telegram upload write
 timeout is 15 minutes. The default 47 MiB source limit leaves headroom below
 Telegram's 50 MB public Bot API upload limit. A local Bot API server is required
@@ -120,6 +130,12 @@ raw text. Diagnostic reports redact common credentials and URL query strings
 and include only the reporting user's events plus explicitly marked global
 health events.
 
+`TELEGRAM_ALLOWED_USER_IDS` is also the default operator/admin allowlist. Set
+`TELEGRAM_ADMIN_USER_IDS` only when a narrower admin set is needed. `/report`
+always writes a diagnostic ticket and never executes code. Repair execution is
+admin-only and disabled unless `MEDIA_BOT_ENABLE_REPAIR=true`; inferred Python
+packages are never installed automatically.
+
 Only download media you are authorized to access and use, and comply with the
 source platform's terms and applicable law.
 
@@ -133,3 +149,8 @@ The repository's `restart_bot.py` coordinates with `supervisor.py` before
 restarting the stack. Deployment and live Telegram acceptance testing are
 separate operator actions; local unit tests do not prove the Inspiron service is
 ready.
+
+The embedded loopback HTTP service exposes `/healthz` for a local service
+manager or reverse proxy. Diagnostic event and supervisor logs rotate with
+bounded backups, and download-token request paths are excluded from access
+logging.

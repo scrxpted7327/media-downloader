@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,11 +25,21 @@ class DownloadServerTests(unittest.IsolatedAsyncioTestCase):
         self.storage.mkdir()
         self.db_path = root / "media.db"
         await init_db(self.db_path)
+        self.access_logger = logging.getLogger("aiohttp.access")
+        self.access_logger_was_disabled = self.access_logger.disabled
+        self.access_logger.disabled = True
+        self.addCleanup(
+            setattr,
+            self.access_logger,
+            "disabled",
+            self.access_logger_was_disabled,
+        )
         self.client = TestClient(TestServer(create_download_app(self.db_path, self.storage)))
         await self.client.start_server()
 
     async def asyncTearDown(self):
         await self.client.close()
+        self.access_logger.disabled = self.access_logger_was_disabled
         self.temporary.cleanup()
 
     async def test_source_download_is_one_time_and_binary(self):
@@ -46,6 +57,30 @@ class DownloadServerTests(unittest.IsolatedAsyncioTestCase):
 
         reused = await self.client.get(f"/download/{token}")
         self.assertEqual(reused.status, 403)
+
+    async def test_healthz_reports_minimal_database_and_storage_readiness(self):
+        response = await self.client.get("/healthz")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"status": "ok"})
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    async def test_healthz_fails_closed_without_storage(self):
+        unavailable = self.storage.with_name("jobs-unavailable")
+        self.storage.rename(unavailable)
+
+        response = await self.client.get("/healthz")
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(await response.json(), {"status": "unhealthy"})
+
+    async def test_healthz_fails_closed_for_a_corrupt_database(self):
+        self.db_path.write_bytes(b"not a sqlite database")
+
+        response = await self.client.get("/healthz")
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(await response.json(), {"status": "unhealthy"})
 
     async def test_rendered_edit_download(self):
         source = self.storage / "source.mp4"

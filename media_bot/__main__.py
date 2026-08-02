@@ -11,11 +11,10 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-import aiosqlite
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import RetryAfter, TimedOut
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -43,12 +42,17 @@ from .downloader import (
     read_source_metadata,
 )
 from .download_server import create_download_app
-from .diagnostics import append_event, install_event_logging, recent_events, redact_sensitive
+from .diagnostics import (
+    append_event,
+    install_event_logging,
+    recent_events,
+    redact_sensitive,
+    write_redacted_json,
+)
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
 from .fix_agent import (
     ERRORS_DIR,
-    FIX_SCRIPTS_DIR,
     apply_known_fix,
     categorize_error,
     invoke_opencode_fix,
@@ -76,26 +80,28 @@ from .settings_ui import (
 )
 from .storage import (
     cleanup_download_messages,
+    cleanup_edit_artifacts,
     cleanup_expired_tokens,
     cleanup_old_jobs,
-    consume_download_token,
+    create_durable_pool_item,
     create_download_token,
     create_edit_job,
     create_job,
-    create_pool_item,
     create_preset,
-    delete_pool_item,
-    get_edit_job,
+    delete_durable_pool_item,
+    delete_job_with_artifacts,
+    foreign_key_violations,
     get_job,
     get_saved_edit_pool_item,
     get_saved_source_pool_item,
     init_db,
     list_all_jobs,
     list_presets,
-    list_source_jobs_for_user,
     list_user_jobs,
     mark_download_message_deleted,
+    open_database,
     reconcile_interrupted_work,
+    reset_source_edits,
     stage_edit_source,
     store_download_message,
     update_edit_job,
@@ -103,7 +109,7 @@ from .storage import (
 )
 from .tools import prefer_ffmpeg_full, provision_ytdlp
 from .watermark import WatermarkAnalysis, analyze_video, create_preview
-from .work_queue import WorkQueue, WorkRejected
+from .work_queue import WorkAlreadyQueued, WorkQueue, WorkRejected
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -113,6 +119,7 @@ install_event_logging()
 RESTART_MARKER = Path("runtime/restart-requested")
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
 FLOW_TTL_SECONDS = 15 * 60
+STARTED_MONOTONIC = time.monotonic()
 
 HELP_TEXT = (
     "Commands:\n"
@@ -121,15 +128,17 @@ HELP_TEXT = (
     "/settings - video presets and customization\n"
     "/presets - list and manage presets\n"
     "/tiktokaccount <username> [50|all] - download a TikTok account archive\n"
-    "/pool - manage video pool and workflows\n"
+    "/pool - manage saved videos and classifications\n"
     "/jobs - list your recent downloads\n"
     "/editconfig - set options for the current edit job\n"
     "/delete <job_id> - delete a downloaded file\n"
     "/cleanup - delete bot status messages from recent jobs\n"
     "/voices - list available TTS voices\n"
-    "/fix [provider/model] - run the AI repair agent for bot errors\n"
-    "/status - bot error status and health\n\n"
-    "/report <issue> - send recent activity and errors to the AI repair agent\n\n"
+    "/queue - show your queued and running work\n"
+    "/canceljob <download|render>:<id> - cancel queued or running work\n"
+    "/report <issue> - save a diagnostic ticket for the operator\n"
+    "/skip - skip the current optional input\n"
+    "/cancel - cancel the current interactive flow\n\n"
     "Send a YouTube, Instagram, TikTok, or Facebook link anywhere in a message. "
     "The bot downloads the first supported link it finds and provides a secure download link."
 )
@@ -283,6 +292,12 @@ def _authorized(update: Update, settings: Settings) -> bool:
     if chat.type == "channel":
         return chat.id in settings.allowed_chat_ids
     return bool(user and user.id in settings.allowed_user_ids) or chat.id in settings.allowed_chat_ids
+
+
+def _admin_authorized(update: Update, settings: Settings) -> bool:
+    """Admin rights are always user-bound; an allowed group is not enough."""
+    user = update.effective_user
+    return bool(user and user.id in settings.admin_user_ids)
 
 
 async def _download_actions_keyboard(
@@ -442,10 +457,18 @@ async def _message_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await handle_url(update, context)
 
 
-def _bind_flow_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _bind_flow_context(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, owner: str,
+) -> None:
     chat = update.effective_chat
     if chat is None:
         return
+    if owner == "settings":
+        context.user_data.pop("pool_flow", None)
+    elif owner == "pool":
+        context.user_data.pop("settings_flow", None)
+    else:
+        raise ValueError(f"unknown flow owner: {owner}")
     context.user_data["_flow_chat_id"] = chat.id
     context.user_data["_flow_expires_at"] = time.monotonic() + FLOW_TTL_SECONDS
 
@@ -481,7 +504,7 @@ async def _handle_active_input(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     field_name = settings_flow.get("field_name") if isinstance(settings_flow, dict) else None
     settings_text_actions = {
-        "preset_create_name", "preset_create_voice", "preset_create_voice_text",
+        "preset_create_name", "preset_import_code", "preset_create_voice", "preset_create_voice_text",
         "preset_create_voice_speed", "preset_create_banner", "preset_edit_field",
         "set_profile_banner",
     }
@@ -541,7 +564,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     text = message.text or message.caption or ""
     urls = extract_supported_urls(text)
     if not urls:
-        await message.reply_text("Send one supported YouTube, Instagram, TikTok, or Facebook URL.")
+        chat = update.effective_chat
+        if chat is not None and chat.type == "private":
+            await message.reply_text(
+                "Send one supported YouTube, Instagram, TikTok, or Facebook URL."
+            )
         return
 
     work: WorkQueue = context.application.bot_data["download_work"]
@@ -570,9 +597,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             results.append(f"#{job.id}: REJECTED")
 
     if len(urls) > 1:
-        lines = [f"Processed {len(results)}/{len(urls)} URLs:"]
+        lines = [f"Queued {len(results)}/{len(urls)} URLs:"]
         for r in results:
             lines.append(f"  {r}")
+        if len(urls) > 8:
+            lines.append("Only the first 8 URLs were accepted; send the remainder separately.")
         await message.reply_text("\n".join(lines))
 
 
@@ -595,6 +624,7 @@ async def _process_single_url(
             temporary, media = await download_instagram(
                 gallerydl, url, settings.max_filesize_mb, settings.timeout_seconds,
                 DownloadReporter(status).progress,
+                ytdlp=ytdlp,
             )
         else:
             try:
@@ -683,13 +713,13 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         saved = await get_saved_edit_pool_item(db_path, current_user_id, edit.id)
         if action == "editsave":
             if saved is None:
-                saved = await create_pool_item(
+                saved = await create_durable_pool_item(
                     db_path,
+                    storage_dir,
                     current_user_id,
-                    edit.file_path,
+                    Path(edit.file_path),
                     source_job_id=edit.source_job_id,
                     edit_job_id=edit.id,
-                    file_size=edit.file_size,
                     title=f"Edit #{edit.id}",
                 )
             await query.answer("Saved to pool")
@@ -714,7 +744,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
         if action == "editunsave":
             if saved is not None:
-                await delete_pool_item(db_path, saved.id, current_user_id)
+                await delete_durable_pool_item(
+                    db_path, storage_dir, saved.id, current_user_id,
+                )
             await query.answer("Removed from pool")
             await query.edit_message_reply_markup(
                 reply_markup=_render_pool_keyboard(edit.id, saved=False)
@@ -738,13 +770,13 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "poolsave":
         saved = await get_saved_source_pool_item(db_path, current_user_id, job.id)
         if saved is None:
-            await create_pool_item(
+            await create_durable_pool_item(
                 db_path,
+                storage_dir,
                 current_user_id,
-                job.file_path,
+                Path(job.file_path),
                 source_job_id=job.id,
-                file_size=job.file_size,
-                thumbnail_path=job.thumbnail_path,
+                thumbnail_file=Path(job.thumbnail_path) if job.thumbnail_path else None,
                 title=job.title or f"Original #{job.id}",
             )
         await query.answer("Original saved to pool")
@@ -772,7 +804,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if action == "poolremove":
         saved = await get_saved_source_pool_item(db_path, current_user_id, job.id)
         if saved is not None:
-            await delete_pool_item(db_path, saved.id, current_user_id)
+            await delete_durable_pool_item(
+                db_path, storage_dir, saved.id, current_user_id,
+            )
         await query.answer("Original removed from pool")
         await query.edit_message_reply_markup(
             reply_markup=await _download_actions_keyboard(job.id, db_path, current_user_id)
@@ -838,12 +872,13 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         dest = storage_dir / f"edit-{edit.id}-{source_path.name}"
         file_size = await stage_edit_source(source_path, dest)
         await update_edit_job(db_path, edit.id, file_path=str(dest), file_size=file_size)
+        _clear_flow_context(context)
         context.user_data["settings_flow"] = {
             "action": "editconfig",
             "edit_id": edit.id,
             "source_job_id": job_id,
         }
-        _bind_flow_context(update, context)
+        _bind_flow_context(update, context, owner="settings")
         await show_editconfig_menu(
             update,
             context,
@@ -854,14 +889,17 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "reset":
         await query.answer()
-        async with aiosqlite.connect(db_path) as db:
-            await db.execute("DELETE FROM edit_jobs WHERE source_job_id = ? AND user_id = ? AND status IN ('pending', 'rendered')", (job_id, current_user_id))
-            await db.commit()
+        result = await reset_source_edits(
+            db_path, storage_dir, job_id, current_user_id,
+        )
         flow = context.user_data.get("settings_flow")
         flow_action = flow.get("action") if isinstance(flow, dict) else getattr(flow, "action", None)
         if flow_action == "editconfig":
             context.user_data.pop("settings_flow", None)
-        await _edit_message(query, "Edit config reset for this download.")
+        await _edit_message(
+            query,
+            f"Edit config reset for this download ({result.records_deleted} removed).",
+        )
         return
 
     if action == "preset":
@@ -952,9 +990,9 @@ async def tiktok_account_command(update: Update, context: ContextTypes.DEFAULT_T
     limit: int | None = 50
     if len(args) > 1:
         if args[1].lower() == "all":
-            if not settings.allow_mass_download_all:
+            if not settings.allow_mass_download_all or not _admin_authorized(update, settings):
                 await message.reply_text(
-                    "Whole-account downloads are disabled by the operator. "
+                    "Whole-account downloads are restricted to operators and currently enabled admins. "
                     "Choose a limit from 1 to 500."
                 )
                 return
@@ -1065,7 +1103,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if message is None or not _authorized(update, settings):
         LOGGER.warning("Rejected help request for unapproved chat/user")
         return
-    await message.reply_text(HELP_TEXT)
+    help_text = HELP_TEXT
+    if _admin_authorized(update, settings):
+        repair_state = "enabled" if settings.repair_enabled else "disabled"
+        help_text += (
+            "\n\nOperator commands:\n"
+            "/status - service health and repair status\n"
+            "/fix [provider/model] - run approved repairs "
+            f"(currently {repair_state})"
+        )
+    await message.reply_text(help_text)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1078,8 +1125,9 @@ async def settings_command_entry(update: Update, context: ContextTypes.DEFAULT_T
     if message is None or not _authorized(update, settings):
         LOGGER.warning("Rejected settings request for unapproved chat/user")
         return
+    _clear_flow_context(context)
     await settings_command(update, context)
-    _bind_flow_context(update, context)
+    _bind_flow_context(update, context, owner="settings")
 
 
 async def presets_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1088,8 +1136,9 @@ async def presets_command_entry(update: Update, context: ContextTypes.DEFAULT_TY
     if message is None or not _authorized(update, settings):
         LOGGER.warning("Rejected presets request for unapproved chat/user")
         return
+    _clear_flow_context(context)
     await presets_command(update, context)
-    _bind_flow_context(update, context)
+    _bind_flow_context(update, context, owner="settings")
 
 
 async def pool_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1098,9 +1147,10 @@ async def pool_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if message is None or not _authorized(update, settings):
         LOGGER.warning("Rejected pool request for unapproved chat/user")
         return
+    _clear_flow_context(context)
     from .pool_ui import pool_command
     await pool_command(update, context)
-    _bind_flow_context(update, context)
+    _bind_flow_context(update, context, owner="pool")
 
 
 async def settings_callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1114,7 +1164,7 @@ async def settings_callback_entry(update: Update, context: ContextTypes.DEFAULT_
     if result is not None and result[0] == "render":
         await _enqueue_render(update, context, result[1])
     if "settings_flow" in context.user_data:
-        _bind_flow_context(update, context)
+        _bind_flow_context(update, context, owner="settings")
 
 
 async def pool_callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1127,7 +1177,7 @@ async def pool_callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
     from .pool_ui import pool_callback
     await pool_callback(update, context)
     if "pool_flow" in context.user_data:
-        _bind_flow_context(update, context)
+        _bind_flow_context(update, context, owner="pool")
 
 
 async def settings_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1139,14 +1189,26 @@ async def settings_text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route /skip through whichever text-input flow is currently active."""
-    if await settings_text_entry(update, context):
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    if message is None or not _authorized(update, settings):
         return
-    if await pool_text_entry(update, context):
+    if not _flow_is_current(update, context):
+        await message.reply_text("There is no active input to skip in this chat.")
         return
-    if await editconfig_text(update, context):
-        return
-    if update.effective_message:
-        await update.effective_message.reply_text("There is no active input to skip.")
+    settings_flow = context.user_data.get("settings_flow")
+    action = (
+        settings_flow.get("action") if isinstance(settings_flow, dict)
+        else getattr(settings_flow, "action", None)
+    )
+    if action == "editconfig":
+        handled = await editconfig_text(update, context)
+    elif settings_flow is not None:
+        handled = await settings_text_entry(update, context)
+    else:
+        handled = await pool_text_entry(update, context)
+    if not handled:
+        await message.reply_text("The current input cannot be skipped.")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1183,6 +1245,9 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     show_all = context.args and context.args[0].lower() in ("all", "--all", "-a")
 
     if show_all:
+        if not _admin_authorized(update, settings):
+            await message.reply_text("Browsing all users' downloads is admin-only.")
+            return
         jobs = await list_all_jobs(settings.db_path, limit=30)
         if not jobs:
             await message.reply_text("No downloads yet.")
@@ -1206,7 +1271,7 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         jobs = await list_user_jobs(settings.db_path, user.id, limit=10)
         if not jobs:
-            await message.reply_text("No downloads yet. Use `/jobs all` to browse community downloads.")
+            await message.reply_text("No downloads yet. Send a supported media URL to start one.")
             return
         lines = ["Your recent downloads:"]
         for job in jobs:
@@ -1216,6 +1281,97 @@ async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             size = f"{job.file_size / 1024 / 1024:.1f} MB" if job.file_size else "unknown size"
             lines.append(f"[{status_label}] Job #{job.id}: {job.url[:60]}... ({size})")
     await message.reply_text("\n".join(lines))
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or not _authorized(update, settings):
+        return
+    download_work: WorkQueue = context.application.bot_data["download_work"]
+    render_work: WorkQueue = context.application.bot_data["render_work"]
+    lines = [
+        "⏳ Your work queue",
+        f"Downloads queued/running: {download_work.pending_for_user(user.id)}",
+        f"Renders queued/running: {render_work.pending_for_user(user.id)}",
+    ]
+    items = (
+        download_work.items_for_user(user.id)
+        + render_work.items_for_user(user.id)
+    )
+    if items:
+        lines.extend(["", *(f"• {label} — {state}" for label, state in items)])
+    else:
+        lines.extend(["", "No queued or running work."])
+    if _admin_authorized(update, settings):
+        lines.extend([
+            "",
+            f"Global downloads: active={download_work.active}, queued={download_work.queued}",
+            f"Global renders: active={render_work.active}, queued={render_work.queued}",
+        ])
+    lines.append("Use /canceljob download:<id> or /canceljob render:<id> to cancel work.")
+    await message.reply_text("\n".join(lines))
+
+
+async def cancel_job_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings: Settings = context.application.bot_data["settings"]
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None or not _authorized(update, settings):
+        return
+    value = context.args[0].strip().lower() if len(context.args or []) == 1 else ""
+    if ":" not in value:
+        await message.reply_text("Usage: /canceljob <download|render>:<id>")
+        return
+    kind, raw_id = value.split(":", 1)
+    if kind not in {"download", "render"} or not raw_id.isdigit():
+        await message.reply_text("Usage: /canceljob <download|render>:<id>")
+        return
+    item_id = int(raw_id)
+    db_path: Path = context.application.bot_data["db_path"]
+
+    if kind == "render":
+        try:
+            edit = await require_owned_edit(db_path, item_id, user.id)
+        except ResourceNotFound:
+            await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+            return
+        work: WorkQueue = context.application.bot_data["render_work"]
+        label = f"render:{item_id}"
+        was_active = work.is_active(label)
+        cancelled = work.cancel(user_id=user.id, label=label)
+        if cancelled:
+            await update_edit_job(
+                db_path, edit.id, status="failed", error_message="cancelled by user",
+            )
+            if not was_active:
+                await cleanup_edit_artifacts(
+                    db_path,
+                    context.application.bot_data["storage_dir"],
+                    edit.id,
+                    user_id=user.id,
+                    preserve_output=False,
+                )
+    else:
+        try:
+            job = await require_owned_job(db_path, item_id, user.id)
+        except ResourceNotFound:
+            await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
+            return
+        work = context.application.bot_data["download_work"]
+        cancelled = work.cancel(user_id=user.id, label=f"download:{item_id}")
+        if not cancelled:
+            cancelled = work.cancel(user_id=user.id, label=f"tiktok-account:{item_id}")
+        if cancelled:
+            await update_job(
+                db_path, job.id, status="failed", error_message="cancelled by user",
+            )
+
+    if cancelled:
+        await message.reply_text(f"Cancellation requested for {kind} #{item_id}.")
+    else:
+        await message.reply_text(f"{kind.title()} #{item_id} is not queued or running.")
 
 
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1231,17 +1387,22 @@ async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     job_id = int(context.args[0])
-    job = await get_job(settings.db_path, job_id)
+    db_path: Path = context.application.bot_data["db_path"]
+    storage_dir: Path = context.application.bot_data["storage_dir"]
+    job = await get_job(db_path, job_id)
     if job is None or job.user_id != user.id:
         await message.reply_text("Job not found or not authorized.")
         return
 
-    if job.file_path:
-        path = Path(job.file_path)
-        if path.is_file():
-            path.unlink(missing_ok=True)
-    await update_job(settings.db_path, job_id, status="deleted", file_path=None)
-    await message.reply_text(f"Job #{job_id} deleted.")
+    result = await delete_job_with_artifacts(
+        db_path, storage_dir, job_id, user_id=user.id,
+    )
+    detail = f" Removed {result.files_deleted} file(s)."
+    if result.files_preserved:
+        detail += " Saved Pool copies were preserved."
+    if result.unsafe_paths:
+        detail += " One or more outside-storage paths were left untouched for safety."
+    await message.reply_text(f"Job #{job_id} deleted.{detail}")
 
 
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1287,12 +1448,13 @@ async def editconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await message.reply_text("No pending edit job. Use /settings -> Edit Existing Video first.")
         return
     edit_id, source_job_id = edit_jobs
+    _clear_flow_context(context)
     context.user_data["settings_flow"] = {
         "action": "editconfig",
         "edit_id": edit_id,
         "source_job_id": source_job_id,
     }
-    _bind_flow_context(update, context)
+    _bind_flow_context(update, context, owner="settings")
     await show_editconfig_menu(update, context, edit_id)
 
 
@@ -1306,7 +1468,7 @@ async def editconfig_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     result = await handle_editconfig_callback(update, context)
     if "settings_flow" in context.user_data:
-        _bind_flow_context(update, context)
+        _bind_flow_context(update, context, owner="settings")
     if isinstance(result, tuple) and result[0] == "render":
         await _enqueue_render(update, context, result[1])
     elif isinstance(result, tuple) and result[0] == "download":
@@ -1376,6 +1538,11 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await show_editconfig_menu(update, context, edit_id)
         return True
     value = None if text.lower() == "/skip" else text
+    if field == "banner_path" and value is not None:
+        await update.message.reply_text(
+            "Send the banner as a Telegram photo, or use /skip to clear it."
+        )
+        return True
     if field == "auto_captions":
         if text.lower() in ("yes", "y", "on", "true", "1"):
             value = True
@@ -1416,8 +1583,7 @@ async def editconfig_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _get_latest_pending_edit(db_path: Path, user_id: int) -> tuple[int, int] | None:
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
+    async with open_database(db_path) as db:
         async with db.execute(
             "SELECT id, source_job_id FROM edit_jobs WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
             (user_id,),
@@ -1504,24 +1670,34 @@ async def _enqueue_render(
         return False
     db_path: Path = context.application.bot_data["db_path"]
     try:
-        await require_owned_edit(db_path, edit_id, user.id)
+        edit = await require_owned_edit(db_path, edit_id, user.id)
     except ResourceNotFound:
         await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
         return False
-    await update_edit_job(db_path, edit_id, status="queued", error_message=None)
     work: WorkQueue = context.application.bot_data["render_work"]
+    label = f"render:{edit_id}"
+    if edit.status in {"queued", "rendering", "awaiting_watermark_review"}:
+        await message.reply_text(f"Render #{edit_id} is already {edit.status.replace('_', ' ')}.")
+        return False
+    if edit.status == "rendered":
+        await message.reply_text(f"Render #{edit_id} is already complete.")
+        return False
     try:
         work.submit(
             user_id=user.id,
-            label=f"render:{edit_id}",
+            label=label,
             factory=lambda: _render_edit_job(update, context, edit_id),
         )
+    except WorkAlreadyQueued:
+        await message.reply_text(f"Render #{edit_id} is already queued or running.")
+        return False
     except WorkRejected as exc:
         await update_edit_job(
             db_path, edit_id, status="failed", error_message=str(exc),
         )
         await message.reply_text(f"❌ Render not queued: {exc}")
         return False
+    await update_edit_job(db_path, edit_id, status="queued", error_message=None)
     return True
 
 
@@ -1542,10 +1718,37 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         await update.effective_message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
         return
 
-    await update_edit_job(db_path, edit.id, status="rendering", error_message=None)
-    msg = await update.effective_message.reply_text("🎬 Preparing render...")
+    msg = None
     out_path = storage_dir / f"edit-{edit.id}-final.mp4"
+
+    async def fail_render(reason: str, user_text: str) -> None:
+        try:
+            await update_edit_job(
+                db_path, edit.id, status="failed", error_message=reason,
+            )
+        except Exception:
+            LOGGER.exception("Could not persist failure for render %s", edit.id)
+        try:
+            await cleanup_edit_artifacts(
+                db_path,
+                storage_dir,
+                edit.id,
+                user_id=edit.user_id,
+                preserve_output=False,
+            )
+        except Exception:
+            LOGGER.exception("Could not clean failed render %s", edit.id)
+        if msg is not None:
+            await _safe_status_edit(msg, user_text)
+        else:
+            try:
+                await update.effective_message.reply_text(user_text)
+            except Exception:
+                LOGGER.exception("Could not report failure for render %s", edit.id)
+
     try:
+        await update_edit_job(db_path, edit.id, status="rendering", error_message=None)
+        msg = await update.effective_message.reply_text("🎬 Preparing render...")
         preset = None
         if edit.preset_id:
             from .storage import list_presets
@@ -1691,11 +1894,27 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                 f"rendered output exceeds the configured "
                 f"{settings.max_filesize_mb} MB size limit"
             )
+    except asyncio.CancelledError:
+        await fail_render("Render cancelled by user.", "⏹ Render cancelled.")
+        raise
     except DownloadError as exc:
-        await update_edit_job(db_path, edit.id, status="failed", error_message=str(exc))
-        await msg.edit_text(f"❌ Render failed: {exc}")
+        await fail_render(str(exc), f"❌ Render failed: {exc}")
+        return
+    except Exception as exc:
+        LOGGER.exception("Unexpected render failure for edit %s", edit.id)
+        await fail_render(str(exc), "❌ Render failed unexpectedly. The error was recorded.")
         return
     await update_edit_job(db_path, edit.id, status="rendered", file_path=str(out_path), file_size=out_path.stat().st_size, subtitles_path=subtitles_path)
+    try:
+        await cleanup_edit_artifacts(
+            db_path,
+            storage_dir,
+            edit.id,
+            user_id=edit.user_id,
+            preserve_output=True,
+        )
+    except Exception:
+        LOGGER.exception("Could not clean intermediate artifacts for render %s", edit.id)
     fallback_note = (
         "\n⚠️ LaMa was unavailable; adaptive FFmpeg removal was used."
         if getattr(reporter, "watermark_fallback_used", False) else ""
@@ -1739,7 +1958,13 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     message = update.effective_message
-    if message is None or not _authorized(update, settings):
+    if message is None or not _admin_authorized(update, settings):
+        return
+    if not settings.repair_enabled:
+        await message.reply_text(
+            "AI repair execution is disabled. Set MEDIA_BOT_ENABLE_REPAIR=true "
+            "and restart the bot to enable it for admins."
+        )
         return
     user = update.effective_user
     if user is None:
@@ -1771,12 +1996,18 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             continue
         category = categorize_error(error_info.get("message", ""))
         error_info["category"] = category
-        fix_result = await apply_known_fix(error_info, settings.tools_dir)
+        fix_result = await apply_known_fix(
+            error_info,
+            settings.tools_dir,
+            repair_enabled=settings.repair_enabled,
+        )
         if category == "unknown":
             workspace = Path.cwd()
             script_path = await invoke_opencode_fix(error_info, workspace, model=model)
             if script_path:
-                code, output = await run_fix_script(script_path)
+                code, output = await run_fix_script(
+                    script_path, repair_enabled=settings.repair_enabled,
+                )
                 append_event(
                     "fix_agent",
                     output[-5000:],
@@ -1804,7 +2035,7 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     message = update.effective_message
-    if message is None or not _authorized(update, settings):
+    if message is None or not _admin_authorized(update, settings):
         return
 
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1814,8 +2045,51 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     failed = sum(1 for ef in error_files if ef.name.startswith("failed_"))
     unfixed = sum(1 for ef in error_files if ef.name.startswith("unfixed_"))
 
+    db_health = "unavailable"
+    fk_violations: int | str = "unknown"
+    job_states: list[str] = []
+    try:
+        async with open_database(settings.db_path) as db:
+            async with db.execute("PRAGMA quick_check") as cursor:
+                row = await cursor.fetchone()
+                db_health = str(row[0]) if row else "unknown"
+            async with db.execute(
+                "SELECT status, count(*) FROM jobs GROUP BY status ORDER BY status"
+            ) as cursor:
+                job_states = [f"{state}={count}" for state, count in await cursor.fetchall()]
+        fk_violations = len(await foreign_key_violations(settings.db_path))
+    except Exception as exc:
+        LOGGER.warning("Status database check failed: %s", exc)
+
+    try:
+        usage = shutil.disk_usage(settings.storage_dir)
+        disk_line = (
+            f"Disk: {usage.free / 1024 ** 3:.1f} GiB free of "
+            f"{usage.total / 1024 ** 3:.1f} GiB"
+        )
+    except OSError:
+        disk_line = "Disk: unavailable"
+
+    download_work: WorkQueue | None = context.application.bot_data.get("download_work")
+    render_work: WorkQueue | None = context.application.bot_data.get("render_work")
+    uptime = _format_duration(time.monotonic() - STARTED_MONOTONIC)
+
     lines = [
-        "🤖 Bot Status",
+        "🤖 Operator Status",
+        f"Uptime: {uptime}",
+        f"Database: {db_health}; foreign-key violations={fk_violations}",
+        f"Jobs: {', '.join(job_states) if job_states else 'none'}",
+        (
+            f"Download queue: active={download_work.active}, queued={download_work.queued}"
+            if download_work else "Download queue: unavailable"
+        ),
+        (
+            f"Render queue: active={render_work.active}, queued={render_work.queued}"
+            if render_work else "Render queue: unavailable"
+        ),
+        disk_line,
+        f"AI repair execution: {'enabled' if settings.repair_enabled else 'disabled'}",
+        "",
         f"Pending errors: {pending}",
         f"Auto-fixed: {fixed}",
         f"Fix failed: {failed}",
@@ -1861,7 +2135,9 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     events = recent_events(user_id=user.id, limit=100)
-    report_id = f"report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{user.id}"
+    report_id = (
+        f"report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_{user.id}"
+    )
     report = {
         "id": report_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1873,53 +2149,13 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     }
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     report_path = ERRORS_DIR / f"{report_id}.json"
-    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    write_redacted_json(report_path, report)
     append_event("user_report", issue, report_id=report_id, user_id=user.id)
 
-    error_info = {
-        "id": report_id,
-        "message": issue,
-        "category": categorize_error(issue),
-        "traceback": json.dumps(events, indent=2, default=str),
-    }
-    script_path = await invoke_opencode_fix(error_info, Path.cwd())
-    if not script_path:
-        await message.reply_text(f"⚠️ Report {report_id} saved, but the AI handoff could not be created.")
-        return
-
     await message.reply_text(
-        f"🤖 Report {report_id} saved with {len(events)} recent events and handed to the AI agent."
+        f"✅ Report {report_id} saved for operator review with "
+        f"{len(events)} recent events. No code was executed."
     )
-
-    async def _run_report_agent() -> None:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "/usr/bin/env", "bash", script_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=900)
-            output = (stdout + stderr).decode("utf-8", "replace")
-            append_event(
-                "report_agent",
-                output[-5000:],
-                report_id=report_id,
-                exit_code=process.returncode,
-                user_id=user.id,
-            )
-            result = "completed" if process.returncode == 0 else f"failed (exit {process.returncode})"
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                text=f"🤖 AI report {report_id} {result}.",
-            )
-        except Exception as exc:
-            append_event("report_agent_error", str(exc), report_id=report_id, user_id=user.id)
-            await context.bot.send_message(
-                chat_id=message.chat_id,
-                text=f"⚠️ AI report {report_id} failed: {exc}",
-            )
-
-    asyncio.create_task(_run_report_agent())
 
 
 async def cleanup_task(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1972,7 +2208,9 @@ async def _post_init(application: Application) -> None:
     storage_dir: Path = application.bot_data["storage_dir"]
 
     app = create_download_app(db_path, storage_dir)
-    runner = web.AppRunner(app)
+    # Download URLs contain bearer tokens; aiohttp's default access log would
+    # persist the full request target. Handler logs use token-free identifiers.
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, settings.download_bind_host, settings.download_port)
     await site.start()
@@ -2074,6 +2312,8 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(pool_callback_entry, pattern=r"^pool:"))
     application.add_handler(CallbackQueryHandler(pool_callback_entry, pattern=r"^workflow:"))
     application.add_handler(CommandHandler("jobs", jobs_command))
+    application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CommandHandler("canceljob", cancel_job_command))
     application.add_handler(CommandHandler("delete", delete_command))
     application.add_handler(CommandHandler("cleanup", cleanup_command))
     application.add_handler(CommandHandler("editconfig", editconfig_command))

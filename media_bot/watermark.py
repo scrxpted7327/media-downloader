@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import tempfile
 import time
 import urllib.request
@@ -406,7 +405,12 @@ def create_preview(path: Path, analysis: WatermarkAnalysis, output: Path) -> Pat
     return output
 
 
-def provision_lama_model(tools_dir: Path, opener: Callable[..., Any] = urllib.request.urlopen) -> Path:
+def provision_lama_model(
+    tools_dir: Path,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+    *,
+    cancel_event: Any | None = None,
+) -> Path:
     target = tools_dir / "lama_fp32.onnx"
     if target.is_file() and _sha256(target) == LAMA_MODEL_SHA256:
         return target
@@ -417,7 +421,13 @@ def provision_lama_model(tools_dir: Path, opener: Callable[..., Any] = urllib.re
         temporary = Path(stream.name)
         try:
             with opener(LAMA_MODEL_URL, timeout=120) as response:
-                shutil.copyfileobj(response, stream)
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("LaMa model download cancelled")
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    stream.write(chunk)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
@@ -436,14 +446,22 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def inpaint_video(input_path: Path, output_path: Path, candidates: list[WatermarkCandidate],
-                  model_path: Path, timeout_seconds: int = 600) -> tuple[str, float]:
+def inpaint_video(
+    input_path: Path,
+    output_path: Path,
+    candidates: list[WatermarkCandidate],
+    model_path: Path,
+    timeout_seconds: int = 600,
+    cancel_event: Any | None = None,
+) -> tuple[str, float]:
     """Inpaint 512px crops, stabilize them with flow, then remux original audio."""
     import onnxruntime as ort
     cv2 = _cv2()
     started = time.monotonic()
     providers = select_onnx_providers(ort.get_available_providers())
     session = ort.InferenceSession(str(model_path), providers=providers)
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("LaMa watermark removal cancelled")
     inputs = session.get_inputs()
     if len(inputs) < 2:
         raise RuntimeError("LaMa ONNX model does not expose image and mask inputs")
@@ -479,9 +497,14 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
                 cv2.circle(region_mask, center, radius, 255, -1)
             candidate_masks[candidate.id] = region_mask
         active_ids: tuple[int, ...] = ()
+        stop_error: Exception | None = None
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                stop_error = InterruptedError("LaMa watermark removal cancelled")
+                break
             if time.monotonic() - started > timeout_seconds:
-                raise TimeoutError("LaMa watermark removal timed out")
+                stop_error = TimeoutError("LaMa watermark removal timed out")
+                break
             ok, frame = capture.read()
             if not ok:
                 break
@@ -560,13 +583,57 @@ def inpaint_video(input_path: Path, output_path: Path, candidates: list[Watermar
             frame_index += 1
         capture.release()
         writer.release()
+        if stop_error is not None:
+            raise stop_error
         if not silent.is_file() or silent.stat().st_size == 0:
             raise RuntimeError("LaMa produced no video")
         import subprocess
         command = ["ffmpeg", "-y", "-i", str(silent), "-i", str(input_path), "-map", "0:v:0",
                    "-map", "1:a?", "-c:v", "copy", "-c:a", "copy", "-shortest",
                    "-movflags", "+faststart", str(output_path)]
-        subprocess.run(command, check=True, capture_output=True, timeout=timeout_seconds)
+        # A file-backed stderr sink cannot fill and deadlock a long remux while
+        # this synchronous worker polls for cancellation.
+        with tempfile.TemporaryFile() as error_stream:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=error_stream,
+                start_new_session=(os.name == "posix"),
+            )
+            deadline = time.monotonic() + max(
+                1.0, timeout_seconds - (time.monotonic() - started),
+            )
+            try:
+                while process.poll() is None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise InterruptedError("LaMa watermark removal cancelled")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("LaMa audio remux timed out")
+                    time.sleep(0.1)
+                if process.returncode:
+                    error_stream.seek(0)
+                    stderr = error_stream.read(64 * 1024)
+                    raise subprocess.CalledProcessError(
+                        process.returncode, command, stderr=stderr,
+                    )
+            except BaseException:
+                if process.poll() is None:
+                    try:
+                        if os.name == "posix":
+                            os.killpg(process.pid, 15)
+                        else:
+                            process.terminate()
+                        process.wait(timeout=3)
+                    except (OSError, subprocess.TimeoutExpired):
+                        try:
+                            if os.name == "posix":
+                                os.killpg(process.pid, 9)
+                            else:
+                                process.kill()
+                        except OSError:
+                            pass
+                        process.wait()
+                raise
     return providers[0] if providers else "CPUExecutionProvider", time.monotonic() - started
 
 

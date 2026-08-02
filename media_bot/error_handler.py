@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import traceback as tb
 from datetime import datetime, timezone
@@ -11,7 +10,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from .fix_agent import ERRORS_DIR, categorize_error
-from .diagnostics import append_event, redact_sensitive
+from .diagnostics import append_event, redact_sensitive, write_redacted_json
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,7 +31,7 @@ def write_error_log(
         "update": update_data,
     }
     path = ERRORS_DIR / f"{error_id}.json"
-    path.write_text(json.dumps(error_info, indent=2, default=str), encoding="utf-8")
+    write_redacted_json(path, error_info)
     return path
 
 

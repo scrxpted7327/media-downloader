@@ -46,6 +46,34 @@ class SettingsTests(unittest.TestCase):
             settings = Settings.from_environment()
         self.assertEqual(settings.download_public_origin, "https://media.example.test")
 
+    def test_allowed_users_are_admins_when_admin_list_is_not_configured(self):
+        with self._environment(TELEGRAM_ALLOWED_USER_IDS="1, 2"):
+            settings = Settings.from_environment()
+
+        self.assertEqual(settings.admin_user_ids, frozenset({1, 2}))
+
+    def test_explicit_admin_list_overrides_allowed_user_fallback(self):
+        with self._environment(
+            TELEGRAM_ALLOWED_USER_IDS="1, 2",
+            TELEGRAM_ADMIN_USER_IDS="2",
+        ):
+            settings = Settings.from_environment()
+
+        self.assertEqual(settings.admin_user_ids, frozenset({2}))
+
+    def test_repair_is_disabled_by_default_and_requires_a_valid_boolean(self):
+        with self._environment():
+            settings = Settings.from_environment()
+        self.assertFalse(settings.repair_enabled)
+
+        with self._environment(MEDIA_BOT_ENABLE_REPAIR="yes"):
+            settings = Settings.from_environment()
+        self.assertTrue(settings.repair_enabled)
+
+        with self._environment(MEDIA_BOT_ENABLE_REPAIR="sometimes"):
+            with self.assertRaisesRegex(ValueError, "MEDIA_BOT_ENABLE_REPAIR"):
+                Settings.from_environment()
+
 
 if __name__ == "__main__":
     unittest.main()

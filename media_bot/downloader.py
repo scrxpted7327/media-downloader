@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -30,6 +31,10 @@ _IMAGE_SUFFIXES = {".avif", ".jpeg", ".jpg", ".png", ".webp"}
 _VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv"}
 LOGGER = logging.getLogger(__name__)
 
+_MIB = 1024 * 1024
+_MAX_DOWNLOAD_WORK_FILES = 1024
+_MAX_ACCOUNT_WORK_FILES = 12_000
+
 _VIDEO_ENCODER: str | None = None
 
 def _detect_video_encoder() -> str:
@@ -42,7 +47,7 @@ def _detect_video_encoder() -> str:
              "-c:v", "libx264", "-t", "1", "-f", "null", "-"],
             capture_output=True, timeout=10,
         )
-        if result.returncode == 0 or b"Unknown encoder" not in result.stderr:
+        if result.returncode == 0:
             _VIDEO_ENCODER = "libx264"
             return _VIDEO_ENCODER
     except (OSError, subprocess.TimeoutExpired):
@@ -60,9 +65,7 @@ def _detect_video_encoder() -> str:
                 return _VIDEO_ENCODER
         except (OSError, subprocess.TimeoutExpired):
             pass
-    _VIDEO_ENCODER = "mpeg4"
-    LOGGER.warning("No hardware encoder found, falling back to mpeg4")
-    return _VIDEO_ENCODER
+    raise DownloadError("ffmpeg has no supported video encoder available")
 
 
 def download_progress(line: bytes) -> int | None:
@@ -84,33 +87,48 @@ async def _read_stream(
         output.append(line)
         progress = download_progress(line)
         if progress is not None and progress_callback is not None:
-            await progress_callback(progress)
+            try:
+                await progress_callback(progress)
+            except Exception as exc:
+                # A cosmetic progress update must not stop pipe draining and
+                # deadlock a downloader with a full stdout/stderr buffer.
+                LOGGER.warning("Could not report download progress: %s", exc)
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     """Terminate a subprocess group, escalating to kill after a short grace."""
-    if process.returncode is not None:
-        return
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
+    if process.returncode is None:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
         else:
-            process.terminate()
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=3)
-        return
-    except asyncio.TimeoutError:
-        pass
-    try:
-        if os.name == "posix":
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                pass
+
+    if os.name == "posix":
+        # The group leader can exit while a child ignores SIGTERM. Probe the
+        # dedicated session and kill any descendants which remain.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        try:
             os.killpg(process.pid, signal.SIGKILL)
-        else:
+        except ProcessLookupError:
+            return
+    elif process.returncode is None:
+        try:
             process.kill()
-    except ProcessLookupError:
-        return
-    await process.wait()
+        except ProcessLookupError:
+            return
+    if process.returncode is None:
+        await process.wait()
 
 
 def _enforce_size(path: Path, max_filesize_mb: int, label: str = "download") -> None:
@@ -121,20 +139,43 @@ def _enforce_size(path: Path, max_filesize_mb: int, label: str = "download") -> 
         )
 
 
-async def _monitor_directory_size(path: Path, maximum_bytes: int) -> None:
-    """Abort a producer once its working tree crosses a hard byte ceiling."""
-    while True:
-        total = 0
+def _working_tree_limits(maximum_mb: int) -> tuple[int, int]:
+    """Allow merge/metadata overhead while retaining a firm temporary cap."""
+    return max(16 * _MIB, maximum_mb * 4 * _MIB + 16 * _MIB), _MAX_DOWNLOAD_WORK_FILES
+
+
+def _check_directory_limits(
+    path: Path, maximum_bytes: int, maximum_files: int,
+) -> None:
+    total = 0
+    count = 0
+    for candidate in path.rglob("*"):
         try:
-            for candidate in path.rglob("*"):
-                if candidate.is_file() and not candidate.is_symlink():
-                    total += candidate.stat().st_size
-                    if total > maximum_bytes:
-                        raise DownloadError(
-                            "download working data exceeds the configured size limit"
-                        )
+            if candidate.is_file() and not candidate.is_symlink():
+                count += 1
+                if count > maximum_files:
+                    raise DownloadError(
+                        "download working data exceeds the configured file-count limit"
+                    )
+                total += candidate.stat().st_size
+                if total > maximum_bytes:
+                    raise DownloadError(
+                        "download working data exceeds the configured size limit"
+                    )
         except FileNotFoundError:
-            pass
+            # Producers can atomically rename individual fragments; continue
+            # checking every other entry rather than accepting a partial scan.
+            continue
+
+
+async def _monitor_directory_size(
+    path: Path, maximum_bytes: int, maximum_files: int = _MAX_DOWNLOAD_WORK_FILES,
+) -> None:
+    """Abort a producer once its working tree crosses hard byte/file ceilings."""
+    while True:
+        await asyncio.to_thread(
+            _check_directory_limits, path, maximum_bytes, maximum_files,
+        )
         await asyncio.sleep(0.25)
 
 
@@ -147,8 +188,11 @@ async def download_media(
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     temporary = tempfile.TemporaryDirectory(prefix="media-bot-")
     directory = Path(temporary.name)
-    process = None
+    process: asyncio.subprocess.Process | None = None
     readers: tuple[asyncio.Task[None], ...] = ()
+    process_wait: asyncio.Task[int] | None = None
+    monitor: asyncio.Task[None] | None = None
+    maximum_bytes, maximum_files = _working_tree_limits(max_filesize_mb)
     command = [
         str(ytdlp), "--no-playlist", "--no-config", "--restrict-filenames", "--max-filesize", f"{max_filesize_mb}M",
         "--socket-timeout", "30", "--retries", "2", "--concurrent-fragments", "4", "--newline",
@@ -157,6 +201,18 @@ async def download_media(
         "--output", str(directory / "%(title).120B-%(id)s.%(ext)s"),
         "--print", "after_move:filepath", "--", url,
     ]
+    async def _abort() -> None:
+        auxiliary = [task for task in (process_wait, monitor) if task is not None]
+        for task in auxiliary:
+            if not task.done():
+                task.cancel()
+        if process is not None:
+            await _terminate_process(process)
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(*readers, *auxiliary, return_exceptions=True)
+
     try:
         process = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -168,19 +224,35 @@ async def download_media(
             asyncio.create_task(_read_stream(process.stdout, stdout_lines)),
             asyncio.create_task(_read_stream(process.stderr, stderr_lines, progress_callback)),
         )
-        await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
-        await asyncio.gather(*readers)
+        process_wait = asyncio.create_task(
+            asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+        )
+        monitor = asyncio.create_task(
+            _monitor_directory_size(directory, maximum_bytes, maximum_files)
+        )
+        done, _ = await asyncio.wait(
+            (process_wait, monitor), return_when=asyncio.FIRST_COMPLETED,
+        )
+        if monitor in done:
+            await monitor
+        await process_wait
+        # A fast producer can finish between monitor intervals. Always perform
+        # one final scan before accepting its output.
+        await asyncio.to_thread(
+            _check_directory_limits, directory, maximum_bytes, maximum_files,
+        )
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
     except asyncio.CancelledError:
-        if process is not None:
-            await _terminate_process(process)
-        await asyncio.gather(*readers, return_exceptions=True)
+        await _abort()
         temporary.cleanup()
         raise
-    except (OSError, asyncio.TimeoutError) as exc:
-        if process is not None:
-            await _terminate_process(process)
-        await asyncio.gather(*readers, return_exceptions=True)
+    except Exception as exc:
+        await _abort()
         temporary.cleanup()
+        if isinstance(exc, DownloadError):
+            raise
         raise DownloadError(
             f"downloader failed or timed out for {url[:100]} (timeout={timeout_seconds}s, max_size={max_filesize_mb}MB)"
         ) from exc
@@ -197,7 +269,9 @@ async def download_media(
     if result.suffix.lower() == ".webm":
         LOGGER.info("Only .webm available; converting %s to .mp4", result.name)
         try:
-            result = await _convert_to_mp4(result, timeout_seconds)
+            result = await _convert_to_mp4(
+                result, timeout_seconds, max_filesize_mb,
+            )
         except DownloadError:
             temporary.cleanup()
             raise
@@ -249,9 +323,26 @@ async def _run_checked(
     timeout_seconds: int,
     error: str,
     *,
-    working_dir_limit: tuple[Path, int] | None = None,
+    working_dir_limit: tuple[Path, int] | tuple[Path, int, int] | None = None,
 ) -> tuple[bytes, bytes]:
     cmd_preview = " ".join(str(c) for c in command[:4]) + " …"
+    process: asyncio.subprocess.Process | None = None
+    process_wait: asyncio.Task[int] | None = None
+    monitor: asyncio.Task[None] | None = None
+    readers: tuple[asyncio.Task[None], ...] = ()
+
+    async def _abort() -> None:
+        auxiliary = [task for task in (process_wait, monitor) if task is not None]
+        for task in auxiliary:
+            if not task.done():
+                task.cancel()
+        if process is not None:
+            await _terminate_process(process)
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(*readers, *auxiliary, return_exceptions=True)
+
     try:
         process = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -279,41 +370,25 @@ async def _run_checked(
             if monitor in done:
                 await monitor
             await process_wait
+            if len(working_dir_limit) == 2:
+                limit_args = (*working_dir_limit, _MAX_DOWNLOAD_WORK_FILES)
+            else:
+                limit_args = working_dir_limit
+            # Catch producers which finish between the monitor's polling ticks.
+            await asyncio.to_thread(_check_directory_limits, *limit_args)
             monitor.cancel()
             await asyncio.gather(monitor, return_exceptions=True)
-        await asyncio.gather(*readers)
+        await asyncio.wait_for(asyncio.gather(*readers), timeout=5)
         stdout, stderr = b"".join(stdout_lines), b"".join(stderr_lines)
     except asyncio.CancelledError:
-        if "process" in locals():
-            await _terminate_process(process)
-        if "process_wait" in locals() and not process_wait.done():
-            process_wait.cancel()
-        if "monitor" in locals() and monitor is not None and not monitor.done():
-            monitor.cancel()
-        if "readers" in locals():
-            await asyncio.gather(*readers, return_exceptions=True)
-        auxiliary = [
-            task for task in (
-                locals().get("process_wait"),
-                locals().get("monitor"),
-            )
-            if task is not None
-        ]
-        if auxiliary:
-            await asyncio.gather(*auxiliary, return_exceptions=True)
+        await _abort()
         raise
-    except (OSError, asyncio.TimeoutError, DownloadError) as exc:
-        if "process" in locals():
-            await _terminate_process(process)
-        if "process_wait" in locals() and not process_wait.done():
-            process_wait.cancel()
-        if "monitor" in locals() and monitor is not None and not monitor.done():
-            monitor.cancel()
-        if "readers" in locals():
-            await asyncio.gather(*readers, return_exceptions=True)
+    except Exception as exc:
+        await _abort()
         if isinstance(exc, DownloadError):
             raise
         raise DownloadError(f"{error} (timeout={timeout_seconds}s, cmd={cmd_preview})") from exc
+    assert process is not None
     if process.returncode != 0:
         detail = stderr.decode("utf-8", "replace").strip().splitlines()[-3:] or [error]
         msg = "; ".join(detail)[:600]
@@ -321,7 +396,9 @@ async def _run_checked(
     return stdout, stderr
 
 
-async def _convert_to_mp4(path: Path, timeout_seconds: int) -> Path:
+async def _convert_to_mp4(
+    path: Path, timeout_seconds: int, max_filesize_mb: int | None = None,
+) -> Path:
     """Convert a .webm video file to .mp4 using ffmpeg."""
     if shutil.which("ffmpeg") is None:
         raise DownloadError(f"ffmpeg is required to convert {path.name}")
@@ -332,7 +409,13 @@ async def _convert_to_mp4(path: Path, timeout_seconds: int) -> Path:
          "-movflags", "+faststart", str(output)],
         timeout_seconds,
         f"failed to convert {path.name} to mp4",
+        working_dir_limit=(
+            (path.parent, *_working_tree_limits(max_filesize_mb))
+            if max_filesize_mb is not None else None
+        ),
     )
+    if max_filesize_mb is not None:
+        _enforce_size(output, max_filesize_mb, "converted download")
     path.unlink(missing_ok=True)
     return output
 
@@ -372,6 +455,7 @@ async def download_tiktok_slideshow(
 
     temporary = tempfile.TemporaryDirectory(prefix="media-bot-tiktok-")
     directory = Path(temporary.name)
+    maximum_bytes, maximum_files = _working_tree_limits(max_filesize_mb)
     try:
         if progress_callback is not None:
             await progress_callback(0)
@@ -382,6 +466,7 @@ async def download_tiktok_slideshow(
             ],
             timeout_seconds,
             f"TikTok slide download failed for {url[:80]}",
+            working_dir_limit=(directory, maximum_bytes, maximum_files),
         )
         images = sorted(path for path in directory.iterdir() if path.suffix.lower() in _IMAGE_SUFFIXES)
         videos = [path for path in directory.iterdir() if path.suffix.lower() in _VIDEO_SUFFIXES]
@@ -403,7 +488,9 @@ async def download_tiktok_slideshow(
                 raise DownloadError(f"TikTok download exceeds the configured {max_filesize_mb} MB size limit")
             if result.suffix.lower() == ".webm":
                 LOGGER.info("TikTok gallery-dl returned .webm; converting %s to .mp4", result.name)
-                result = await _convert_to_mp4(result, timeout_seconds)
+                result = await _convert_to_mp4(
+                    result, timeout_seconds, max_filesize_mb,
+                )
             _enforce_size(result, max_filesize_mb, "TikTok download")
             return temporary, result
 
@@ -445,10 +532,17 @@ async def download_tiktok_account(
         command.extend(["--post-range", f"1-{post_limit}"])
     command.append(profile_url)
     try:
+        account_file_limit = min(
+            _MAX_ACCOUNT_WORK_FILES,
+            max(2_000, (post_limit or 500) * 20),
+        )
+        account_working_bytes = max_archive_mb * _MIB + max(
+            16 * _MIB, max_archive_mb * _MIB // 4,
+        )
         await _run_checked(
             command, timeout_seconds,
             f"TikTok account download failed for {profile_url[:80]}",
-            working_dir_limit=(downloads, max_archive_mb * 1024 * 1024),
+            working_dir_limit=(downloads, account_working_bytes, account_file_limit),
         )
         media = sorted(
             path for path in downloads.rglob("*")
@@ -465,9 +559,14 @@ async def download_tiktok_account(
             )
         account = re.sub(r"[^A-Za-z0-9_.-]+", "_", profile_url.rstrip("/").split("/")[-1]) or "account"
         archive = root / f"tiktok-{account.lstrip('@')}.zip"
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED, allowZip64=True) as bundle:
-            for path in media:
-                bundle.write(path, path.relative_to(downloads))
+        await asyncio.to_thread(
+            _write_zip_atomic,
+            archive,
+            [(path, str(path.relative_to(downloads))) for path in media],
+            zipfile.ZIP_STORED,
+            max_archive_mb * _MIB,
+            "TikTok account archive",
+        )
         if not archive.is_file() or archive.stat().st_size == 0:
             raise DownloadError("TikTok account archive creation failed")
         _enforce_size(archive, max_archive_mb, "TikTok account archive")
@@ -502,6 +601,7 @@ async def _render_tiktok_video(
         ],
         timeout_seconds,
         f"TikTok slide video rendering failed for {directory.name}",
+        working_dir_limit=(directory, *_working_tree_limits(max_filesize_mb)),
     )
     if not output.is_file():
         raise DownloadError("TikTok slide video rendering produced no file")
@@ -510,14 +610,57 @@ async def _render_tiktok_video(
     return temporary, output
 
 
+def _write_zip_atomic(
+    destination: Path,
+    entries: list[tuple[Path, str]],
+    compression: int,
+    maximum_bytes: int,
+    label: str,
+) -> None:
+    """Build a bounded ZIP beside its destination, then publish it atomically."""
+    partial = destination.with_name(f".{destination.name}.part")
+    partial.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(
+            partial, "w", compression, allowZip64=True,
+        ) as bundle:
+            for source, archive_name in entries:
+                bundle.write(source, archive_name)
+                if partial.stat().st_size > maximum_bytes:
+                    raise DownloadError(
+                        f"{label} exceeds the configured {maximum_bytes // _MIB} MB size limit"
+                    )
+        if not partial.is_file() or partial.stat().st_size == 0:
+            raise DownloadError(f"{label} creation failed")
+        if partial.stat().st_size > maximum_bytes:
+            raise DownloadError(
+                f"{label} exceeds the configured {maximum_bytes // _MIB} MB size limit"
+            )
+        os.replace(partial, destination)
+    except DownloadError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise DownloadError(f"{label} creation failed: {exc}") from exc
+    finally:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError as exc:
+            LOGGER.warning("Could not remove ZIP staging file %s: %s", partial, exc)
+
+
 async def _package_tiktok_zip(
     directory: Path, images: list[Path], max_filesize_mb: int,
     temporary: tempfile.TemporaryDirectory[str],
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     zip_path = directory / "tiktok-slides.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for img in images:
-            zf.write(img, img.name)
+    await asyncio.to_thread(
+        _write_zip_atomic,
+        zip_path,
+        [(image, image.name) for image in images],
+        zipfile.ZIP_DEFLATED,
+        max_filesize_mb * _MIB,
+        "ZIP archive",
+    )
     if not zip_path.is_file():
         raise DownloadError("ZIP creation failed")
     if zip_path.stat().st_size > max_filesize_mb * 1024 * 1024:
@@ -531,6 +674,7 @@ async def download_instagram(
     max_filesize_mb: int,
     timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
+    ytdlp: Path | None = None,
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     """Download an Instagram Reel/download using gallery-dl, falling back to yt-dlp."""
     if not gallerydl.is_file() or not os.access(gallerydl, os.X_OK):
@@ -538,6 +682,7 @@ async def download_instagram(
 
     temporary = tempfile.TemporaryDirectory(prefix="media-bot-instagram-")
     directory = Path(temporary.name)
+    maximum_bytes, maximum_files = _working_tree_limits(max_filesize_mb)
     try:
         if progress_callback is not None:
             await progress_callback(0)
@@ -548,6 +693,7 @@ async def download_instagram(
             ],
             timeout_seconds,
             "Instagram download failed or timed out",
+            working_dir_limit=(directory, maximum_bytes, maximum_files),
         )
         videos = [p for p in directory.iterdir() if p.suffix.lower() in _VIDEO_SUFFIXES]
         if videos:
@@ -572,7 +718,9 @@ async def download_instagram(
         err_text = str(exc).lower()
         if "redirect to login" in err_text or "login" in err_text or "authentication" in err_text:
             LOGGER.warning("gallery-dl requires login for Instagram, falling back to yt-dlp for %s", url)
-            return await _download_instagram_ytdlp(url, max_filesize_mb, timeout_seconds, progress_callback)
+            return await _download_instagram_ytdlp(
+                url, max_filesize_mb, timeout_seconds, progress_callback, ytdlp,
+            )
         raise
     except Exception as exc:
         temporary.cleanup()
@@ -581,7 +729,9 @@ async def download_instagram(
     if result.suffix.lower() == ".webm":
         LOGGER.info("Instagram returned .webm; converting %s to .mp4", result.name)
         try:
-            result = await _convert_to_mp4(result, timeout_seconds)
+            result = await _convert_to_mp4(
+                result, timeout_seconds, max_filesize_mb,
+            )
         except DownloadError:
             temporary.cleanup()
             raise
@@ -594,23 +744,105 @@ async def _download_instagram_ytdlp(
     max_filesize_mb: int,
     timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
+    ytdlp: Path | None = None,
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     """Fallback: download Instagram using yt-dlp."""
-    ytdlp = Path(sys.executable).with_name("yt-dlp")
-    if not ytdlp.is_file():
-        ytdlp = Path(shutil.which("yt-dlp") or sys.executable)
-    if not ytdlp.is_file() or not os.access(ytdlp, os.X_OK):
+    candidates = (
+        [ytdlp]
+        if ytdlp is not None
+        else [
+            Path(sys.executable).with_name("yt-dlp"),
+            Path(found) if (found := shutil.which("yt-dlp")) else None,
+        ]
+    )
+    executable = next((
+        candidate for candidate in candidates
+        if candidate is not None
+        and candidate.is_file()
+        and os.access(candidate, os.X_OK)
+        and not os.path.samefile(candidate, sys.executable)
+    ), None)
+    if executable is None:
         raise DownloadError(f"yt-dlp is required as fallback for Instagram ({url[:80]})")
-    return await download_media(ytdlp, url, max_filesize_mb, timeout_seconds, progress_callback)
+    return await download_media(
+        executable, url, max_filesize_mb, timeout_seconds, progress_callback,
+    )
 
 
-async def persist_download(temp_path: Path, job_id: int, storage_dir: Path) -> Path:
-    """Move a downloaded file to persistent job storage."""
+def _persist_download_sync(temp_path: Path, job_id: int, storage_dir: Path) -> Path:
     storage_dir.mkdir(parents=True, exist_ok=True)
     if temp_path.is_symlink() or not temp_path.is_file():
         raise DownloadError("download result is not a regular file")
     dest = storage_dir / f"{job_id}-{temp_path.name}"
     if dest.exists():
         raise DownloadError(f"persistent destination already exists for job {job_id}")
-    shutil.move(str(temp_path), str(dest))
+
+    # A hard link publishes the complete file without a copy or overwrite
+    # window when temporary and persistent storage share a filesystem.
+    try:
+        os.link(temp_path, dest, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise DownloadError(
+            f"persistent destination already exists for job {job_id}"
+        ) from exc
+    except OSError as exc:
+        fallback_errors = {
+            errno.EXDEV, errno.EPERM, errno.EACCES,
+            getattr(errno, "ENOTSUP", -1), getattr(errno, "ENOSYS", -1),
+        }
+        if exc.errno not in fallback_errors:
+            raise DownloadError(f"could not persist download for job {job_id}: {exc}") from exc
+
+        descriptor, partial_name = tempfile.mkstemp(
+            prefix=f".{dest.name}.", suffix=".part", dir=storage_dir,
+        )
+        os.close(descriptor)
+        partial = Path(partial_name)
+        try:
+            try:
+                shutil.copy2(temp_path, partial)
+                with partial.open("rb") as copied:
+                    os.fsync(copied.fileno())
+                if dest.exists():
+                    raise DownloadError(
+                        f"persistent destination already exists for job {job_id}"
+                    )
+                try:
+                    os.link(partial, dest, follow_symlinks=False)
+                except FileExistsError as link_exc:
+                    raise DownloadError(
+                        f"persistent destination already exists for job {job_id}"
+                    ) from link_exc
+                except OSError:
+                    # Some cross-device/network filesystems do not support hard
+                    # links. os.replace still prevents a partially copied result.
+                    if dest.exists():
+                        raise DownloadError(
+                            f"persistent destination already exists for job {job_id}"
+                        )
+                    os.replace(partial, dest)
+            except DownloadError:
+                raise
+            except OSError as persist_exc:
+                raise DownloadError(
+                    f"could not persist download for job {job_id}: {persist_exc}"
+                ) from persist_exc
+        finally:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                LOGGER.warning("Could not remove persistence staging file %s: %s", partial, cleanup_exc)
+    try:
+        temp_path.unlink()
+    except OSError as exc:
+        # Persistence succeeded; leaving the recoverable temporary copy is
+        # preferable to removing the durable destination.
+        LOGGER.warning("Could not remove persisted temporary file %s: %s", temp_path, exc)
     return dest
+
+
+async def persist_download(temp_path: Path, job_id: int, storage_dir: Path) -> Path:
+    """Move a downloaded file to persistent job storage without blocking asyncio."""
+    return await asyncio.to_thread(
+        _persist_download_sync, temp_path, job_id, storage_dir,
+    )

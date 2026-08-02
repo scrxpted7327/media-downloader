@@ -8,10 +8,13 @@ from unittest.mock import AsyncMock, patch
 from media_bot.downloader import (
     DownloadError,
     _enforce_size,
+    _download_instagram_ytdlp,
     _run_checked,
+    _write_zip_atomic,
     download_progress,
     download_tiktok_account,
     download_tiktok_slideshow,
+    persist_download,
     read_source_metadata,
 )
 
@@ -72,6 +75,133 @@ class DownloadProgressTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_checked_process_enforces_fast_producer_file_ceiling(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaisesRegex(DownloadError, "file-count"):
+                    await _run_checked(
+                        [
+                            __import__("sys").executable,
+                            "-c",
+                            (
+                                "import pathlib,sys; root=pathlib.Path(sys.argv[1]); "
+                                "[(root / f'part-{i}').write_bytes(b'x') for i in range(4)]"
+                            ),
+                            str(root),
+                        ],
+                        10,
+                        "test producer failed",
+                        working_dir_limit=(root, 1024, 3),
+                    )
+
+        asyncio.run(run())
+
+    def test_checked_process_enforces_fast_producer_byte_ceiling(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with self.assertRaisesRegex(DownloadError, "size limit"):
+                    await _run_checked(
+                        [
+                            __import__("sys").executable,
+                            "-c",
+                            "import pathlib,sys; (pathlib.Path(sys.argv[1]) / 'part').write_bytes(b'x' * 2048)",
+                            str(root),
+                        ],
+                        10,
+                        "test producer failed",
+                        working_dir_limit=(root, 1024, 10),
+                    )
+
+        asyncio.run(run())
+
+    def test_persist_download_is_atomic_and_removes_source(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source" / "clip.mp4"
+                source.parent.mkdir()
+                source.write_bytes(b"complete-video")
+                destination = await persist_download(source, 42, root / "storage")
+                self.assertEqual(destination.read_bytes(), b"complete-video")
+                self.assertFalse(source.exists())
+                self.assertFalse(list(destination.parent.glob("*.part")))
+
+        asyncio.run(run())
+
+    def test_persist_download_refuses_to_overwrite_existing_job_file(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "clip.mp4"
+                source.write_bytes(b"new")
+                storage = root / "storage"
+                storage.mkdir()
+                existing = storage / "42-clip.mp4"
+                existing.write_bytes(b"old")
+                with self.assertRaisesRegex(DownloadError, "already exists"):
+                    await persist_download(source, 42, storage)
+                self.assertEqual(existing.read_bytes(), b"old")
+                self.assertEqual(source.read_bytes(), b"new")
+
+        asyncio.run(run())
+
+    def test_atomic_zip_removes_partial_output_when_limit_is_exceeded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "image.jpg"
+            source.write_bytes(b"not-compressible-enough")
+            destination = root / "slides.zip"
+            with self.assertRaisesRegex(DownloadError, "size limit"):
+                _write_zip_atomic(
+                    destination,
+                    [(source, source.name)],
+                    __import__("zipfile").ZIP_STORED,
+                    1,
+                    "test ZIP",
+                )
+            self.assertFalse(destination.exists())
+            self.assertFalse((root / ".slides.zip.part").exists())
+
+    def test_instagram_fallback_never_substitutes_python_for_ytdlp(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_python = Path(tmp) / "python"
+                fake_python.write_bytes(b"python")
+                with (
+                    patch("media_bot.downloader.sys.executable", str(fake_python)),
+                    patch("media_bot.downloader.shutil.which", return_value=None),
+                    patch("media_bot.downloader.download_media", new=AsyncMock()) as download,
+                ):
+                    with self.assertRaisesRegex(DownloadError, "yt-dlp is required"):
+                        await _download_instagram_ytdlp(
+                            "https://instagram.com/reel/example", 50, 30,
+                        )
+                download.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_instagram_fallback_uses_provisioned_ytdlp(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                ytdlp = Path(tmp) / "yt-dlp"
+                ytdlp.write_text("#!/bin/sh\n")
+                ytdlp.chmod(0o755)
+                expected = (object(), Path(tmp) / "media.mp4")
+                with patch(
+                    "media_bot.downloader.download_media",
+                    new=AsyncMock(return_value=expected),
+                ) as download:
+                    result = await _download_instagram_ytdlp(
+                        "https://instagram.com/reel/example", 50, 30,
+                        ytdlp=ytdlp,
+                    )
+                self.assertEqual(result, expected)
+                self.assertEqual(download.await_args.args[0], ytdlp)
+
+        asyncio.run(run())
+
 
 class TikTokGalleryDlFallbackTests(unittest.TestCase):
     def test_downloads_tiktok_account_media_into_zip(self):
@@ -103,9 +233,10 @@ class TikTokGalleryDlFallbackTests(unittest.TestCase):
     def test_accepts_video_when_gallery_dl_returns_mp4(self):
         """yt-dlp failures fall back to gallery-dl, which may download a video — not slides."""
 
-        async def fake_run(cmd, timeout_seconds, error_prefix):
+        async def fake_run(cmd, timeout_seconds, error_prefix, **kwargs):
             directory = Path(cmd[cmd.index("--directory") + 1])
             (directory / "video_000.mp4").write_bytes(b"fake-tiktok-video")
+            self.assertIn("working_dir_limit", kwargs)
 
         gallerydl = Path(tempfile.gettempdir()) / "fake-gallery-dl"
         gallerydl.write_text("#!/bin/sh\n")
@@ -126,7 +257,7 @@ class TikTokGalleryDlFallbackTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_errors_when_gallery_dl_returns_neither_images_nor_video(self):
-        async def fake_run(cmd, timeout_seconds, error_prefix):
+        async def fake_run(cmd, timeout_seconds, error_prefix, **kwargs):
             return None
 
         gallerydl = Path(tempfile.gettempdir()) / "fake-gallery-dl"
