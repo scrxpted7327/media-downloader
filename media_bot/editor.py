@@ -25,6 +25,8 @@ _VOICE_PRESETS = {
     "premium": {"ar": "44100", "ac": "2", "codec": "aac"},
 }
 
+_CHANNEL_BANNER_HEIGHT_RATIO = .15
+
 _VIDEO_ENCODER: str | None = None
 
 def _detect_video_encoder() -> str:
@@ -1078,9 +1080,8 @@ async def render_channel_banner(
         )
 
         duration_us = _get_duration_us(input_path)
-        position_map = {
-            "bottom": f"0:{vid_h - int(vid_h * 0.18)}",
-        }
+        banner_height = int(vid_h * _CHANNEL_BANNER_HEIGHT_RATIO)
+        position_map = {"bottom": f"0:{vid_h - banner_height}"}
         pos = position_map["bottom"]
 
         cmd = [
@@ -1088,7 +1089,8 @@ async def render_channel_banner(
             "-i", str(input_path),
             "-i", str(banner_img_path),
             "-filter_complex",
-            f"[1:v]scale={vid_w}:{int(vid_h * 0.18)}[b];[0:v][b]overlay=0:{vid_h - int(vid_h * 0.18)}",
+            f"[1:v]scale={vid_w}:{banner_height}[b];"
+            f"[0:v][b]overlay=0:{vid_h - banner_height}",
             "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
             "-c:a", "copy",
             "-movflags", "+faststart",
@@ -1153,7 +1155,7 @@ async def _compose_channel_banner_image(
 ) -> Path:
     from PIL import Image, ImageDraw, ImageFont
 
-    banner_h = int(vid_h * 0.18)
+    banner_h = int(vid_h * _CHANNEL_BANNER_HEIGHT_RATIO)
     img = Image.new("RGBA", (vid_w, banner_h), (0, 0, 0, 180))
     draw = ImageDraw.Draw(img)
 
