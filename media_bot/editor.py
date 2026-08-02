@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from PIL import Image
 
-from .downloader import DownloadError, _run_checked, _terminate_process
+from .downloader import (
+    DownloadError,
+    _create_subprocess_exec,
+    _run_checked,
+    _terminate_process,
+)
 from .tools import prefer_ffmpeg_full
 
 prefer_ffmpeg_full()
@@ -238,7 +243,7 @@ async def _run_ffmpeg_with_progress(
     process: asyncio.subprocess.Process | None = None
     readers: tuple[asyncio.Task[None], ...] = ()
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await _create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=(os.name == "posix"),
         )
@@ -384,7 +389,7 @@ async def _transcribe_ssh(wav_path: Path, language: str | None, timeout: int) ->
     LOGGER.info("Transcribing via SSH to %s...", ssh_target)
     try:
         with wav_path.open("rb") as wav_stream:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await _create_subprocess_exec(
                 *ssh_args,
                 stdin=wav_stream,
                 stdout=asyncio.subprocess.PIPE,

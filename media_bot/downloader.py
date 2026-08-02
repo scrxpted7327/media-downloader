@@ -131,6 +131,24 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
+async def _create_subprocess_exec(
+    *command: str,
+    **kwargs,
+) -> asyncio.subprocess.Process:
+    """Spawn without leaking a child if cancellation lands during startup."""
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(*command, **kwargs))
+    try:
+        return await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        # The OS process may exist before asyncio publishes its Process handle.
+        # Join the shielded spawn, then terminate that process group before the
+        # caller observes cancellation.
+        result = (await asyncio.gather(spawn, return_exceptions=True))[0]
+        if not isinstance(result, BaseException):
+            await _terminate_process(result)
+        raise
+
+
 def _enforce_size(path: Path, max_filesize_mb: int, label: str = "download") -> None:
     if path.stat().st_size > max_filesize_mb * 1024 * 1024:
         path.unlink(missing_ok=True)
@@ -214,7 +232,7 @@ async def download_media(
         await asyncio.gather(*readers, *auxiliary, return_exceptions=True)
 
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await _create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=(os.name == "posix"),
         )
@@ -344,7 +362,7 @@ async def _run_checked(
         await asyncio.gather(*readers, *auxiliary, return_exceptions=True)
 
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await _create_subprocess_exec(
             *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             start_new_session=(os.name == "posix"),
         )

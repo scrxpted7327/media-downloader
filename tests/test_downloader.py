@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from media_bot.downloader import (
     DownloadError,
+    _create_subprocess_exec,
     _enforce_size,
     _download_instagram_ytdlp,
     _run_checked,
@@ -20,6 +21,37 @@ from media_bot.downloader import (
 
 
 class DownloadProgressTests(unittest.TestCase):
+    def test_cancel_during_process_spawn_terminates_published_process(self):
+        async def run():
+            started = asyncio.Event()
+            release = asyncio.Event()
+            process = object()
+
+            async def delayed_spawn(*_args, **_kwargs):
+                started.set()
+                await release.wait()
+                return process
+
+            with (
+                patch(
+                    "media_bot.downloader.asyncio.create_subprocess_exec",
+                    side_effect=delayed_spawn,
+                ),
+                patch(
+                    "media_bot.downloader._terminate_process",
+                    new=AsyncMock(),
+                ) as terminate,
+            ):
+                task = asyncio.create_task(_create_subprocess_exec("command"))
+                await started.wait()
+                task.cancel()
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                terminate.assert_awaited_once_with(process)
+
+        asyncio.run(run())
+
     def test_parses_ytdlp_progress(self):
         self.assertEqual(download_progress(b"[download]  42.7% of 10.00MiB at 1.00MiB/s"), 42)
 
