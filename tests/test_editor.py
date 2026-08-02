@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from media_bot.editor import (
+    _ass_timestamp,
     _caption_chunks,
     _image_difference,
     _get_video_dimensions,
@@ -34,6 +35,10 @@ class ImageDifferenceTests(unittest.TestCase):
 
 
 class SegmentsToSrtTests(unittest.TestCase):
+    def test_ass_timestamp_uses_centiseconds(self):
+        self.assertEqual(_ass_timestamp(40.2), "0:00:40.20")
+        self.assertEqual(_ass_timestamp(3661.999), "1:01:02.00")
+
     def test_converts_segments(self):
         segments = [{"start": 1.0, "end": 2.5, "text": "Hello world"}]
         srt = _segments_to_srt(segments)
@@ -140,6 +145,7 @@ class RenderEditIntegrationTests(unittest.TestCase):
             self.assertIn(",three four\n", ass)
             self.assertNotIn("One two three four", ass)
             self.assertIn(",228,1\n", ass)
+            self.assertIn("Dialogue: 0,0:00:00.00,0:00:00.90", ass)
 
     def test_auto_captions_preserve_video_when_no_speech_is_found(self):
         with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:

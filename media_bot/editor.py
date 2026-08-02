@@ -495,6 +495,15 @@ def _segments_to_srt(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _ass_timestamp(seconds: float) -> str:
+    """Format an ASS timestamp using its required centisecond precision."""
+    centiseconds = max(0, round(float(seconds) * 100))
+    hours, remainder = divmod(centiseconds, 360_000)
+    minutes, remainder = divmod(remainder, 6_000)
+    whole_seconds, fraction = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{fraction:02d}"
+
+
 async def render_captions(
     input_path: Path,
     output_path: Path,
@@ -550,20 +559,15 @@ async def render_captions(
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
         for seg in _caption_chunks(segments):
-            start_h = int(seg["start"] // 3600)
-            start_m = int((seg["start"] % 3600) // 60)
-            start_s = seg["start"] % 60
-            end_h = int(seg["end"] // 3600)
-            end_m = int((seg["end"] % 3600) // 60)
-            end_s = seg["end"] % 60
+            start = _ass_timestamp(seg["start"])
+            end = _ass_timestamp(seg["end"])
             safe_text = (
                 seg["text"].replace("\\", "\\\\")
                 .replace("{", "\\{").replace("}", "\\}")
                 .replace("\n", " ")
             )
             ass_header += (
-                f"Dialogue: 0,{start_h:02d}:{start_m:02d}:{start_s:06.3f},"
-                f"{end_h:02d}:{end_m:02d}:{end_s:06.3f},Default,,0,0,0,,{safe_text}\n"
+                f"Dialogue: 0,{start},{end},Default,,0,0,0,,{safe_text}\n"
             )
 
         ass_path = Path(tmpdir.name) / "captions.ass"
@@ -581,7 +585,10 @@ async def render_captions(
                 timeout_seconds,
                 f"closed caption burn failed for {input_path.name}",
                 total_duration_us=duration_us,
-                progress_callback=lambda p: progress_callback(50 + p // 2) if progress_callback else None,
+                progress_callback=(
+                    (lambda p: progress_callback(50 + p // 2))
+                    if progress_callback else None
+                ),
             )
         finally:
             tmpdir.cleanup()
