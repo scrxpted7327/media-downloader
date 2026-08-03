@@ -373,6 +373,7 @@ def _render_preparation_text(
     watermark_position: str,
     banner_path: str | None,
     channel_banner: bool,
+    voice_outro: str = "none",
 ) -> str:
     """Explain the resolved render plan before expensive work begins."""
     source_label = (source.title or source.url or "source video").strip()
@@ -383,10 +384,22 @@ def _render_preparation_text(
         action = "swap" if watermark_mode == "swap" else "remove"
         detail = "automatic candidate review" if watermark_position == "auto" else watermark_position
         stages.append(f"watermark {action} ({detail})")
-    if auto_captions or voice_mode == "swearify":
+    if voice_mode == "swearify":
+        stages.append("Swearify voice-over")
+        if voice_outro == "like_subscribe":
+            stages.append("like & subscribe end plug")
         stages.append("captions from speech")
-    if voice_text or voice_mode == "swearify":
-        stages.append("Swearify voice-over" if voice_mode == "swearify" else "voice-over")
+    elif voice_outro == "like_subscribe":
+        if voice_text:
+            stages.append("voice-over")
+        stages.append("like & subscribe end plug")
+        if auto_captions:
+            stages.append("captions from speech")
+    else:
+        if auto_captions:
+            stages.append("captions from speech")
+        if voice_text:
+            stages.append("voice-over")
     if channel_banner:
         stages.append("channel banner")
     if banner_path:
@@ -405,6 +418,7 @@ def _render_preparation_text(
     if watermark_mode in {"remove", "swap"}:
         watermark_detail = f"{watermark_mode} / {watermark_position}"
     banner_detail = Path(banner_path).name if banner_path else "off"
+    outro_detail = "like & subscribe plug (appended)" if voice_outro == "like_subscribe" else "off"
     preset_name = preset.name if preset is not None else "ad hoc edit"
     return (
         f"🎬 Preparing render — Job #{edit.id}\n"
@@ -413,6 +427,7 @@ def _render_preparation_text(
         f"Watermark: {watermark_detail}\n"
         f"Captions: {caption_detail}\n"
         f"Voice: {voice_detail}\n"
+        f"End voice plug: {outro_detail}\n"
         f"Banner: {banner_detail}\n"
         f"Planned stages: {' → '.join(stages)}\n\n"
         "Auto Hashtags: queued after delivery from the original source when "
@@ -2244,6 +2259,8 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         v_voice = edit.voice_over_voice if edit.voice_over_voice is not None else (preset.voice_over_voice or "default" if preset else "default")
         v_mode = edit.voice_mode if edit.voice_mode is not None else (preset.voice_mode if preset else None)
         v_mode = (v_mode or "normal").strip().lower()
+        v_outro = edit.voice_outro if edit.voice_outro is not None else (preset.voice_outro if preset else None)
+        v_outro = (v_outro or "none").strip().lower()
         v_quality = edit.voice_quality if edit.voice_quality is not None else (preset.voice_quality or "basic" if preset else "basic")
         v_speed = edit.voice_speed if edit.voice_speed is not None else (preset.voice_speed or 1.0 if preset else 1.0)
         tts_eng = edit.tts_engine if edit.tts_engine is not None else (preset.tts_engine if preset else None)
@@ -2262,6 +2279,8 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         ch_banner = edit.channel_banner
         if v_mode not in {"normal", "swearify"}:
             raise DownloadError(f"Unsupported voice-over mode: {v_mode}")
+        if v_outro not in {"none", "like_subscribe"}:
+            raise DownloadError(f"Unsupported voice outro: {v_outro}")
         await _safe_status_edit(
             msg,
             _render_preparation_text(
@@ -2275,6 +2294,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                 watermark_position=wm_pos,
                 banner_path=b_path,
                 channel_banner=ch_banner,
+                voice_outro=v_outro,
             ),
         )
         if v_mode == "swearify":
@@ -2377,10 +2397,22 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         steps = []
         if wm_removal:
             steps.append("Watermark swap" if wm_mode == "swap" else "Watermark removal")
-        if cap_text or auto_cap:
+        if v_mode == "swearify":
+            steps.append("Swearify voice-over")
+            if v_outro == "like_subscribe":
+                steps.append("Like & Subscribe plug")
             steps.append("Captions")
-        if v_text:
-            steps.append("Swearify voice-over" if v_mode == "swearify" else "Voice-over")
+        elif v_outro == "like_subscribe":
+            if v_text:
+                steps.append("Voice-over")
+            steps.append("Like & Subscribe plug")
+            if cap_text or auto_cap:
+                steps.append("Captions")
+        else:
+            if cap_text or auto_cap:
+                steps.append("Captions")
+            if v_text:
+                steps.append("Voice-over")
         if ch_banner and source.url:
             steps.append("Channel banner")
         if b_path:
@@ -2400,6 +2432,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             auto_captions=auto_cap,
             voice_text=v_text,
             voice_mode=v_mode,
+            voice_outro=v_outro,
             voice=v_voice,
             voice_quality=v_quality,
             voice_speed=v_speed,

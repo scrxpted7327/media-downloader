@@ -66,6 +66,7 @@ class Preset:
     caption_text: str | None
     voice_over_voice: str | None
     voice_mode: str | None
+    voice_outro: str | None
     caption_color: str | None
     caption_style: str | None
     caption_position: str | None
@@ -102,6 +103,7 @@ class EditJob:
     voice_text: str | None
     voice_over_voice: str | None
     voice_mode: str | None
+    voice_outro: str | None
     voice_quality: str | None
     voice_speed: float | None
     tts_engine: str | None
@@ -231,7 +233,7 @@ class UnsafeStoragePath(ValueError):
 
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 _JOB_UPDATE_FIELDS = frozenset({
     "status", "file_path", "file_size", "local_api_used", "status_message_id",
@@ -241,7 +243,7 @@ _USER_SETTINGS_UPDATE_FIELDS = frozenset({
     "preset_name", "crop_preset", "caption_text", "voice_over_voice",
 })
 _PRESET_UPDATE_FIELDS = frozenset({
-    "name", "crop_preset", "caption_text", "voice_over_voice", "voice_mode", "caption_color",
+    "name", "crop_preset", "caption_text", "voice_over_voice", "voice_mode", "voice_outro", "caption_color",
     "caption_style", "caption_position", "auto_captions", "voice_quality",
     "voice_speed", "voice_text", "tts_engine", "banner_path", "banner_position",
     "banner_scale", "watermark_removal", "watermark_position", "watermark_mode",
@@ -250,7 +252,7 @@ _PRESET_UPDATE_FIELDS = frozenset({
 _EDIT_UPDATE_FIELDS = frozenset({
     "preset_id", "caption_text", "caption_color", "caption_style",
     "caption_position", "auto_captions", "voice_text", "voice_over_voice",
-    "voice_mode", "voice_quality", "voice_speed", "tts_engine", "banner_path",
+    "voice_mode", "voice_outro", "voice_quality", "voice_speed", "tts_engine", "banner_path",
     "banner_position", "banner_scale", "watermark_removal",
     "watermark_position", "watermark_mode", "watermark_text",
     "watermark_analysis", "watermark_confidence", "watermark_candidates",
@@ -342,6 +344,7 @@ _SCHEMA_SQL = """
         voice_text TEXT,
         voice_over_voice TEXT,
         voice_mode TEXT,
+        voice_outro TEXT,
         voice_quality TEXT,
         voice_speed REAL,
         tts_engine TEXT,
@@ -413,6 +416,7 @@ _SCHEMA_SQL = """
         voice_text TEXT,
         tts_engine TEXT,
         voice_mode TEXT,
+        voice_outro TEXT,
         banner_path TEXT,
         banner_position TEXT,
         banner_scale TEXT,
@@ -518,6 +522,7 @@ _LEGACY_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("voice_text", "TEXT"),
         ("tts_engine", "TEXT"),
         ("voice_mode", "TEXT"),
+        ("voice_outro", "TEXT"),
         ("banner_path", "TEXT"),
         ("banner_position", "TEXT"),
         ("banner_scale", "TEXT"),
@@ -542,6 +547,7 @@ _LEGACY_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("voice_text", "TEXT"),
         ("voice_over_voice", "TEXT"),
         ("voice_mode", "TEXT"),
+        ("voice_outro", "TEXT"),
         ("voice_quality", "TEXT"),
         ("voice_speed", "REAL"),
         ("tts_engine", "TEXT"),
@@ -646,6 +652,14 @@ async def _apply_migrations(db: aiosqlite.Connection) -> None:
                     f'ALTER TABLE "edit_jobs" ADD COLUMN "{column}" {definition}'
                 )
         await _mark_migration(db, 6, "track render preparation messages")
+    if 7 not in applied:
+        for table in ("presets", "edit_jobs"):
+            existing = await _column_names(db, table)
+            if "voice_outro" not in existing:
+                await db.execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN "voice_outro" TEXT'
+                )
+        await _mark_migration(db, 7, "add voice-over outro")
 
 
 async def _mark_migration(db: aiosqlite.Connection, version: int, name: str) -> None:
@@ -1044,9 +1058,9 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
         cursor = await db.execute(
             "INSERT INTO presets (user_id, name, crop_preset, caption_text, voice_over_voice, "
             "caption_color, caption_style, caption_position, auto_captions, voice_quality, voice_speed, "
-            "voice_text, tts_engine, voice_mode, banner_path, banner_position, banner_scale, "
+            "voice_text, tts_engine, voice_mode, voice_outro, banner_path, banner_position, banner_scale, "
             "watermark_removal, watermark_position, watermark_mode, watermark_text, channel_banner) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 name,
@@ -1062,6 +1076,7 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
                 kwargs.get("voice_text"),
                 kwargs.get("tts_engine"),
                 kwargs.get("voice_mode"),
+                kwargs.get("voice_outro"),
                 kwargs.get("banner_path"),
                 kwargs.get("banner_position"),
                 kwargs.get("banner_scale"),
@@ -2328,6 +2343,7 @@ def _row_to_preset(row: aiosqlite.Row) -> Preset:
         caption_text=row["caption_text"],
         voice_over_voice=row["voice_over_voice"],
         voice_mode=row["voice_mode"],
+        voice_outro=row["voice_outro"],
         caption_color=row["caption_color"],
         caption_style=row["caption_style"],
         caption_position=row["caption_position"],
@@ -2365,6 +2381,7 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         voice_text=row["voice_text"],
         voice_over_voice=row["voice_over_voice"],
         voice_mode=row["voice_mode"],
+        voice_outro=row["voice_outro"],
         voice_quality=row["voice_quality"],
         voice_speed=row["voice_speed"],
         tts_engine=row["tts_engine"],

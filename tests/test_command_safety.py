@@ -166,6 +166,7 @@ class CommandContainmentTests(unittest.IsolatedAsyncioTestCase):
             auto_captions=True,
             voice_text="generated roast",
             voice_mode="swearify",
+            voice_outro="like_subscribe",
             watermark_mode="remove",
             watermark_position="auto",
             banner_path="/tmp/banner.png",
@@ -175,6 +176,7 @@ class CommandContainmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Roast preset", text)
         self.assertIn("automatic candidate review", text)
         self.assertIn("Swearify roast", text)
+        self.assertIn("like & subscribe plug", text)
         self.assertIn("Auto Hashtags", text)
 
     async def test_watermark_review_sends_a_swipeable_candidate_album(self):

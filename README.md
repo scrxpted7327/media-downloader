@@ -89,6 +89,11 @@ threats, doxxing, protected-trait attacks, or unsupported claims. It uses the
 same `MEDIA_BOT_AUTO_HASHTAGS_CODEX_*` settings as metadata generation and
 fails the render with an actionable error when Codex is unavailable.
 
+Voice settings also include an optional `Like & Subscribe` end plug. It uses
+the selected TTS voice to append a short call-to-action after the original
+audio, holds the final video frame while it plays, and includes the plug in
+automatic captions when Auto Captions is enabled.
+
 ## Telegram setup
 
 Disable BotFather privacy mode if the bot must receive ordinary group messages.

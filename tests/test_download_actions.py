@@ -586,6 +586,8 @@ class DownloadEditActionTests(unittest.TestCase):
             callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
             self.assertIn("🤬 Voice Mode", labels)
             self.assertIn(f"editcfg:{edit.id}:voice_menu:voice_mode", callbacks)
+            self.assertIn("📣 End Plug", labels)
+            self.assertIn(f"editcfg:{edit.id}:voice_menu:voice_outro", callbacks)
 
         asyncio.run(run())
 
