@@ -1,7 +1,9 @@
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,6 +11,7 @@ from media_bot.__main__ import (
     _admin_authorized,
     _bind_flow_context,
     _render_edit_job,
+    _send_watermark_review_album,
     cancel_job_command,
     fix_command,
     handle_url,
@@ -23,6 +26,7 @@ from media_bot.storage import (
     update_edit_job,
     update_job,
 )
+from media_bot.watermark import WatermarkAnalysis, WatermarkCandidate
 from media_bot.work_queue import WorkQueue
 
 
@@ -83,6 +87,140 @@ class CommandContainmentTests(unittest.IsolatedAsyncioTestCase):
 
         repair.assert_not_awaited()
         self.assertIn("disabled", update.effective_message.reply_text.await_args.args[0])
+
+    async def test_reply_fix_reports_live_render_and_supervisor_patience(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = root / "media.db"
+            await init_db(db_path)
+            source = await create_job(db_path, "https://example.com/video", 1, 1)
+            await update_job(db_path, source.id, status="uploaded", file_path=str(root / "source.mp4"))
+            edit = await create_edit_job(db_path, source.id, 1)
+            await update_edit_job(
+                db_path,
+                edit.id,
+                status="rendering",
+                render_status_message_id=42,
+            )
+            update = _update()
+            update.effective_message.reply_to_message = SimpleNamespace(
+                message_id=42,
+                chat_id=1,
+                text=f"🎬 Preparing render — Job #{edit.id}",
+                caption=None,
+            )
+            render_work = WorkQueue(
+                name="render", workers=1, capacity=4, per_user_capacity=2,
+            )
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def hold_render():
+                started.set()
+                await release.wait()
+
+            render_work.submit(
+                user_id=1,
+                label=f"render:{edit.id}",
+                factory=hold_render,
+            )
+            render_work.start()
+            await asyncio.wait_for(started.wait(), timeout=1)
+            context = _context(
+                _settings(),
+                db_path=db_path,
+                render_work=render_work,
+                download_work=None,
+                metadata_work=None,
+            )
+            with patch.object(
+                __import__("media_bot.__main__", fromlist=["SUPERVISOR_STATE_PATH"]),
+                "SUPERVISOR_STATE_PATH",
+                root / "supervisor-state.json",
+            ) as state_path:
+                state_path.write_text(
+                    json.dumps({
+                        "state": "running",
+                        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                        "child_pid": 123,
+                    }),
+                    encoding="utf-8",
+                )
+                await fix_command(update, context)
+
+            release.set()
+            await render_work.stop()
+
+            report = update.effective_message.reply_text.await_args.args[0]
+            self.assertIn("Supervisor: running", report)
+            self.assertIn("still running", report)
+            self.assertIn("No code repair", report)
+
+    def test_render_preparation_context_names_resolved_stages(self):
+        from media_bot.__main__ import _render_preparation_text
+
+        text = _render_preparation_text(
+            SimpleNamespace(id=7),
+            SimpleNamespace(title="Original clip", url="https://example.com/video"),
+            SimpleNamespace(name="Roast preset"),
+            auto_captions=True,
+            voice_text="generated roast",
+            voice_mode="swearify",
+            voice_outro="like_subscribe",
+            watermark_mode="remove",
+            watermark_position="auto",
+            banner_path="/tmp/banner.png",
+            channel_banner=True,
+        )
+        self.assertIn("Original clip", text)
+        self.assertIn("Roast preset", text)
+        self.assertIn("automatic candidate review", text)
+        self.assertIn("Swearify roast", text)
+        self.assertIn("like & subscribe plug", text)
+        self.assertIn("Auto Hashtags", text)
+
+    async def test_watermark_review_sends_a_swipeable_candidate_album(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previews = []
+            for index in range(1, 4):
+                preview = root / f"candidate-{index}.jpg"
+                preview.write_bytes(b"jpeg")
+                previews.append(preview)
+            analysis = WatermarkAnalysis(
+                width=320,
+                height=180,
+                sample_count=3,
+                candidates=tuple(
+                    WatermarkCandidate(index, 10, 10, 30, 20, .8, .8, .9)
+                    for index in range(1, 4)
+                ),
+                selected=(),
+                requires_review=True,
+                duration_seconds=3,
+            )
+            message = SimpleNamespace(
+                chat_id=1,
+                reply_text=AsyncMock(),
+                reply_photo=AsyncMock(),
+            )
+            context = SimpleNamespace(
+                bot=SimpleNamespace(send_media_group=AsyncMock()),
+            )
+
+            await _send_watermark_review_album(
+                message,
+                context,
+                SimpleNamespace(id=9, watermark_candidates="[]"),
+                analysis,
+                previews,
+            )
+
+            context.bot.send_media_group.assert_awaited_once()
+            media = context.bot.send_media_group.await_args.kwargs["media"]
+            self.assertEqual(len(media), 3)
+            self.assertEqual(message.reply_photo.await_count, 0)
+            message.reply_text.assert_awaited_once()
 
     async def test_report_is_ticket_only_even_for_enabled_admin(self):
         with tempfile.TemporaryDirectory() as directory:

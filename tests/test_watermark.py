@@ -12,7 +12,9 @@ import numpy as np
 
 from media_bot.watermark import (
     WatermarkAnalysis,
+    WatermarkCandidate,
     analyze_video,
+    create_candidate_previews,
     provision_lama_model,
     select_onnx_providers,
 )
@@ -138,6 +140,43 @@ class WatermarkAnalysisTests(unittest.TestCase):
             right = max(moving, key=lambda item: item.x)
             self.assertLess(left.active_ranges[0][1], right.active_ranges[0][1])
             self.assertEqual(analysis, WatermarkAnalysis.from_json(analysis.to_json()))
+
+    def test_candidate_previews_are_separate_full_size_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "logo.mp4"
+            _video(path, logo=True)
+            analysis = WatermarkAnalysis(
+                width=320,
+                height=180,
+                sample_count=6,
+                candidates=tuple(
+                    WatermarkCandidate(
+                        id=index,
+                        x=20 + index * 20,
+                        y=15,
+                        width=40,
+                        height=24,
+                        confidence=.7 + index / 100,
+                        persistence=.8,
+                        border_score=.9,
+                    )
+                    for index in range(1, 7)
+                ),
+                selected=(),
+                requires_review=True,
+                duration_seconds=3.0,
+            )
+
+            previews = create_candidate_previews(path, analysis, root / "previews")
+
+            self.assertEqual(len(previews), 6)
+            self.assertEqual(
+                [preview.name for preview in previews],
+                [f"watermark-candidate-{index:02d}.jpg" for index in range(1, 7)],
+            )
+            self.assertTrue(all(preview.is_file() for preview in previews))
+            self.assertTrue(all(cv2.imread(str(preview)).shape[:2] == (180, 320) for preview in previews))
 
     def test_model_download_is_checksum_verified_and_cached(self):
         payload = b"pinned-model"

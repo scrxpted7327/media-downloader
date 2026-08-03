@@ -45,7 +45,8 @@ package or execute an unverified ffmpeg build.
 Watermark removal is opt-in and new presets keep the original video by default.
 When enabled, automatic detection samples the middle 90% of a video for persistent
 logos or text. Confident regions render immediately; uncertain regions are
-shown as numbered Telegram buttons and remain reviewable after a bot restart.
+uploaded as a swipeable Telegram album with one full-size preview per candidate,
+then remain reviewable after a bot restart.
 The pinned Apache-2.0 LaMa ONNX model is downloaded lazily to
 `MEDIA_BOT_TOOLS_DIR` and SHA-256 verified. If ONNX inference or provisioning
 fails, the render completes with adaptive FFmpeg `delogo` regions and reports
@@ -77,6 +78,22 @@ to standard input, and runs the transcription inline. No Whisper server or
 additional open port is required; the remote temporary WAV is deleted when the
 command finishes.
 
+### Swearify voice-over
+
+Voice settings include an opt-in `Swearify (AI roast)` mode. It samples the
+source clip's frames and transcript, asks the configured local Codex CLI for a
+short evidence-bound comedic roast, replaces the audio with TTS, and burns
+captions generated from that replacement audio. The mode permits ordinary
+profanity for entertainment but instructs the generator not to use slurs,
+threats, doxxing, protected-trait attacks, or unsupported claims. It uses the
+same `MEDIA_BOT_AUTO_HASHTAGS_CODEX_*` settings as metadata generation and
+fails the render with an actionable error when Codex is unavailable.
+
+Voice settings also include an optional `Like & Subscribe` end plug. It uses
+the selected TTS voice to append a short call-to-action after the original
+audio, holds the final video frame while it plays, and includes the plug in
+automatic captions when Auto Captions is enabled.
+
 ## Telegram setup
 
 Disable BotFather privacy mode if the bot must receive ordinary group messages.
@@ -98,12 +115,23 @@ Use `/queue` to see your queued/running job IDs and
 
 After a rendered video is delivered, the bot queues evidence-bound description
 and hashtag generation in the authenticated local Codex CLI. It transcribes
-the final video audio, samples eight frames, and sends both to Codex; the
-result is delivered as a separate Telegram message. The default runtime
-settings are `gpt-5.6-luna`, `max` reasoning, one metadata worker, and a
+the original source audio and samples eight frames from the original source,
+so watermarks, banners, and other edit overlays do not become the description's
+subject. The result is delivered as a separate Telegram message. The default
+runtime settings are `gpt-5.6-luna`, `max` reasoning, one metadata worker, and a
 1,800-second subprocess limit. Set `MEDIA_BOT_AUTO_HASHTAGS_CODEX_HOME` when
 Codex authentication is stored in a non-default home. A missing or unavailable
 Codex installation never fails the rendered video delivery.
+Auto Hashtags is currently automatic after each successful render rather than a
+separate per-render toggle.
+
+Before rendering, the bot edits its preparation message to show the source,
+preset, resolved watermark/caption/voice/banner settings, planned stages, and
+the later Auto Hashtags step. Long watermark, Swearify, metadata, and repair
+analysis stages refresh their progress messages periodically. Reply `/fix` to an authorized bot message to ask
+for a durable job and supervisor-state check; it reports whether the work is
+still running, queued, waiting for review, halted, or crashed. A standalone
+`/fix` remains the admin-only repair scan.
 Pool saves are durable copies: source retention, Reset, and `/delete` do not
 invalidate media explicitly saved in the Pool.
 Shared preset codes can be imported from Settings; another user's private

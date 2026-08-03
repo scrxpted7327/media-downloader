@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from media_bot.editor import (
+    DEFAULT_VOICE_OUTRO_TEXT,
     _ass_timestamp,
     _caption_chunks,
     _caption_position_override,
@@ -22,6 +23,7 @@ from media_bot.editor import (
     _transcribe_ssh,
     render_captions,
     render_edit,
+    render_voice_outro,
     render_voice_over,
     remove_watermark,
     transcribe_audio,
@@ -135,6 +137,20 @@ def _create_test_video(path: Path, duration: int = 3) -> None:
         ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=red:s=640x480:d={duration}",
          "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)],
         capture_output=True, check=True,
+    )
+
+
+def _create_test_video_with_audio(path: Path, duration: int = 2) -> None:
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=red:s=640x480:d={duration}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration}",
+            "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", str(path),
+        ],
+        capture_output=True,
+        check=True,
     )
 
 
@@ -281,6 +297,111 @@ class RenderEditIntegrationTests(unittest.TestCase):
             ).stdout.strip())
             self.assertGreaterEqual(duration, 1.8)
 
+    def test_voice_outro_appends_audio_and_holds_video_frame(self):
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            self.skipTest("ffmpeg/ffprobe not available")
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            _create_test_video_with_audio(source, duration=2)
+
+            async def make_one_second_voice(_text, path, _voice, _speed, _timeout):
+                with wave.open(str(path), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(16_000)
+                    audio.writeframes(b"\0\0" * 16_000)
+
+            with (
+                patch("media_bot.editor._detect_tts_engine", return_value="test"),
+                patch.dict("media_bot.editor._TTS_ENGINES", {"test": make_one_second_voice}),
+            ):
+                asyncio.run(render_voice_outro(
+                    source,
+                    output,
+                    DEFAULT_VOICE_OUTRO_TEXT,
+                    tts_engine="test",
+                    timeout_seconds=30,
+                ))
+
+            duration = float(subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(output),
+                ],
+                capture_output=True, check=True, text=True,
+            ).stdout.strip())
+            self.assertGreaterEqual(duration, 2.8)
+
+    def test_voice_outro_supports_video_without_source_audio(self):
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            self.skipTest("ffmpeg/ffprobe not available")
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "video-only.mp4"
+            output = root / "output.mp4"
+            _create_test_video(source, duration=1)
+
+            async def make_voice(_text, path, _voice, _speed, _timeout):
+                with wave.open(str(path), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(16_000)
+                    audio.writeframes(b"\0\0" * 8_000)
+
+            with (
+                patch("media_bot.editor._detect_tts_engine", return_value="test"),
+                patch.dict("media_bot.editor._TTS_ENGINES", {"test": make_voice}),
+            ):
+                asyncio.run(render_voice_outro(
+                    source, output, tts_engine="test", timeout_seconds=30,
+                ))
+
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+
+    def test_render_edit_captions_include_appended_voice_outro(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+            stages = []
+
+            async def fake_voice(input_path, path, *_args, **_kwargs):
+                stages.append(("voice", input_path))
+                path.write_bytes(b"voice-stage")
+                return path
+
+            async def fake_outro(input_path, path, *_args, **_kwargs):
+                stages.append(("outro", input_path))
+                path.write_bytes(b"outro-stage")
+                return path
+
+            async def fake_captions(input_path, path, *_args, **_kwargs):
+                stages.append(("captions", input_path))
+                path.write_bytes(b"caption-stage")
+                return path
+
+            with (
+                patch("media_bot.editor.render_voice_over", side_effect=fake_voice),
+                patch("media_bot.editor.render_voice_outro", side_effect=fake_outro),
+                patch("media_bot.editor.render_captions", side_effect=fake_captions),
+            ):
+                asyncio.run(render_edit(
+                    source,
+                    output,
+                    auto_captions=True,
+                    voice_text="Narration",
+                    voice_outro="like_subscribe",
+                ))
+
+            self.assertEqual([stage[0] for stage in stages], ["voice", "outro", "captions"])
+            self.assertEqual(stages[1][1].name, ".output_voice.mp4")
+            self.assertEqual(stages[2][1].name, ".output_outro.mp4")
+            self.assertTrue(output.is_file())
+
     def test_macos_say_uses_an_aiff_temporary_file(self):
         with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
             root = Path(directory)
@@ -308,6 +429,41 @@ class RenderEditIntegrationTests(unittest.TestCase):
                 ))
 
             self.assertEqual(audio_paths[0].suffix, ".aiff")
+            self.assertTrue(output.is_file())
+
+    def test_swearify_captions_are_burned_after_replacement_voice(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+            stages = []
+
+            async def fake_voice(_input, path, *_args, **_kwargs):
+                stages.append(("voice", _input))
+                path.write_bytes(b"voice-stage")
+                return path
+
+            async def fake_captions(input_path, path, *_args, **kwargs):
+                stages.append(("captions", input_path, kwargs.get("srt_output_path")))
+                path.write_bytes(b"caption-stage")
+                return path
+
+            with (
+                patch("media_bot.editor.render_voice_over", side_effect=fake_voice),
+                patch("media_bot.editor.render_captions", side_effect=fake_captions),
+            ):
+                asyncio.run(render_edit(
+                    source,
+                    output,
+                    auto_captions=False,
+                    voice_text="That was a damn disaster.",
+                    voice_mode="swearify",
+                ))
+
+            self.assertEqual([stage[0] for stage in stages], ["voice", "captions"])
+            self.assertEqual(stages[0][1], source)
+            self.assertEqual(stages[1][1].name, ".output_voice.mp4")
             self.assertTrue(output.is_file())
 
     def test_render_edit_swaps_manual_watermark_with_text(self):

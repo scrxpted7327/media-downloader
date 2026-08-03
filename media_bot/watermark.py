@@ -405,6 +405,105 @@ def create_preview(path: Path, analysis: WatermarkAnalysis, output: Path) -> Pat
     return output
 
 
+def _candidate_preview_seconds(
+    candidate: WatermarkCandidate,
+    duration_seconds: float,
+) -> float:
+    """Choose a representative frame while respecting time-windowed marks."""
+    if candidate.active_ranges:
+        start, end = max(
+            candidate.active_ranges,
+            key=lambda pair: max(0.0, pair[1] - pair[0]),
+        )
+    else:
+        start = candidate.start_seconds if candidate.start_seconds is not None else 0.0
+        end = candidate.end_seconds if candidate.end_seconds is not None else duration_seconds
+    return max(0.0, min(duration_seconds, (start + end) / 2.0))
+
+
+def _annotate_candidate_frame(frame, candidate: WatermarkCandidate, cv2):
+    """Mark one candidate on a full-size frame for a readable Telegram preview."""
+    height, width = frame.shape[:2]
+    x1 = max(0, min(width - 1, candidate.x))
+    y1 = max(0, min(height - 1, candidate.y))
+    x2 = max(x1 + 1, min(width - 1, candidate.x + candidate.width))
+    y2 = max(y1 + 1, min(height - 1, candidate.y + candidate.height))
+    thickness = max(2, round(min(width, height) / 180))
+    color = (35, 220, 35)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+
+    label = f"Candidate {candidate.id}  {candidate.confidence:.0%} confidence"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.55, min(1.2, width / 900))
+    label_thickness = max(1, round(font_scale * 2))
+    (label_width, label_height), baseline = cv2.getTextSize(
+        label, font, font_scale, label_thickness,
+    )
+    pad = max(6, round(min(width, height) / 120))
+    label_y = max(label_height + baseline + pad, y1)
+    label_x2 = min(width - 1, x1 + label_width + pad * 2)
+    label_y1 = max(0, label_y - label_height - baseline - pad)
+    cv2.rectangle(frame, (x1, label_y1), (label_x2, label_y), color, -1)
+    cv2.putText(
+        frame,
+        label,
+        (x1 + pad, label_y - baseline - pad // 2),
+        font,
+        font_scale,
+        (0, 0, 0),
+        label_thickness,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
+def create_candidate_previews(
+    path: Path,
+    analysis: WatermarkAnalysis,
+    output_dir: Path,
+) -> list[Path]:
+    """Create one readable full-frame preview per detected candidate.
+
+    Telegram renders an album as a swipeable set of photos.  A separate
+    full-size frame for each candidate is substantially easier to inspect than
+    the old six-tile contact sheet, especially on a phone.
+    """
+    cv2 = _cv2()
+    if not analysis.candidates:
+        return []
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise RuntimeError(f"could not open video: {path.name}")
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    previews: list[Path] = []
+    try:
+        for candidate in analysis.candidates[:6]:
+            seconds = _candidate_preview_seconds(candidate, analysis.duration_seconds)
+            capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000.0)
+            ok, frame = capture.read()
+            if not ok:
+                capture.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    round(seconds * fps),
+                )
+                ok, frame = capture.read()
+            if not ok:
+                raise RuntimeError(
+                    f"could not read preview frame for candidate {candidate.id}"
+                )
+            annotated = _annotate_candidate_frame(frame, candidate, cv2)
+            output = output_dir / f"watermark-candidate-{candidate.id:02d}.jpg"
+            if not cv2.imwrite(str(output), annotated, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+                raise RuntimeError(
+                    f"could not save preview for candidate {candidate.id}"
+                )
+            previews.append(output)
+    finally:
+        capture.release()
+    return previews
+
+
 def provision_lama_model(
     tools_dir: Path,
     opener: Callable[..., Any] = urllib.request.urlopen,

@@ -39,6 +39,9 @@ _VOICE_PRESETS = {
     "premium": {"ar": "44100", "ac": "2", "codec": "aac"},
 }
 
+DEFAULT_VOICE_OUTRO_TEXT = "If you enjoyed this video, please like and subscribe for more."
+VOICE_OUTRO_LIKE_SUBSCRIBE = "like_subscribe"
+
 _CHANNEL_BANNER_HEIGHT_RATIO = .15
 
 _VIDEO_ENCODER: str | None = None
@@ -813,40 +816,21 @@ async def render_voice_over(
     if not voice_text:
         raise DownloadError("voice_text is empty")
 
-    engine = await _detect_tts_engine(tts_engine)
     preset = _VOICE_PRESETS.get(quality.lower(), _VOICE_PRESETS["basic"])
 
     tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-tts-")
-    # macOS `say` writes AIFF by default and rejects a `.wav` destination unless
-    # a matching data format is supplied. FFmpeg accepts AIFF directly.
-    audio_suffix = ".aiff" if engine == "say" else ".wav"
-    tmp_audio = Path(tmpdir.name) / f"tts-output{audio_suffix}"
-
-    tts_func = _TTS_ENGINES.get(engine)
-    if tts_func is None:
-        raise DownloadError(f"unsupported TTS engine: {engine}")
+    engine = tts_engine or "auto"
 
     try:
-        if progress_callback:
-            await progress_callback(10)
-        try:
-            await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
-        except Exception as exc:
-            # Auto mode should remain usable when the network-backed Edge TTS
-            # service is unavailable on the bot host.
-            if (tts_engine in (None, "auto") and engine == "edge-tts"
-                    and shutil.which("espeak-ng")):
-                LOGGER.warning("Edge TTS failed; falling back to eSpeak NG: %s", exc)
-                engine = "espeak-ng"
-                tmp_audio.unlink(missing_ok=True)
-                await _tts_espeak(voice_text, tmp_audio, voice, speed, timeout_seconds)
-            else:
-                raise
-        if progress_callback:
-            await progress_callback(30)
-
-        if not tmp_audio.is_file() or tmp_audio.stat().st_size == 0:
-            raise DownloadError(f"TTS engine ({engine}) produced no audio")
+        tmp_audio, engine = await _synthesize_tts_audio(
+            voice_text,
+            Path(tmpdir.name),
+            tts_engine,
+            voice,
+            speed,
+            timeout_seconds,
+            progress_callback=progress_callback,
+        )
 
         if progress_callback:
             await progress_callback(50)
@@ -879,6 +863,168 @@ async def render_voice_over(
 
     if not output_path.is_file():
         raise DownloadError(f"voice-over produced no output file ({output_path.name})")
+    return output_path
+
+
+async def _synthesize_tts_audio(
+    voice_text: str,
+    directory: Path,
+    tts_engine: str | None,
+    voice: str,
+    speed: float,
+    timeout_seconds: int,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[Path, str]:
+    """Generate one temporary speech track for replacement or appended audio."""
+    engine = await _detect_tts_engine(tts_engine)
+    # macOS `say` writes AIFF by default and rejects a `.wav` destination unless
+    # a matching data format is supplied. FFmpeg accepts AIFF directly.
+    audio_suffix = ".aiff" if engine == "say" else ".wav"
+    tmp_audio = directory / f"tts-output{audio_suffix}"
+    tts_func = _TTS_ENGINES.get(engine)
+    if tts_func is None:
+        raise DownloadError(f"unsupported TTS engine: {engine}")
+
+    if progress_callback:
+        await progress_callback(10)
+    try:
+        await tts_func(voice_text, tmp_audio, voice, speed, timeout_seconds)
+    except Exception as exc:
+        # Auto mode should remain usable when the network-backed Edge TTS
+        # service is unavailable on the bot host.
+        if (tts_engine in (None, "auto") and engine == "edge-tts"
+                and shutil.which("espeak-ng")):
+            LOGGER.warning("Edge TTS failed; falling back to eSpeak NG: %s", exc)
+            engine = "espeak-ng"
+            tmp_audio.unlink(missing_ok=True)
+            await _tts_espeak(voice_text, tmp_audio, voice, speed, timeout_seconds)
+        else:
+            raise
+    if progress_callback:
+        await progress_callback(30)
+
+    if not tmp_audio.is_file() or tmp_audio.stat().st_size == 0:
+        raise DownloadError(f"TTS engine ({engine}) produced no audio")
+    return tmp_audio, engine
+
+
+def _has_audio_stream(path: Path) -> bool:
+    """Return whether ffprobe finds a source audio stream."""
+    if shutil.which("ffprobe") is None:
+        raise DownloadError("ffprobe is required for an appended voice-over")
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DownloadError(f"audio stream probe failed for {path.name}") from exc
+    if result.returncode != 0:
+        raise DownloadError(f"audio stream probe failed for {path.name}")
+    return bool(result.stdout.strip())
+
+
+async def render_voice_outro(
+    input_video: Path,
+    output_path: Path,
+    voice_text: str = DEFAULT_VOICE_OUTRO_TEXT,
+    tts_engine: str | None = None,
+    voice: str = "default",
+    quality: str = "basic",
+    speed: float = 1.0,
+    timeout_seconds: int = 600,
+    progress_callback: ProgressCallback | None = None,
+) -> Path:
+    """Append a spoken plug while holding the final video frame on screen."""
+    if not input_video.is_file():
+        raise DownloadError(f"input video not found for voice outro ({input_video.name})")
+    if shutil.which("ffmpeg") is None:
+        raise DownloadError("ffmpeg is required for a voice outro")
+    if not voice_text or not voice_text.strip():
+        raise DownloadError("voice outro text is empty")
+
+    base_duration_us = _get_duration_us(input_video)
+    if not base_duration_us or base_duration_us <= 0:
+        raise DownloadError(f"could not determine video duration for voice outro ({input_video.name})")
+    has_audio = _has_audio_stream(input_video)
+    preset = _VOICE_PRESETS.get(quality.lower(), _VOICE_PRESETS["basic"])
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-tts-outro-")
+    engine = tts_engine or "auto"
+    try:
+        tmp_audio, engine = await _synthesize_tts_audio(
+            voice_text.strip(),
+            Path(tmpdir.name),
+            tts_engine,
+            voice,
+            speed,
+            timeout_seconds,
+            progress_callback=progress_callback,
+        )
+        outro_duration_us = _get_duration_us(tmp_audio)
+        if not outro_duration_us or outro_duration_us <= 0:
+            raise DownloadError(f"TTS engine ({engine}) produced audio with no duration")
+
+        base_duration = base_duration_us / 1_000_000
+        outro_duration = outro_duration_us / 1_000_000
+        audio_rate = preset["ar"]
+        if has_audio:
+            base_audio = (
+                f"[0:a]aresample={audio_rate}:filter_type=kaiser,"
+                f"apad,atrim=duration={base_duration:.6f}[base]"
+            )
+        else:
+            base_audio = (
+                f"anullsrc=r={audio_rate}:cl=stereo,"
+                f"atrim=duration={base_duration:.6f}[base]"
+            )
+        filter_graph = ";".join([
+            f"[0:v]tpad=stop_mode=clone:stop_duration={outro_duration:.6f},"
+            "format=yuv420p[vout]",
+            base_audio,
+            f"[1:a]aresample={audio_rate}:filter_type=kaiser,"
+            f"apad,atrim=duration={outro_duration:.6f}[plug]",
+            "[base][plug]concat=n=2:v=0:a=1[aout]",
+        ])
+        if progress_callback:
+            await progress_callback(50)
+        await _run_ffmpeg_with_progress(
+            [
+                "ffmpeg", "-y",
+                "-i", str(input_video),
+                "-i", str(tmp_audio),
+                "-filter_complex", filter_graph,
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", preset["codec"],
+                "-ac", preset["ac"],
+                "-ar", preset["ar"],
+                "-movflags", "+faststart",
+                "-shortest",
+                str(output_path),
+            ],
+            timeout_seconds,
+            f"voice outro merge failed for {input_video.name}",
+            total_duration_us=base_duration_us + outro_duration_us,
+            progress_callback=progress_callback,
+        )
+        if progress_callback:
+            await progress_callback(100)
+    except DownloadError:
+        raise
+    except Exception as exc:
+        raise DownloadError(f"voice outro failed ({engine}): {exc}") from exc
+    finally:
+        tmpdir.cleanup()
+
+    if not output_path.is_file():
+        raise DownloadError(f"voice outro produced no output file ({output_path.name})")
     return output_path
 
 
@@ -1457,6 +1603,7 @@ async def render_edit(
     caption_position: str = "bottom",
     auto_captions: bool = True,
     voice_text: str | None = None,
+    voice_mode: str | None = None,
     voice: str = "default",
     voice_quality: str = "basic",
     voice_speed: float = 1.0,
@@ -1474,6 +1621,7 @@ async def render_edit(
     tools_dir: Path | None = None,
     watermark_mode: str = "keep",
     watermark_text: str | None = None,
+    voice_outro: str | None = None,
 ) -> tuple[Path, str | None]:
     current = input_path
     step_idx = 0
@@ -1515,9 +1663,55 @@ async def render_edit(
                     progress_callback=progress_callback,
                 )
 
-        if caption_text or auto_captions:
+        voice_mode_key = (voice_mode or "normal").strip().lower()
+        if voice_mode_key not in {"normal", "swearify"}:
+            raise DownloadError(f"unsupported voice-over mode: {voice_mode}")
+        voice_outro_key = (voice_outro or "none").strip().lower()
+        if voice_outro_key not in {"none", VOICE_OUTRO_LIKE_SUBSCRIBE}:
+            raise DownloadError(f"unsupported voice outro: {voice_outro}")
+
+        async def _render_voice_stage() -> None:
+            nonlocal current, step_idx
+            if not voice_text:
+                raise DownloadError("voice_text is required for the selected voice-over mode")
+            tmp = _stage("voice")
+            if advance:
+                advance(step_idx)
+            current = await render_voice_over(
+                current, tmp, voice_text, tts_engine, voice, voice_quality,
+                voice_speed, timeout_seconds,
+                progress_callback=progress_callback,
+            )
+            step_idx += 1
+
+        async def _render_voice_outro_stage() -> None:
+            nonlocal current, step_idx
+            if voice_outro_key == "none":
+                return
+            tmp = _stage("outro")
+            if advance:
+                advance(step_idx)
+            current = await render_voice_outro(
+                current,
+                tmp,
+                DEFAULT_VOICE_OUTRO_TEXT,
+                tts_engine,
+                voice,
+                voice_quality,
+                voice_speed,
+                timeout_seconds,
+                progress_callback=progress_callback,
+            )
+            step_idx += 1
+
+        async def _render_caption_stage(*, force_auto: bool = False) -> None:
+            nonlocal current, step_idx, staged_srt
+            caption_enabled = force_auto or caption_text or auto_captions
+            if not caption_enabled:
+                return
             tmp = _stage("cap")
-            if auto_captions:
+            caption_auto = True if force_auto else auto_captions
+            if caption_auto:
                 staged_srt = output_path.with_name(f".{output_path.stem}_captions.srt")
                 intermediates.add(staged_srt)
             if advance:
@@ -1525,7 +1719,7 @@ async def render_edit(
             current = await render_captions(
                 current, tmp,
                 caption_text, caption_color, caption_style, caption_position,
-                auto_captions, timeout_seconds,
+                caption_auto, timeout_seconds,
                 srt_output_path=staged_srt,
                 progress_callback=progress_callback,
                 bottom_safe_area=(
@@ -1538,16 +1732,24 @@ async def render_edit(
                 await progress_callback(100)
             step_idx += 1
 
-        if voice_text:
-            tmp = _stage("voice")
-            if advance:
-                advance(step_idx)
-            current = await render_voice_over(
-                current, tmp, voice_text, tts_engine, voice, voice_quality,
-                voice_speed, timeout_seconds,
-                progress_callback=progress_callback,
-            )
-            step_idx += 1
+        if voice_mode_key == "swearify":
+            # Swearify captions must be generated from the replacement audio, not
+            # from the clip's original speech. The voice stage therefore precedes
+            # a forced automatic-caption stage.
+            await _render_voice_stage()
+            await _render_voice_outro_stage()
+            await _render_caption_stage(force_auto=True)
+        elif voice_outro_key != "none":
+            # Captions need to see the appended plug so the call-to-action is
+            # visible during the held final frame as well as audible.
+            if voice_text:
+                await _render_voice_stage()
+            await _render_voice_outro_stage()
+            await _render_caption_stage()
+        else:
+            await _render_caption_stage()
+            if voice_text:
+                await _render_voice_stage()
 
         if channel_banner and source_url:
             tmp = _stage("chan")

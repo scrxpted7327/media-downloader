@@ -567,6 +567,30 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_voice_menu_exposes_swearify_mode(self):
+        from media_bot.settings_ui import handle_editconfig_callback
+
+        async def run():
+            await init_db(self.db_path)
+            source = await create_job(
+                self.db_path, "https://example.com/voice-menu", user_id=1, chat_id=2,
+            )
+            edit = await create_edit_job(self.db_path, source_job_id=source.id, user_id=1)
+            update, query = _make_update(f"editcfg:{edit.id}:voice_menu")
+            context = _make_context(self.db_path, self.storage_dir)
+
+            await handle_editconfig_callback(update, context)
+
+            markup = query.edit_message_text.await_args.kwargs["reply_markup"]
+            labels = [button.text for row in markup.inline_keyboard for button in row]
+            callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+            self.assertIn("🤬 Voice Mode", labels)
+            self.assertIn(f"editcfg:{edit.id}:voice_menu:voice_mode", callbacks)
+            self.assertIn("📣 End Plug", labels)
+            self.assertIn(f"editcfg:{edit.id}:voice_menu:voice_outro", callbacks)
+
+        asyncio.run(run())
+
     def test_preset_menu_has_no_manual_caption_text(self):
         from media_bot.settings_ui import _build_config_rows
 

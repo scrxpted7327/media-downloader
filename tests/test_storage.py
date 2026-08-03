@@ -284,6 +284,7 @@ class StorageTests(unittest.TestCase):
                 self.db_path, 1, "full",
                 caption_text="hello", caption_color="yellow", caption_style="bold",
                 caption_position="high", voice_over_voice="alice", voice_quality="premium", voice_speed=1.2,
+                voice_mode="swearify", voice_outro="like_subscribe",
                 watermark_mode="swap", watermark_text="@replacement",
             )
             self.assertEqual(preset.caption_text, "hello")
@@ -291,6 +292,8 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(preset.caption_style, "bold")
             self.assertEqual(preset.caption_position, "high")
             self.assertEqual(preset.voice_over_voice, "alice")
+            self.assertEqual(preset.voice_mode, "swearify")
+            self.assertEqual(preset.voice_outro, "like_subscribe")
             self.assertEqual(preset.voice_quality, "premium")
             self.assertEqual(preset.voice_speed, 1.2)
             self.assertEqual(preset.watermark_mode, "swap")
@@ -324,8 +327,11 @@ class StorageTests(unittest.TestCase):
             edit = await create_edit_job(self.db_path, job.id, 1, preset_id=None)
             self.assertEqual(edit.source_job_id, job.id)
             self.assertIsNone(edit.preset_id)
-            updated = await update_edit_job(self.db_path, edit.id, status="rendered")
+            updated = await update_edit_job(
+                self.db_path, edit.id, status="rendered", voice_outro="like_subscribe",
+            )
             self.assertEqual(updated.status, "rendered")
+            self.assertEqual(updated.voice_outro, "like_subscribe")
             fetched = await get_edit_job(self.db_path, edit.id)
             self.assertIsNotNone(fetched)
 
@@ -507,6 +513,60 @@ class StorageTests(unittest.TestCase):
                 ) as cursor:
                     versions = [row["version"] for row in await cursor.fetchall()]
             self.assertEqual(versions, list(range(1, LATEST_SCHEMA_VERSION + 1)))
+
+        asyncio.run(run())
+
+    def test_migrates_legacy_database_without_metadata_columns(self):
+        async def run():
+            # This is the shape of the live database after the metadata feature
+            # was deployed: the migration table exists but has no markers, and
+            # edit_jobs still has the pre-metadata columns.
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.executescript(
+                    """
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE TABLE edit_jobs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_job_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        preset_id INTEGER,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        file_path TEXT,
+                        file_size INTEGER,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        error_message TEXT
+                    );
+                    """
+                )
+                await db.commit()
+
+            await init_db(self.db_path)
+
+            async with open_database(self.db_path) as db:
+                async with db.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ) as cursor:
+                    versions = [row["version"] for row in await cursor.fetchall()]
+                async with db.execute("PRAGMA table_info(edit_jobs)") as cursor:
+                    columns = {row["name"] for row in await cursor.fetchall()}
+                async with db.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'idx_edit_jobs_metadata_status'"
+                ) as cursor:
+                    metadata_index = await cursor.fetchone()
+
+            self.assertEqual(versions, list(range(1, LATEST_SCHEMA_VERSION + 1)))
+            self.assertIn("metadata_status", columns)
+            self.assertIn("metadata_hashtags", columns)
+            self.assertIn("voice_mode", columns)
+            self.assertIn("voice_outro", columns)
+            self.assertIn("render_status_message_id", columns)
+            self.assertIsNotNone(metadata_index)
 
         asyncio.run(run())
 
