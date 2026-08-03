@@ -510,6 +510,57 @@ class StorageTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_migrates_legacy_database_without_metadata_columns(self):
+        async def run():
+            # This is the shape of the live database after the metadata feature
+            # was deployed: the migration table exists but has no markers, and
+            # edit_jobs still has the pre-metadata columns.
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.executescript(
+                    """
+                    CREATE TABLE schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                    CREATE TABLE edit_jobs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_job_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        preset_id INTEGER,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        file_path TEXT,
+                        file_size INTEGER,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        error_message TEXT
+                    );
+                    """
+                )
+                await db.commit()
+
+            await init_db(self.db_path)
+
+            async with open_database(self.db_path) as db:
+                async with db.execute(
+                    "SELECT version FROM schema_migrations ORDER BY version"
+                ) as cursor:
+                    versions = [row["version"] for row in await cursor.fetchall()]
+                async with db.execute("PRAGMA table_info(edit_jobs)") as cursor:
+                    columns = {row["name"] for row in await cursor.fetchall()}
+                async with db.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'index' AND name = 'idx_edit_jobs_metadata_status'"
+                ) as cursor:
+                    metadata_index = await cursor.fetchone()
+
+            self.assertEqual(versions, list(range(1, LATEST_SCHEMA_VERSION + 1)))
+            self.assertIn("metadata_status", columns)
+            self.assertIn("metadata_hashtags", columns)
+            self.assertIsNotNone(metadata_index)
+
+        asyncio.run(run())
+
     def test_migration_repairs_orphaned_edits_without_deleting_them(self):
         async def run():
             await init_db(self.db_path)

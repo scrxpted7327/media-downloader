@@ -492,7 +492,6 @@ _SCHEMA_SQL = """
     CREATE INDEX IF NOT EXISTS idx_presets_user ON presets(user_id);
     CREATE INDEX IF NOT EXISTS idx_edit_jobs_source ON edit_jobs(source_job_id);
     CREATE INDEX IF NOT EXISTS idx_edit_jobs_user ON edit_jobs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_edit_jobs_metadata_status ON edit_jobs(metadata_status);
     CREATE INDEX IF NOT EXISTS idx_shared_presets_code ON shared_presets(share_code);
     CREATE INDEX IF NOT EXISTS idx_pool_user ON pool_items(user_id);
     CREATE INDEX IF NOT EXISTS idx_pool_status ON pool_items(status);
