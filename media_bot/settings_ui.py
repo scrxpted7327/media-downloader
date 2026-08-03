@@ -66,6 +66,7 @@ class _State:
     PRESET_CREATE_CAPTION_POS = "preset_create_caption_pos"
     PRESET_CREATE_VOICE_MENU = "preset_create_voice_menu"
     PRESET_CREATE_VOICE = "preset_create_voice"
+    PRESET_CREATE_VOICE_MODE = "preset_create_voice_mode"
     PRESET_CREATE_VOICE_TEXT = "preset_create_voice_text"
     PRESET_CREATE_VOICE_QUALITY = "preset_create_voice_quality"
     PRESET_CREATE_VOICE_SPEED = "preset_create_voice_speed"
@@ -107,6 +108,10 @@ _FIELD_CHOICES: dict[str, list[tuple[str, str]]] = {
         ("⬇️ Bottom", "high"),
     ],
     "voice_quality": [("📶 Basic", "basic"), ("✨ Premium", "premium")],
+    "voice_mode": [
+        ("🎤 Manual narration", "normal"),
+        ("🤬 Swearify (AI roast)", "swearify"),
+    ],
     "voice_speed": [
         ("🐢 0.50×", "0.5"), ("0.75×", "0.75"), ("1.00×", "1.0"),
         ("1.25×", "1.25"), ("1.50×", "1.5"), ("🐇 2.00×", "2.0"),
@@ -227,6 +232,7 @@ def _config_snapshot(cfg: Preset | EditJob) -> dict[str, Any]:
         "caption_position": cfg.caption_position,
         "voice_text": cfg.voice_text,
         "voice_over_voice": cfg.voice_over_voice,
+        "voice_mode": cfg.voice_mode,
         "voice_quality": cfg.voice_quality,
         "voice_speed": cfg.voice_speed,
         "tts_engine": cfg.tts_engine,
@@ -253,6 +259,9 @@ def _effective_edit_snapshot(edit: EditJob, preset: Preset | None = None) -> dic
 
 def _voice_summary(values: dict[str, Any]) -> str:
     parts = []
+    mode = values.get("voice_mode") or "normal"
+    if mode == "swearify":
+        parts.append("🤬 Swearify")
     v = values.get("voice_over_voice")
     if v:
         parts.append(f"🎤 {_fmt_current(v)}")
@@ -277,12 +286,14 @@ def _tts_engine_overview(engine: str) -> str:
     return (
         f"🎤 Voice settings\n\n"
         f"Current TTS engine: {engine}\n{detail}\n\n"
-        "Set Voice Text to the narration you want generated."
+        "Manual narration uses Voice Text. Swearify generates a profane comedic "
+        "roast from the clip's transcript and frames, then burns captions for that audio."
     )
 
 
 def _voice_menu_keyboard(back_data: str) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton("🤬 Voice Mode", callback_data=f"{back_data}:voice_mode")],
         [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{back_data}:voice_over_voice")],
         [InlineKeyboardButton("📝 Voice Text", callback_data=f"{back_data}:voice_text")],
         [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{back_data}:voice_quality")],
@@ -414,13 +425,14 @@ def _build_config_rows(
     pos = _caption_position_label(values.get("caption_position"))
     v_name = _fmt_current(values.get("voice_over_voice") or "default")
     v_quality = _fmt_current(values.get("voice_quality") or "basic")
+    v_mode = "🤬 Swearify" if values.get("voice_mode") == "swearify" else "Manual"
     b_path = _fmt_current(values.get("banner_path"))
     rows = [
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
         [InlineKeyboardButton(
-            f"🎤 Voice Settings [{v_name} {v_quality}]",
+            f"🎤 Voice Settings [{v_mode} {v_name} {v_quality}]",
             callback_data=f"{field_prefix}:voice_menu",
         )],
         [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
@@ -451,6 +463,8 @@ def _build_config_rows(
         ("Channel Banner", "channel_banner"),
     ):
         enabled = bool(values.get(field_name))
+        if field_name == "auto_captions" and values.get("voice_mode") == "swearify":
+            enabled = True
         toggles.toggle(
             label,
             enabled,
@@ -504,6 +518,9 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
         await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
     elif action == _State.PRESET_CREATE_VOICE:
         await _show_voice_selector(query, "preset_create", flow, back_data="preset_create:voice:back")
+    elif action == _State.PRESET_CREATE_VOICE_MODE:
+        await _show_options(update, context, action, "Voice mode:", "voice_mode",
+            *_FIELD_CHOICES["voice_mode"])
     elif action == _State.PRESET_CREATE_VOICE_TEXT:
         await _edit_message(query, "Voice-over text to speak (or /skip for none):")
     elif action == _State.PRESET_CREATE_VOICE_QUALITY:
@@ -545,6 +562,7 @@ _CREATE_PREV_STEP: dict[str, str | None] = {
     _State.PRESET_CREATE_CAPTION_POS: _State.PRESET_CREATE_CAPTION_STYLE,
     _State.PRESET_CREATE_VOICE_MENU: _State.PRESET_CREATE_CAPTION_POS,
     _State.PRESET_CREATE_VOICE: _State.PRESET_CREATE_VOICE_MENU,
+    _State.PRESET_CREATE_VOICE_MODE: _State.PRESET_CREATE_VOICE_MENU,
     _State.PRESET_CREATE_VOICE_TEXT: _State.PRESET_CREATE_VOICE_MENU,
     _State.PRESET_CREATE_VOICE_QUALITY: _State.PRESET_CREATE_VOICE_MENU,
     _State.PRESET_CREATE_VOICE_SPEED: _State.PRESET_CREATE_VOICE_MENU,
@@ -603,7 +621,8 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         elif flow.action == _State.PRESET_CREATE_CAPTION_POS:
             flow.data.pop("caption_position", None)
         elif flow.action in (_State.PRESET_CREATE_VOICE, _State.PRESET_CREATE_VOICE_TEXT,
-                             _State.PRESET_CREATE_VOICE_QUALITY, _State.PRESET_CREATE_VOICE_SPEED,
+                             _State.PRESET_CREATE_VOICE_MODE, _State.PRESET_CREATE_VOICE_QUALITY,
+                             _State.PRESET_CREATE_VOICE_SPEED,
                              _State.PRESET_CREATE_TTS_ENGINE):
             pass
         elif flow.action == _State.PRESET_CREATE_BANNER_POS:
@@ -644,6 +663,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
         return
 
     if data == "preset_create:voice:done":
+        flow.data.setdefault("voice_mode", "normal")
         flow.data.setdefault("voice_quality", "basic")
         flow.data.setdefault("voice_speed", 1.0)
         flow.data.setdefault("tts_engine", "auto")
@@ -667,7 +687,11 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
 
     if data.startswith("preset_create:voice:"):
         inner = data.split(":", 2)[-1]
-        if inner == "voice_over_voice":
+        if inner == "voice_mode":
+            flow.action = _State.PRESET_CREATE_VOICE_MODE
+            await _show_options(update, context, flow.action, "Voice mode:", "voice_mode",
+                *_FIELD_CHOICES["voice_mode"])
+        elif inner == "voice_over_voice":
             flow.action = _State.PRESET_CREATE_VOICE
             await _show_voice_selector(query, "preset_create", flow, back_data="preset_create:voice:back")
         elif inner == "voice_text":
@@ -732,7 +756,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
     elif field == "caption_position":
         flow.action = _State.PRESET_CREATE_VOICE_MENU
         await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
-    elif field in ("voice_quality", "voice_speed", "tts_engine", "voice_text", "voice_over_voice"):
+    elif field in ("voice_mode", "voice_quality", "voice_speed", "tts_engine", "voice_text", "voice_over_voice"):
         flow.action = _State.PRESET_CREATE_VOICE_MENU
         await _edit_message(query, "Voice settings:", _voice_menu_keyboard("preset_create:voice"))
     elif field in ("banner_position", "banner_scale", "banner_path"):
@@ -863,6 +887,7 @@ async def settings_callback(
             )
             engine = (preset.tts_engine if preset else None) or "auto"
             rows = [
+                [InlineKeyboardButton("🤬 Voice Mode", callback_data=f"preset:field:{preset_id}:voice_mode")],
                 [InlineKeyboardButton("🎤 Voice Name", callback_data=f"preset:field:{preset_id}:voice_over_voice")],
                 [InlineKeyboardButton("✨ Voice Quality", callback_data=f"preset:field:{preset_id}:voice_quality")],
                 [InlineKeyboardButton("⏩ Voice Speed", callback_data=f"preset:field:{preset_id}:voice_speed")],
@@ -1162,6 +1187,7 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         flow.data["caption_color"] = "white"
         flow.data["caption_style"] = "basic"
         flow.data["caption_position"] = "bottom"
+        flow.data["voice_mode"] = "normal"
         flow.data["voice_quality"] = "basic"
         flow.data["voice_speed"] = 1.0
         flow.data["tts_engine"] = "auto"
@@ -1949,6 +1975,7 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
         if isinstance(flow, dict):
             flow["field_name"] = "voice_menu"
         rows = [
+            [InlineKeyboardButton("🤬 Voice Mode", callback_data=f"{prefix}:voice_menu:voice_mode")],
             [InlineKeyboardButton("🎤 Voice Name", callback_data=f"{prefix}:voice_menu:voice_over_voice")],
             [InlineKeyboardButton("📝 Voice Text", callback_data=f"{prefix}:voice_menu:voice_text")],
             [InlineKeyboardButton("✨ Voice Quality", callback_data=f"{prefix}:voice_menu:voice_quality")],

@@ -65,6 +65,7 @@ class Preset:
     crop_preset: str | None
     caption_text: str | None
     voice_over_voice: str | None
+    voice_mode: str | None
     caption_color: str | None
     caption_style: str | None
     caption_position: str | None
@@ -100,6 +101,7 @@ class EditJob:
     auto_captions: bool
     voice_text: str | None
     voice_over_voice: str | None
+    voice_mode: str | None
     voice_quality: str | None
     voice_speed: float | None
     tts_engine: str | None
@@ -136,6 +138,7 @@ class EditJob:
     metadata_result_message_id: int | None
     metadata_reply_message_id: int | None
     render_delivery_message_id: int | None
+    render_status_message_id: int | None
 
 
 @dataclass(frozen=True)
@@ -228,7 +231,7 @@ class UnsafeStoragePath(ValueError):
 
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 6
 
 _JOB_UPDATE_FIELDS = frozenset({
     "status", "file_path", "file_size", "local_api_used", "status_message_id",
@@ -238,7 +241,7 @@ _USER_SETTINGS_UPDATE_FIELDS = frozenset({
     "preset_name", "crop_preset", "caption_text", "voice_over_voice",
 })
 _PRESET_UPDATE_FIELDS = frozenset({
-    "name", "crop_preset", "caption_text", "voice_over_voice", "caption_color",
+    "name", "crop_preset", "caption_text", "voice_over_voice", "voice_mode", "caption_color",
     "caption_style", "caption_position", "auto_captions", "voice_quality",
     "voice_speed", "voice_text", "tts_engine", "banner_path", "banner_position",
     "banner_scale", "watermark_removal", "watermark_position", "watermark_mode",
@@ -247,7 +250,7 @@ _PRESET_UPDATE_FIELDS = frozenset({
 _EDIT_UPDATE_FIELDS = frozenset({
     "preset_id", "caption_text", "caption_color", "caption_style",
     "caption_position", "auto_captions", "voice_text", "voice_over_voice",
-    "voice_quality", "voice_speed", "tts_engine", "banner_path",
+    "voice_mode", "voice_quality", "voice_speed", "tts_engine", "banner_path",
     "banner_position", "banner_scale", "watermark_removal",
     "watermark_position", "watermark_mode", "watermark_text",
     "watermark_analysis", "watermark_confidence", "watermark_candidates",
@@ -258,7 +261,7 @@ _EDIT_UPDATE_FIELDS = frozenset({
     "metadata_started_at", "metadata_completed_at", "metadata_model",
     "metadata_reasoning_effort", "metadata_progress_message_id",
     "metadata_result_message_id", "metadata_reply_message_id",
-    "render_delivery_message_id",
+    "render_delivery_message_id", "render_status_message_id",
 })
 _POOL_UPDATE_FIELDS = frozenset({"title", "status"})
 _WORKFLOW_UPDATE_FIELDS = frozenset({
@@ -338,6 +341,7 @@ _SCHEMA_SQL = """
         auto_captions INTEGER NOT NULL DEFAULT 0,
         voice_text TEXT,
         voice_over_voice TEXT,
+        voice_mode TEXT,
         voice_quality TEXT,
         voice_speed REAL,
         tts_engine TEXT,
@@ -373,7 +377,8 @@ _SCHEMA_SQL = """
         metadata_progress_message_id INTEGER,
         metadata_result_message_id INTEGER,
         metadata_reply_message_id INTEGER,
-        render_delivery_message_id INTEGER
+        render_delivery_message_id INTEGER,
+        render_status_message_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS download_tokens (
         token_hash TEXT PRIMARY KEY,
@@ -407,6 +412,7 @@ _SCHEMA_SQL = """
         voice_speed REAL,
         voice_text TEXT,
         tts_engine TEXT,
+        voice_mode TEXT,
         banner_path TEXT,
         banner_position TEXT,
         banner_scale TEXT,
@@ -511,6 +517,7 @@ _LEGACY_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("auto_captions", "INTEGER NOT NULL DEFAULT 0"),
         ("voice_text", "TEXT"),
         ("tts_engine", "TEXT"),
+        ("voice_mode", "TEXT"),
         ("banner_path", "TEXT"),
         ("banner_position", "TEXT"),
         ("banner_scale", "TEXT"),
@@ -534,6 +541,7 @@ _LEGACY_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("auto_captions", "INTEGER NOT NULL DEFAULT 0"),
         ("voice_text", "TEXT"),
         ("voice_over_voice", "TEXT"),
+        ("voice_mode", "TEXT"),
         ("voice_quality", "TEXT"),
         ("voice_speed", "REAL"),
         ("tts_engine", "TEXT"),
@@ -571,6 +579,10 @@ _METADATA_COLUMNS: tuple[tuple[str, str], ...] = (
     ("metadata_result_message_id", "INTEGER"),
     ("metadata_reply_message_id", "INTEGER"),
     ("render_delivery_message_id", "INTEGER"),
+)
+
+_RENDER_MESSAGE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("render_status_message_id", "INTEGER"),
 )
 
 
@@ -618,6 +630,22 @@ async def _apply_migrations(db: aiosqlite.Connection) -> None:
             "ON edit_jobs(metadata_status)"
         )
         await _mark_migration(db, 4, "add automatic metadata state")
+    if 5 not in applied:
+        for table in ("presets", "edit_jobs"):
+            existing = await _column_names(db, table)
+            if "voice_mode" not in existing:
+                await db.execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN "voice_mode" TEXT'
+                )
+        await _mark_migration(db, 5, "add voice-over mode")
+    if 6 not in applied:
+        existing = await _column_names(db, "edit_jobs")
+        for column, definition in _RENDER_MESSAGE_COLUMNS:
+            if column not in existing:
+                await db.execute(
+                    f'ALTER TABLE "edit_jobs" ADD COLUMN "{column}" {definition}'
+                )
+        await _mark_migration(db, 6, "track render preparation messages")
 
 
 async def _mark_migration(db: aiosqlite.Connection, version: int, name: str) -> None:
@@ -1016,9 +1044,9 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
         cursor = await db.execute(
             "INSERT INTO presets (user_id, name, crop_preset, caption_text, voice_over_voice, "
             "caption_color, caption_style, caption_position, auto_captions, voice_quality, voice_speed, "
-            "voice_text, tts_engine, banner_path, banner_position, banner_scale, "
+            "voice_text, tts_engine, voice_mode, banner_path, banner_position, banner_scale, "
             "watermark_removal, watermark_position, watermark_mode, watermark_text, channel_banner) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 name,
@@ -1033,6 +1061,7 @@ async def create_preset(db_path: Path, user_id: int, name: str, **kwargs) -> Pre
                 kwargs.get("voice_speed"),
                 kwargs.get("voice_text"),
                 kwargs.get("tts_engine"),
+                kwargs.get("voice_mode"),
                 kwargs.get("banner_path"),
                 kwargs.get("banner_position"),
                 kwargs.get("banner_scale"),
@@ -1192,6 +1221,49 @@ async def get_edit_job(db_path: Path, edit_id: int) -> EditJob | None:
         async with db.execute("SELECT * FROM edit_jobs WHERE id = ?", (edit_id,)) as cur:
             row = await cur.fetchone()
         return _row_to_edit_job(row) if row else None
+
+
+async def find_edit_by_message(
+    db_path: Path,
+    *,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+) -> EditJob | None:
+    """Find an owned edit associated with one of its Telegram messages."""
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT e.* FROM edit_jobs e "
+            "JOIN jobs j ON j.id = e.source_job_id "
+            "WHERE e.user_id = ? AND j.chat_id = ? AND ("
+            "e.render_status_message_id = ? OR "
+            "e.render_delivery_message_id = ? OR "
+            "e.metadata_progress_message_id = ? OR "
+            "e.metadata_result_message_id = ? OR "
+            "e.metadata_reply_message_id = ?"
+            ") ORDER BY e.updated_at DESC, e.id DESC LIMIT 1",
+            (user_id, chat_id, message_id, message_id, message_id, message_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_edit_job(row) if row else None
+
+
+async def find_job_by_message(
+    db_path: Path,
+    *,
+    user_id: int,
+    chat_id: int,
+    message_id: int,
+) -> JobRecord | None:
+    """Find an owned source job by its Telegram status message."""
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT * FROM jobs WHERE user_id = ? AND chat_id = ? "
+            "AND status_message_id = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (user_id, chat_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_job(row) if row else None
 
 
 async def queue_metadata_job(
@@ -2255,6 +2327,7 @@ def _row_to_preset(row: aiosqlite.Row) -> Preset:
         crop_preset=row["crop_preset"],
         caption_text=row["caption_text"],
         voice_over_voice=row["voice_over_voice"],
+        voice_mode=row["voice_mode"],
         caption_color=row["caption_color"],
         caption_style=row["caption_style"],
         caption_position=row["caption_position"],
@@ -2291,6 +2364,7 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         auto_captions=_safe_bool(row, "auto_captions"),
         voice_text=row["voice_text"],
         voice_over_voice=row["voice_over_voice"],
+        voice_mode=row["voice_mode"],
         voice_quality=row["voice_quality"],
         voice_speed=row["voice_speed"],
         tts_engine=row["tts_engine"],
@@ -2327,6 +2401,7 @@ def _row_to_edit_job(row: aiosqlite.Row) -> EditJob:
         metadata_result_message_id=_safe_int(row, "metadata_result_message_id"),
         metadata_reply_message_id=_safe_int(row, "metadata_reply_message_id"),
         render_delivery_message_id=_safe_int(row, "render_delivery_message_id"),
+        render_status_message_id=_safe_int(row, "render_status_message_id"),
     )
 
 

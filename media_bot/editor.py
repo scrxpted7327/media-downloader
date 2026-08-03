@@ -1457,6 +1457,7 @@ async def render_edit(
     caption_position: str = "bottom",
     auto_captions: bool = True,
     voice_text: str | None = None,
+    voice_mode: str | None = None,
     voice: str = "default",
     voice_quality: str = "basic",
     voice_speed: float = 1.0,
@@ -1515,9 +1516,32 @@ async def render_edit(
                     progress_callback=progress_callback,
                 )
 
-        if caption_text or auto_captions:
+        voice_mode_key = (voice_mode or "normal").strip().lower()
+        if voice_mode_key not in {"normal", "swearify"}:
+            raise DownloadError(f"unsupported voice-over mode: {voice_mode}")
+
+        async def _render_voice_stage() -> None:
+            nonlocal current, step_idx
+            if not voice_text:
+                raise DownloadError("voice_text is required for the selected voice-over mode")
+            tmp = _stage("voice")
+            if advance:
+                advance(step_idx)
+            current = await render_voice_over(
+                current, tmp, voice_text, tts_engine, voice, voice_quality,
+                voice_speed, timeout_seconds,
+                progress_callback=progress_callback,
+            )
+            step_idx += 1
+
+        async def _render_caption_stage(*, force_auto: bool = False) -> None:
+            nonlocal current, step_idx, staged_srt
+            caption_enabled = force_auto or caption_text or auto_captions
+            if not caption_enabled:
+                return
             tmp = _stage("cap")
-            if auto_captions:
+            caption_auto = True if force_auto else auto_captions
+            if caption_auto:
                 staged_srt = output_path.with_name(f".{output_path.stem}_captions.srt")
                 intermediates.add(staged_srt)
             if advance:
@@ -1525,7 +1549,7 @@ async def render_edit(
             current = await render_captions(
                 current, tmp,
                 caption_text, caption_color, caption_style, caption_position,
-                auto_captions, timeout_seconds,
+                caption_auto, timeout_seconds,
                 srt_output_path=staged_srt,
                 progress_callback=progress_callback,
                 bottom_safe_area=(
@@ -1538,16 +1562,16 @@ async def render_edit(
                 await progress_callback(100)
             step_idx += 1
 
-        if voice_text:
-            tmp = _stage("voice")
-            if advance:
-                advance(step_idx)
-            current = await render_voice_over(
-                current, tmp, voice_text, tts_engine, voice, voice_quality,
-                voice_speed, timeout_seconds,
-                progress_callback=progress_callback,
-            )
-            step_idx += 1
+        if voice_mode_key == "swearify":
+            # Swearify captions must be generated from the replacement audio, not
+            # from the clip's original speech. The voice stage therefore precedes
+            # a forced automatic-caption stage.
+            await _render_voice_stage()
+            await _render_caption_stage(force_auto=True)
+        else:
+            await _render_caption_stage()
+            if voice_text:
+                await _render_voice_stage()
 
         if channel_banner and source_url:
             tmp = _stage("chan")

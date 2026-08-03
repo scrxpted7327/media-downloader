@@ -12,6 +12,22 @@ import restart_bot
 
 
 class SupervisorReportingTests(unittest.TestCase):
+    def test_supervisor_state_snapshot_records_current_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "supervisor-state.json"
+            with patch.object(supervisor, "SUPERVISOR_STATE", state_path):
+                state = {"pid": 123, "state": "starting"}
+                supervisor._set_supervisor_state(
+                    state,
+                    "running",
+                    child_pid=456,
+                )
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["state"], "running")
+            self.assertEqual(payload["child_pid"], 456)
+            self.assertIn("updated_at", payload)
+
     def test_restart_shutdown_signal_sends_and_acknowledges(self):
         with tempfile.TemporaryDirectory() as directory:
             ack = Path(directory) / "restart-ack"

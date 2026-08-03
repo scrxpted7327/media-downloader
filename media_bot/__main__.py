@@ -4,16 +4,19 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
+import tempfile
 import time
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -85,6 +88,7 @@ from .settings_ui import (
     settings_text_handler,
     show_editconfig_menu,
 )
+from .swearify import SwearifyError, generate_swearify_script
 from .storage import (
     cleanup_download_messages,
     cleanup_edit_artifacts,
@@ -99,6 +103,8 @@ from .storage import (
     delete_durable_pool_item,
     delete_job_with_artifacts,
     foreign_key_violations,
+    find_edit_by_message,
+    find_job_by_message,
     get_edit_job,
     get_job,
     get_saved_edit_pool_item,
@@ -120,7 +126,7 @@ from .storage import (
     update_job,
 )
 from .tools import prefer_ffmpeg_full, provision_ytdlp
-from .watermark import WatermarkAnalysis, analyze_video, create_preview
+from .watermark import WatermarkAnalysis, analyze_video, create_candidate_previews
 from .work_queue import WorkAlreadyQueued, WorkQueue, WorkRejected
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -130,6 +136,7 @@ install_event_logging()
 
 RESTART_MARKER = Path("runtime/restart-requested")
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
+SUPERVISOR_STATE_PATH = Path("runtime/supervisor-state.json")
 FLOW_TTL_SECONDS = 15 * 60
 STARTED_MONOTONIC = time.monotonic()
 
@@ -203,6 +210,64 @@ def _format_eta_line(elapsed: float, pct: int) -> str:
     if eta_seconds < 1:
         return "⏱ almost done"
     return f"⏱ {_format_duration(eta_seconds)} left"
+
+
+def _read_supervisor_state() -> dict[str, object] | None:
+    try:
+        payload = json.loads(SUPERVISOR_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _supervisor_state_lines() -> list[str]:
+    """Describe the supervisor heartbeat without treating a stale file as live."""
+    state = _read_supervisor_state()
+    if state is None:
+        return ["Supervisor: no heartbeat is available (it may be stopped or pre-update)."]
+
+    heartbeat_text = str(state.get("heartbeat_at") or "")
+    heartbeat_age: float | None = None
+    if heartbeat_text:
+        try:
+            heartbeat = datetime.fromisoformat(heartbeat_text)
+            if heartbeat.tzinfo is None:
+                heartbeat = heartbeat.replace(tzinfo=timezone.utc)
+            heartbeat_age = max(0.0, (datetime.now(timezone.utc) - heartbeat).total_seconds())
+        except ValueError:
+            heartbeat_age = None
+
+    status = str(state.get("state") or "unknown")
+    if heartbeat_age is None:
+        freshness = "heartbeat age unknown"
+    elif heartbeat_age > 20:
+        freshness = f"heartbeat stale for {_format_duration(heartbeat_age)}"
+    else:
+        freshness = f"heartbeat {int(heartbeat_age)}s ago"
+
+    child_pid = state.get("child_pid")
+    if status == "running" and (heartbeat_age is None or heartbeat_age <= 20):
+        detail = "bot is running; an active job may simply need patience"
+    elif status in {"crashed", "backoff"}:
+        detail = "bot crashed and is restarting or waiting to restart"
+    elif status == "halted":
+        detail = "supervisor is halted and needs operator intervention"
+    elif status in {"stopped", "stopping"}:
+        detail = "supervisor is stopped"
+    elif heartbeat_age is not None and heartbeat_age > 20:
+        detail = "supervisor heartbeat is stale; it may have halted"
+    else:
+        detail = "supervisor state is being initialized"
+
+    lines = [
+        f"Supervisor: {status} ({detail}; {freshness})",
+    ]
+    if child_pid:
+        lines.append(f"Bot process: PID {child_pid}")
+    reason = str(state.get("reason") or state.get("last_error") or "").strip()
+    if reason:
+        lines.append(f"Supervisor note: {redact_sensitive(reason, 400)}")
+    return lines
 
 
 async def _safe_status_edit(message, text: str) -> bool:
@@ -296,6 +361,65 @@ class _ProgressReporter:
             pass
 
 
+def _render_preparation_text(
+    edit,
+    source,
+    preset,
+    *,
+    auto_captions: bool,
+    voice_text: str | None,
+    voice_mode: str,
+    watermark_mode: str,
+    watermark_position: str,
+    banner_path: str | None,
+    channel_banner: bool,
+) -> str:
+    """Explain the resolved render plan before expensive work begins."""
+    source_label = (source.title or source.url or "source video").strip()
+    if len(source_label) > 180:
+        source_label = source_label[:177].rstrip() + "…"
+    stages: list[str] = []
+    if watermark_mode in {"remove", "swap"}:
+        action = "swap" if watermark_mode == "swap" else "remove"
+        detail = "automatic candidate review" if watermark_position == "auto" else watermark_position
+        stages.append(f"watermark {action} ({detail})")
+    if auto_captions or voice_mode == "swearify":
+        stages.append("captions from speech")
+    if voice_text or voice_mode == "swearify":
+        stages.append("Swearify voice-over" if voice_mode == "swearify" else "voice-over")
+    if channel_banner:
+        stages.append("channel banner")
+    if banner_path:
+        stages.append("banner overlay")
+    if not stages:
+        stages.append("video render / validation")
+
+    caption_detail = "Auto Captions (Whisper)" if auto_captions else "off"
+    if voice_mode == "swearify":
+        voice_detail = "Swearify roast (Codex → TTS → captions)"
+    elif voice_text:
+        voice_detail = f"manual narration ({len(voice_text.strip())} characters)"
+    else:
+        voice_detail = "off"
+    watermark_detail = "keep"
+    if watermark_mode in {"remove", "swap"}:
+        watermark_detail = f"{watermark_mode} / {watermark_position}"
+    banner_detail = Path(banner_path).name if banner_path else "off"
+    preset_name = preset.name if preset is not None else "ad hoc edit"
+    return (
+        f"🎬 Preparing render — Job #{edit.id}\n"
+        f"Source: {source_label}\n"
+        f"Preset: {preset_name}\n\n"
+        f"Watermark: {watermark_detail}\n"
+        f"Captions: {caption_detail}\n"
+        f"Voice: {voice_detail}\n"
+        f"Banner: {banner_detail}\n"
+        f"Planned stages: {' → '.join(stages)}\n\n"
+        "Auto Hashtags: queued after delivery from the original source when "
+        "Codex is available. Some stages may take a few minutes."
+    )
+
+
 def _authorized(update: Update, settings: Settings) -> bool:
     chat = update.effective_chat
     user = update.effective_user
@@ -374,7 +498,7 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
         caption = " ".join(job.source_caption.split())
         details.append(caption[:300] + ("…" if len(caption) > 300 else ""))
     suffix = "\n\n" + "\n".join(details) if details else ""
-    text = f"✅ Download complete. Choose an action:{suffix}"
+    text = f"✅ Download complete. Job #{job.id}. Choose an action:{suffix}"
     thumbnail = Path(job.thumbnail_path) if job.thumbnail_path else None
     if thumbnail is not None and thumbnail.is_file():
         with thumbnail.open("rb") as photo:
@@ -414,7 +538,7 @@ async def _send_render_download_link(
     )
     url = _build_download_url(settings, token)
     link_message = await message.reply_text(
-        f"⬇️ Direct download ({settings.token_expiry_minutes} min):\n{url}",
+        f"⬇️ Direct download for Job #{edit.id} ({settings.token_expiry_minutes} min):\n{url}",
         disable_web_page_preview=True,
         reply_markup=_render_pool_keyboard(edit.id, saved=False),
     )
@@ -1123,7 +1247,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         help_text += (
             "\n\nOperator commands:\n"
             "/status - service health and repair status\n"
-            "/fix [provider/model] - run approved repairs "
+            "/fix [provider/model] - run approved repairs; reply /fix to a bot "
+            "message for a durable state/supervisor check "
             f"(currently {repair_state})"
         )
     await message.reply_text(help_text)
@@ -1647,6 +1772,49 @@ def _watermark_review_keyboard(edit, analysis: WatermarkAnalysis) -> InlineKeybo
     return InlineKeyboardMarkup(rows)
 
 
+async def _send_watermark_review_album(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    edit,
+    analysis: WatermarkAnalysis,
+    preview_paths: list[Path],
+) -> None:
+    """Send candidate previews as a swipeable album with a separate control message."""
+    media: list[InputMediaPhoto] = []
+    with ExitStack() as handles:
+        for candidate, preview_path in zip(analysis.candidates, preview_paths, strict=False):
+            media.append(InputMediaPhoto(
+                media=handles.enter_context(preview_path.open("rb")),
+                caption=(
+                    f"Job #{edit.id} — Candidate {candidate.id} "
+                    f"({candidate.confidence:.0%} confidence)"
+                ),
+            ))
+        try:
+            await context.bot.send_media_group(
+                chat_id=message.chat_id,
+                media=media,
+            )
+        except Exception as exc:
+            # A private/local Telegram API may not expose albums. Keep the
+            # important property—one clear image per candidate—even there.
+            LOGGER.warning("Watermark preview album failed; sending separate photos: %s", exc)
+            for candidate, preview_path in zip(analysis.candidates, preview_paths, strict=False):
+                with preview_path.open("rb") as photo:
+                    await message.reply_photo(
+                        photo=photo,
+                        caption=(
+                            f"Job #{edit.id} — Candidate {candidate.id} "
+                            f"({candidate.confidence:.0%} confidence)"
+                        ),
+                    )
+    await message.reply_text(
+        f"Swipe through the candidate previews for Job #{edit.id}, then "
+        "select the regions to remove or replace:",
+        reply_markup=_watermark_review_keyboard(edit, analysis),
+    )
+
+
 async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -1823,29 +1991,33 @@ async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> Non
     if edit is None:
         return
     source = await get_job(db_path, edit.source_job_id)
-    if source is None or not edit.file_path:
+    if source is None or not source.file_path:
         await update_edit_job(
             db_path,
             edit_id,
             metadata_status="failed",
-            metadata_error="rendered video or source job is missing",
+            metadata_error="original source video is missing",
             metadata_completed_at=datetime.now(timezone.utc).isoformat(),
         )
         return
 
     async def progress(stage: str, percent: int) -> None:
-        await _metadata_progress(context, edit_id, stage, percent)
+        await _metadata_progress(context, edit_id, f"original source: {stage}", percent)
 
     model, reasoning, executable, timeout, codex_home = _metadata_settings(settings)
     try:
-        result: MetadataResult = await generate_metadata(
-            Path(edit.file_path),
-            model=model,
-            reasoning_effort=reasoning,
-            codex_executable=executable,
-            timeout_seconds=timeout,
-            codex_home=codex_home,
-            progress_callback=progress,
+        result: MetadataResult = await _run_with_progress_heartbeat(
+            lambda: generate_metadata(
+                Path(source.file_path),
+                model=model,
+                reasoning_effort=reasoning,
+                codex_executable=executable,
+                timeout_seconds=timeout,
+                codex_home=codex_home,
+                progress_callback=progress,
+            ),
+            progress,
+            "metadata analysis still running",
         )
         await update_edit_job(
             db_path,
@@ -1944,7 +2116,10 @@ async def _enqueue_metadata(
     try:
         progress_kwargs: dict[str, object] = {
             "chat_id": source.chat_id,
-            "text": f"📝 Generating description and hashtags for job #{edit_id}…",
+            "text": (
+                f"📝 Generating description and hashtags from the original source "
+                f"for job #{edit_id}…"
+            ),
         }
         if delivery_message_id is not None:
             progress_kwargs["reply_to_message_id"] = delivery_message_id
@@ -2040,7 +2215,16 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
 
     try:
         await update_edit_job(db_path, edit.id, status="rendering", error_message=None)
-        msg = await update.effective_message.reply_text("🎬 Preparing render...")
+        msg = await update.effective_message.reply_text(
+            f"🎬 Preparing render — Job #{edit.id}\nLoading source and render settings…"
+        )
+        render_status_message_id = _telegram_message_id(msg)
+        if render_status_message_id is not None:
+            await update_edit_job(
+                db_path,
+                edit.id,
+                render_status_message_id=render_status_message_id,
+            )
         preset = None
         if edit.preset_id:
             from .storage import list_presets
@@ -2058,6 +2242,8 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         auto_cap = edit.auto_captions
         v_text = edit.voice_text if edit.voice_text is not None else (preset.voice_text if preset else None)
         v_voice = edit.voice_over_voice if edit.voice_over_voice is not None else (preset.voice_over_voice or "default" if preset else "default")
+        v_mode = edit.voice_mode if edit.voice_mode is not None else (preset.voice_mode if preset else None)
+        v_mode = (v_mode or "normal").strip().lower()
         v_quality = edit.voice_quality if edit.voice_quality is not None else (preset.voice_quality or "basic" if preset else "basic")
         v_speed = edit.voice_speed if edit.voice_speed is not None else (preset.voice_speed or 1.0 if preset else 1.0)
         tts_eng = edit.tts_engine if edit.tts_engine is not None else (preset.tts_engine if preset else None)
@@ -2073,6 +2259,51 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         wm_text = edit.watermark_text if edit.watermark_text is not None else (
             preset.watermark_text if preset else None
         )
+        ch_banner = edit.channel_banner
+        if v_mode not in {"normal", "swearify"}:
+            raise DownloadError(f"Unsupported voice-over mode: {v_mode}")
+        await _safe_status_edit(
+            msg,
+            _render_preparation_text(
+                edit,
+                source,
+                preset,
+                auto_captions=bool(auto_cap),
+                voice_text=v_text,
+                voice_mode=v_mode,
+                watermark_mode=wm_mode,
+                watermark_position=wm_pos,
+                banner_path=b_path,
+                channel_banner=ch_banner,
+            ),
+        )
+        if v_mode == "swearify":
+            await msg.edit_text(
+                "🤬 Swearify is analyzing the clip for an evidence-bound comedic roast…"
+            )
+
+            async def _swearify_progress(stage: str, percent: int) -> None:
+                await _safe_status_edit(msg, f"🤬 Swearify: {stage} ({percent}%)")
+
+            model, reasoning, executable, timeout, codex_home = _metadata_settings(settings)
+            try:
+                swearify_result = await _run_with_status_heartbeat(
+                    msg,
+                    "🤬 Swearify is still analyzing the original clip…",
+                    lambda: generate_swearify_script(
+                        Path(edit.file_path),
+                        model=model,
+                        reasoning_effort=reasoning,
+                        codex_executable=executable,
+                        timeout_seconds=timeout,
+                        codex_home=codex_home,
+                        progress_callback=_swearify_progress,
+                    ),
+                )
+            except SwearifyError as exc:
+                raise DownloadError(f"Swearify script generation failed: {exc}") from exc
+            v_text = swearify_result.script
+            auto_cap = True
         if wm_mode == "swap" and not (wm_text and wm_text.strip()):
             raise DownloadError("Set Replacement Watermark text before using Swap mode.")
         wm_removal = wm_mode in ("remove", "swap")
@@ -2081,7 +2312,11 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             if not edit.watermark_analysis:
                 await msg.edit_text("🔎 Analyzing persistent watermark regions…")
                 try:
-                    analysis = await asyncio.to_thread(analyze_video, Path(edit.file_path))
+                    analysis = await _run_with_status_heartbeat(
+                        msg,
+                        "🔎 Watermark analysis is still running…",
+                        lambda: asyncio.to_thread(analyze_video, Path(edit.file_path)),
+                    )
                 except Exception as exc:
                     LOGGER.warning("Persistent watermark analysis unavailable: %s", exc)
                     append_event(
@@ -2093,17 +2328,12 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                 if analysis is None:
                     wm_candidates = None
                 else:
-                    preview_path = storage_dir / f"edit-{edit.id}-watermarks.jpg"
-                    if analysis.candidates:
-                        await asyncio.to_thread(
-                            create_preview, Path(edit.file_path), analysis, preview_path,
-                        )
                     confidence = max((item.confidence for item in analysis.candidates), default=0.0)
                     edit = await update_edit_job(
                         db_path, edit.id, watermark_analysis=analysis.to_json(),
                         watermark_confidence=confidence,
                         watermark_candidates=json.dumps(list(analysis.selected)),
-                        watermark_preview_path=str(preview_path) if analysis.candidates else None,
+                        watermark_preview_path=None,
                         status="awaiting_watermark_review" if analysis.requires_review else "pending",
                     )
                     append_event(
@@ -2114,16 +2344,25 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                         duration_seconds=analysis.duration_seconds,
                     )
                     if analysis.requires_review:
-                        await msg.edit_text("Watermark candidates need your review.")
-                        with preview_path.open("rb") as preview:
-                            await update.effective_message.reply_photo(
-                                preview,
-                                caption=(
-                                    "Select the numbered regions to replace, then tap Apply."
-                                    if wm_mode == "swap"
-                                    else "Select the numbered regions to remove, then tap Apply."
-                                ),
-                                reply_markup=_watermark_review_keyboard(edit, analysis),
+                        await msg.edit_text(
+                            "🔎 Watermark candidates need your review. "
+                            "Preparing a swipeable preview for each region…"
+                        )
+                        with tempfile.TemporaryDirectory(
+                            prefix=f"media-bot-watermark-review-{edit.id}-"
+                        ) as preview_directory:
+                            preview_paths = await asyncio.to_thread(
+                                create_candidate_previews,
+                                Path(edit.file_path),
+                                analysis,
+                                Path(preview_directory),
+                            )
+                            await _send_watermark_review_album(
+                                msg,
+                                context,
+                                edit,
+                                analysis,
+                                preview_paths,
                             )
                         return
             if edit.watermark_analysis:
@@ -2135,15 +2374,13 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                 ]
                 if analysis.candidates and not wm_candidates:
                     wm_removal = False
-        ch_banner = edit.channel_banner
-
         steps = []
         if wm_removal:
             steps.append("Watermark swap" if wm_mode == "swap" else "Watermark removal")
         if cap_text or auto_cap:
             steps.append("Captions")
         if v_text:
-            steps.append("Voice-over")
+            steps.append("Swearify voice-over" if v_mode == "swearify" else "Voice-over")
         if ch_banner and source.url:
             steps.append("Channel banner")
         if b_path:
@@ -2162,6 +2399,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             caption_position=cap_pos,
             auto_captions=auto_cap,
             voice_text=v_text,
+            voice_mode=v_mode,
             voice=v_voice,
             voice_quality=v_quality,
             voice_speed=v_speed,
@@ -2267,10 +2505,208 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
     await _safe_status_edit(msg, f"✅ Job #{edit.id} delivery finished.")
 
 
+async def _run_with_status_heartbeat(message, label: str, operation):
+    """Keep a long-running operator action visibly alive in Telegram."""
+    started = time.monotonic()
+    heartbeat_stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while not heartbeat_stop.is_set():
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=8)
+            except asyncio.TimeoutError:
+                await _safe_status_edit(
+                    message,
+                    f"{label}\n⏳ Still working ({_format_duration(time.monotonic() - started)})…",
+                )
+
+    task = asyncio.create_task(heartbeat(), name="operator-status-heartbeat")
+    try:
+        return await operation()
+    finally:
+        heartbeat_stop.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _run_with_progress_heartbeat(operation, progress, label: str):
+    """Keep a durable progress message alive during callback-silent analysis."""
+    heartbeat_stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while not heartbeat_stop.is_set():
+            try:
+                await asyncio.wait_for(heartbeat_stop.wait(), timeout=8)
+            except asyncio.TimeoutError:
+                await progress(label, 50)
+
+    task = asyncio.create_task(heartbeat(), name="analysis-progress-heartbeat")
+    try:
+        return await operation()
+    finally:
+        heartbeat_stop.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+_JOB_REFERENCE_PATTERN = re.compile(r"\b(?:job|render)\s*#?\s*(\d+)\b", re.IGNORECASE)
+
+
+async def _resolve_fix_target(
+    db_path: Path,
+    user_id: int,
+    message,
+) -> tuple[object | None, object | None]:
+    """Resolve a replied bot message to an owned edit and/or source job."""
+    target_id = getattr(message, "message_id", None)
+    chat_id = getattr(message, "chat_id", None)
+    if not isinstance(target_id, int) or not isinstance(chat_id, int):
+        return None, None
+
+    edit = await find_edit_by_message(
+        db_path,
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=target_id,
+    )
+    job = await find_job_by_message(
+        db_path,
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=target_id,
+    )
+    if edit is not None:
+        job = job or await get_job(db_path, edit.source_job_id)
+        return edit, job
+    if job is not None:
+        return None, job
+
+    body = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+    match = _JOB_REFERENCE_PATTERN.search(str(body))
+    if not match:
+        return None, None
+    reference_id = int(match.group(1))
+    possible_edit = await get_edit_job(db_path, reference_id)
+    if (
+        possible_edit is not None
+        and possible_edit.user_id == user_id
+    ):
+        source = await get_job(db_path, possible_edit.source_job_id)
+        if source is not None and source.chat_id == chat_id:
+            return possible_edit, source
+    possible_job = await get_job(db_path, reference_id)
+    if (
+        possible_job is not None
+        and possible_job.user_id == user_id
+        and possible_job.chat_id == chat_id
+    ):
+        return None, possible_job
+    return None, None
+
+
+def _queue_activity(work: WorkQueue | None, label: str) -> str:
+    if work is None:
+        return "queue unavailable"
+    if work.is_active(label):
+        return "running"
+    if work.has_label(label):
+        return "queued"
+    return "not admitted"
+
+
+async def _reply_fix_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    reply = getattr(message, "reply_to_message", None) if message is not None else None
+    if message is None or user is None or reply is None:
+        return
+
+    edit, job = await _resolve_fix_target(
+        context.application.bot_data["db_path"],
+        user.id,
+        reply,
+    )
+    lines = ["🩺 Supervisor state check", *_supervisor_state_lines()]
+    if edit is None and job is None:
+        lines.extend([
+            "",
+            "I could not map that bot message to a durable download or render job.",
+            "No repair was executed. Reply /fix to a message containing a Job # reference or a tracked status message.",
+        ])
+        await message.reply_text("\n".join(lines))
+        return
+
+    db_path: Path = context.application.bot_data["db_path"]
+    if edit is not None:
+        job = job or await get_job(db_path, edit.source_job_id)
+        render_work: WorkQueue | None = context.application.bot_data.get("render_work")
+        metadata_work: WorkQueue | None = context.application.bot_data.get("metadata_work")
+        lines.extend([
+            "",
+            f"Render #{edit.id}: {edit.status}",
+            f"Render queue: {_queue_activity(render_work, f'render:{edit.id}')}",
+        ])
+        if edit.status == "awaiting_watermark_review":
+            lines.append("The render is paused waiting for your watermark candidate selection.")
+        elif edit.status in {"queued", "rendering"}:
+            render_state = _queue_activity(render_work, f"render:{edit.id}")
+            if render_state == "running":
+                lines.append("The render is still running; this likely needs patience.")
+            elif render_state == "queued":
+                lines.append("The render is admitted and waiting for a worker.")
+            else:
+                lines.append("The durable row says this render is active, but no live worker owns it; it may have halted.")
+        elif edit.status == "failed":
+            lines.append(f"Render failed: {redact_sensitive(edit.error_message or 'unknown error', 500)}")
+        elif edit.status == "rendered":
+            lines.append("The video render completed.")
+
+        if edit.status == "rendered" and edit.metadata_status in {"queued", "running"}:
+            metadata_state = _queue_activity(metadata_work, f"metadata:{edit.id}")
+            lines.append(f"Auto Hashtags: {edit.metadata_status} ({metadata_state})")
+            if metadata_state == "running":
+                lines.append("Metadata generation is still running; it may simply need patience.")
+            elif metadata_state == "not admitted":
+                lines.append("Metadata is marked active but has no live worker; it may have halted.")
+        elif edit.metadata_status in {"generated", "skipped", "failed", "cancelled"}:
+            lines.append(f"Auto Hashtags: {edit.metadata_status}")
+    elif job is not None:
+        download_work: WorkQueue | None = context.application.bot_data.get("download_work")
+        activity = _queue_activity(download_work, f"download:{job.id}")
+        lines.extend([
+            "",
+            f"Download #{job.id}: {job.status}",
+            f"Download queue: {activity}",
+        ])
+        if job.status in {"queued", "downloading"}:
+            if activity == "running":
+                lines.append("The download is still running; this likely needs patience.")
+            elif activity == "queued":
+                lines.append("The download is admitted and waiting for a worker.")
+            else:
+                lines.append("The durable row says this download is active, but no live worker owns it; it may have halted.")
+        elif job.status == "failed":
+            lines.append(f"Download failed: {redact_sensitive(job.error_message or 'unknown error', 500)}")
+        else:
+            lines.append("The download is no longer active.")
+
+    lines.extend(["", "No code repair was executed by this reply-state check."])
+    await message.reply_text("\n".join(lines))
+
+
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
     message = update.effective_message
-    if message is None or not _admin_authorized(update, settings):
+    if message is None:
+        return
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None) if reply is not None else None
+    if isinstance(reply_id, int):
+        if not _authorized(update, settings):
+            return
+        await _reply_fix_state(update, context)
+        return
+    if not _admin_authorized(update, settings):
         return
     if not settings.repair_enabled:
         await message.reply_text(
@@ -2293,32 +2729,57 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     model_text = f" using {model}" if model else ""
-    await message.reply_text(f"🔍 Scanning for errors to fix{model_text}...")
+    progress = await message.reply_text(
+        f"🔍 Supervisor is scanning for errors to fix{model_text}…\n"
+        "I’ll keep this message updated while checks or repairs run."
+    )
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     error_files = sorted(ERRORS_DIR.glob("*.json"))
     pending = [ef for ef in error_files if not ef.name.startswith(("fixed_", "failed_", "unfixed_"))]
     if not pending:
-        await message.reply_text("No pending errors found.")
+        await _safe_status_edit(progress, "✅ Supervisor scan complete. No pending errors found.")
         return
 
     report_lines = []
-    for ef in pending[:5]:
+    for index, ef in enumerate(pending[:5], start=1):
+        await _safe_status_edit(
+            progress,
+            f"🔍 Supervisor repair scan ({index}/{min(len(pending), 5)})\n"
+            f"Inspecting {ef.stem}…",
+        )
         error_info = load_error_log(ef)
         if error_info is None:
             continue
         category = categorize_error(error_info.get("message", ""))
         error_info["category"] = category
-        fix_result = await apply_known_fix(
-            error_info,
-            settings.tools_dir,
-            repair_enabled=settings.repair_enabled,
+        fix_result = await _run_with_status_heartbeat(
+            progress,
+            f"🛠️ Applying approved fix [{category}]…",
+            lambda: apply_known_fix(
+                error_info,
+                settings.tools_dir,
+                repair_enabled=settings.repair_enabled,
+            ),
         )
         if category == "unknown":
             workspace = Path.cwd()
-            script_path = await invoke_opencode_fix(error_info, workspace, model=model)
+            await _safe_status_edit(
+                progress,
+                f"🤖 Supervisor is analyzing unknown error [{category}]…\n"
+                "Preparing the approved repair path.",
+            )
+            script_path = await _run_with_status_heartbeat(
+                progress,
+                "🤖 OpenCode repair analysis is still running…",
+                lambda: invoke_opencode_fix(error_info, workspace, model=model),
+            )
             if script_path:
-                code, output = await run_fix_script(
-                    script_path, repair_enabled=settings.repair_enabled,
+                code, output = await _run_with_status_heartbeat(
+                    progress,
+                    "🤖 Running the approved repair script…",
+                    lambda: run_fix_script(
+                        script_path, repair_enabled=settings.repair_enabled,
+                    ),
                 )
                 append_event(
                     "fix_agent",
@@ -2341,7 +2802,11 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             report_lines.append(f"⚠️ Fix failed [{category}]: {fix_result[:200]}")
             ef.replace(ERRORS_DIR / f"failed_{ef.name}")
 
-    await message.reply_text("\n".join(report_lines) if report_lines else "No fixable errors.")
+    await _safe_status_edit(
+        progress,
+        "✅ Supervisor repair scan complete.\n\n"
+        + ("\n".join(report_lines) if report_lines else "No fixable errors."),
+    )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2398,6 +2863,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = [
         "🤖 Operator Status",
         f"Uptime: {uptime}",
+        *_supervisor_state_lines(),
         f"Database: {db_health}; foreign-key violations={fk_violations}",
         f"Jobs: {', '.join(job_states) if job_states else 'none'}",
         f"Metadata: {', '.join(metadata_states) if metadata_states else 'none'}",

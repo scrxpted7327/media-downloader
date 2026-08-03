@@ -157,6 +157,8 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.db_path = self.root / "media.db"
+        self.original = self.root / "original.mp4"
+        self.original.write_bytes(b"original video")
         self.video = self.root / "edit-final.mp4"
         self.video.write_bytes(b"video")
         await init_db(self.db_path)
@@ -203,6 +205,13 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
         from media_bot.__main__ import _metadata_job
 
         job = await create_job(self.db_path, "https://example.test/video", 1, 1)
+        await update_job(
+            self.db_path,
+            job.id,
+            status="uploaded",
+            file_path=str(self.original),
+            file_size=self.original.stat().st_size,
+        )
         edit = await create_edit_job(self.db_path, job.id, 1)
         await update_edit_job(
             self.db_path,
@@ -246,7 +255,7 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=MetadataResult(
                 "A grounded clip", tuple(f"#tag{index}" for index in range(8))
             )),
-        ):
+        ) as generate:
             await metadata_job(context, edit_id)
 
         updated = await get_edit_job(self.db_path, edit_id)
@@ -255,6 +264,7 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.metadata_reply_message_id, 20)
         bot.send_message.assert_awaited_once()
         self.assertIn("Description and hashtags", bot.send_message.await_args.kwargs["text"])
+        self.assertEqual(generate.await_args.args[0], self.original)
 
     async def test_codex_unavailable_skips_metadata_without_affecting_render_status(self):
         work = WorkQueue(name="metadata", workers=1, capacity=2, per_user_capacity=2)

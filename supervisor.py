@@ -34,6 +34,7 @@ RESTART_DELAY = 3
 MAX_RESTART_DELAY = 300
 EVENTS_PATH = Path("runtime/events.jsonl")
 SUPERVISOR_LOG = Path("runtime/supervisor.log")
+SUPERVISOR_STATE = Path("runtime/supervisor-state.json")
 EVENTS_MAX_BYTES = 5 * 1024 * 1024
 EVENTS_BACKUP_COUNT = 3
 SUPERVISOR_LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -42,6 +43,7 @@ MAX_CONSECUTIVE_CRASHES = 8
 GRACEFUL_STOP_SECONDS = 10
 FORCE_KILL_SECONDS = 5
 WEEKLY_RESTART_SECONDS = 86400 * 7
+SUPERVISOR_HEARTBEAT_SECONDS = 5
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
 _LOCK_HANDLE = None
 _ERROR_LOG_PATTERN = re.compile(r"Error logged: (err_[A-Za-z0-9_]+)")
@@ -225,6 +227,41 @@ def append_event(kind: str, message: str, **context) -> None:
     )
 
 
+def _write_supervisor_state(state: dict[str, object]) -> None:
+    """Publish a small atomic heartbeat for bot-side and operator diagnostics."""
+    try:
+        write_redacted_json(SUPERVISOR_STATE, state)
+    except Exception:
+        LOGGER.debug("Could not write supervisor state", exc_info=True)
+
+
+async def _supervisor_heartbeat(
+    state: dict[str, object],
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        state["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+        state["pid"] = os.getpid()
+        _write_supervisor_state(state)
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=SUPERVISOR_HEARTBEAT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            continue
+
+
+def _set_supervisor_state(
+    state: dict[str, object],
+    status: str,
+    **updates: object,
+) -> None:
+    state.update(updates)
+    state["state"] = status
+    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_supervisor_state(state)
+
+
 async def _capture_stream(stream, name: str, output: deque[str]) -> None:
     if stream is None:
         return
@@ -381,6 +418,15 @@ async def _launch_bot(bot_args: list[str], cwd: Path) -> asyncio.subprocess.Proc
 async def supervise(cwd: Path) -> None:
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    state: dict[str, object] = {
+        "pid": os.getpid(),
+        "state": "starting",
+        "cwd": str(cwd),
+        "child_pid": None,
+        "crash_count": 0,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_supervisor_state(state)
 
     def request_stop(signum: signal.Signals) -> None:
         if not stop_event.is_set():
@@ -403,9 +449,20 @@ async def supervise(cwd: Path) -> None:
     bot_args = [sys.executable, "-m", "media_bot"]
     crash_count = 0
     last_crash_time = 0.0
+    heartbeat_task = asyncio.create_task(
+        _supervisor_heartbeat(state, stop_event),
+        name="supervisor-heartbeat",
+    )
 
     try:
         while not stop_event.is_set():
+            _set_supervisor_state(
+                state,
+                "starting",
+                child_pid=None,
+                crash_count=crash_count,
+                next_restart_at=None,
+            )
             LOGGER.info("Starting bot: %s", " ".join(bot_args))
             append_event("launch_attempt", "Starting bot", command=bot_args, cwd=str(cwd))
             try:
@@ -417,10 +474,27 @@ async def supervise(cwd: Path) -> None:
                 append_event("launch_failure", detail, error_id=error_id)
                 LOGGER.exception("Could not launch bot")
                 await notify_error(error_id, error_path)
+                _set_supervisor_state(
+                    state,
+                    "backoff",
+                    child_pid=None,
+                    crash_count=crash_count + 1,
+                    last_error=detail,
+                    last_error_category="launch_failure",
+                )
                 if await _wait_for_stop(stop_event, RESTART_DELAY):
                     return
                 continue
             start_time = time.monotonic()
+            _set_supervisor_state(
+                state,
+                "running",
+                child_pid=proc.pid,
+                child_started_at=datetime.now(timezone.utc).isoformat(),
+                last_error=None,
+                next_restart_at=None,
+                crash_count=crash_count,
+            )
             stdout_lines: deque[str] = deque(maxlen=2000)
             stderr_lines: deque[str] = deque(maxlen=2000)
             readers = (
@@ -437,13 +511,31 @@ async def supervise(cwd: Path) -> None:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if shutdown_wait in done:
+                    _set_supervisor_state(
+                        state,
+                        "stopping",
+                        child_pid=proc.pid,
+                        reason="shutdown requested",
+                    )
                     await _terminate_process_group(proc)
                     await asyncio.gather(*readers, return_exceptions=True)
                     append_event("supervisor_stopped", "Supervisor and bot stopped gracefully")
+                    _set_supervisor_state(
+                        state,
+                        "stopped",
+                        child_pid=None,
+                        reason="shutdown requested",
+                    )
                     return
                 if process_wait not in done:
                     LOGGER.info("Bot running for 7 days; restarting gracefully")
                     append_event("weekly_restart", "Starting scheduled weekly bot restart")
+                    _set_supervisor_state(
+                        state,
+                        "restarting",
+                        child_pid=proc.pid,
+                        reason="scheduled weekly restart",
+                    )
                     await _terminate_process_group(proc)
                     await asyncio.gather(*readers, return_exceptions=True)
                     crash_count = 0
@@ -473,9 +565,28 @@ async def supervise(cwd: Path) -> None:
                 stderr_tail=stderr_text[-10000:],
             )
             LOGGER.info("Bot exited (code=%s, ran=%.1fs)", exit_code, duration)
+            _set_supervisor_state(
+                state,
+                "exited" if exit_code == 0 else "crashed",
+                child_pid=None,
+                last_exit_code=exit_code,
+                last_exit_at=datetime.now(timezone.utc).isoformat(),
+                last_exit_duration_seconds=round(duration, 3),
+                crash_count=crash_count,
+            )
 
             if exit_code == 0:
                 crash_count = 0
+                _set_supervisor_state(
+                    state,
+                    "backoff",
+                    child_pid=None,
+                    crash_count=0,
+                    reason="bot exited cleanly; waiting before restart",
+                    next_restart_at=datetime.fromtimestamp(
+                        time.time() + RESTART_DELAY, timezone.utc,
+                    ).isoformat(),
+                )
                 if await _wait_for_stop(stop_event, RESTART_DELAY):
                     return
                 continue
@@ -507,6 +618,15 @@ async def supervise(cwd: Path) -> None:
                         category=category,
                         error_id=error_id,
                     )
+                    _set_supervisor_state(
+                        state,
+                        "halted",
+                        child_pid=None,
+                        crash_count=crash_count,
+                        reason="dependency failure requires operator restart",
+                        last_error_category=category,
+                        last_error=stderr_text[-1000:],
+                    )
                     return
             else:
                 LOGGER.info("No actionable error output (exit=%d), restarting...", exit_code)
@@ -521,12 +641,42 @@ async def supervise(cwd: Path) -> None:
                     "Supervisor stopped after repeated bot crashes",
                     crash_count=crash_count,
                 )
+                _set_supervisor_state(
+                    state,
+                    "halted",
+                    child_pid=None,
+                    crash_count=crash_count,
+                    reason="maximum consecutive crashes reached",
+                    last_error_category="repeated_crash",
+                    last_error=stderr_text[-1000:],
+                )
                 return
 
             delay = min(RESTART_DELAY * (2 ** min(crash_count - 1, 6)), MAX_RESTART_DELAY)
+            _set_supervisor_state(
+                state,
+                "backoff",
+                child_pid=None,
+                crash_count=crash_count,
+                reason=f"bot crashed; retrying in {delay}s",
+                next_restart_at=datetime.fromtimestamp(
+                    time.time() + delay, timezone.utc,
+                ).isoformat(),
+            )
             if await _wait_for_stop(stop_event, delay):
                 return
     finally:
+        shutdown_requested = stop_event.is_set()
+        stop_event.set()
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        if state.get("state") not in {"halted", "stopped"}:
+            _set_supervisor_state(
+                state,
+                "stopped" if shutdown_requested else "halted",
+                child_pid=None,
+            )
         for signum in installed_signals:
             loop.remove_signal_handler(signum)
 

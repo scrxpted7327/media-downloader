@@ -284,6 +284,7 @@ class StorageTests(unittest.TestCase):
                 self.db_path, 1, "full",
                 caption_text="hello", caption_color="yellow", caption_style="bold",
                 caption_position="high", voice_over_voice="alice", voice_quality="premium", voice_speed=1.2,
+                voice_mode="swearify",
                 watermark_mode="swap", watermark_text="@replacement",
             )
             self.assertEqual(preset.caption_text, "hello")
@@ -291,6 +292,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(preset.caption_style, "bold")
             self.assertEqual(preset.caption_position, "high")
             self.assertEqual(preset.voice_over_voice, "alice")
+            self.assertEqual(preset.voice_mode, "swearify")
             self.assertEqual(preset.voice_quality, "premium")
             self.assertEqual(preset.voice_speed, 1.2)
             self.assertEqual(preset.watermark_mode, "swap")
@@ -557,6 +559,8 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(versions, list(range(1, LATEST_SCHEMA_VERSION + 1)))
             self.assertIn("metadata_status", columns)
             self.assertIn("metadata_hashtags", columns)
+            self.assertIn("voice_mode", columns)
+            self.assertIn("render_status_message_id", columns)
             self.assertIsNotNone(metadata_index)
 
         asyncio.run(run())

@@ -310,6 +310,41 @@ class RenderEditIntegrationTests(unittest.TestCase):
             self.assertEqual(audio_paths[0].suffix, ".aiff")
             self.assertTrue(output.is_file())
 
+    def test_swearify_captions_are_burned_after_replacement_voice(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+            stages = []
+
+            async def fake_voice(_input, path, *_args, **_kwargs):
+                stages.append(("voice", _input))
+                path.write_bytes(b"voice-stage")
+                return path
+
+            async def fake_captions(input_path, path, *_args, **kwargs):
+                stages.append(("captions", input_path, kwargs.get("srt_output_path")))
+                path.write_bytes(b"caption-stage")
+                return path
+
+            with (
+                patch("media_bot.editor.render_voice_over", side_effect=fake_voice),
+                patch("media_bot.editor.render_captions", side_effect=fake_captions),
+            ):
+                asyncio.run(render_edit(
+                    source,
+                    output,
+                    auto_captions=False,
+                    voice_text="That was a damn disaster.",
+                    voice_mode="swearify",
+                ))
+
+            self.assertEqual([stage[0] for stage in stages], ["voice", "captions"])
+            self.assertEqual(stages[0][1], source)
+            self.assertEqual(stages[1][1].name, ".output_voice.mp4")
+            self.assertTrue(output.is_file())
+
     def test_render_edit_swaps_manual_watermark_with_text(self):
         if not Path(shutil.which("ffmpeg") or "").is_file():
             self.skipTest("ffmpeg not available")
