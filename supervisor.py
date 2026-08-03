@@ -427,6 +427,7 @@ async def supervise(cwd: Path) -> None:
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_supervisor_state(state)
+    restart_event = asyncio.Event()
 
     def request_stop(signum: signal.Signals) -> None:
         if not stop_event.is_set():
@@ -434,9 +435,16 @@ async def supervise(cwd: Path) -> None:
             append_event("supervisor_shutdown_requested", "Supervisor shutdown requested", signal=signum.name)
             stop_event.set()
 
+    def request_bot_restart() -> None:
+        if not stop_event.is_set():
+            LOGGER.info("Supervisor received %s; restarting the bot", signal.SIGUSR2.name)
+            append_event("bot_restart_requested", "Bot restart requested after an operator repair")
+            restart_event.set()
+
     installed_signals: list[signal.Signals] = []
     for signum, callback in (
         (signal.SIGUSR1, lambda: asyncio.create_task(notify_restart_shutdown())),
+        (signal.SIGUSR2, request_bot_restart),
         (signal.SIGTERM, lambda: request_stop(signal.SIGTERM)),
         (signal.SIGINT, lambda: request_stop(signal.SIGINT)),
     ):
@@ -503,10 +511,11 @@ async def supervise(cwd: Path) -> None:
             )
             process_wait = asyncio.create_task(proc.wait())
             shutdown_wait = asyncio.create_task(stop_event.wait())
+            restart_wait = asyncio.create_task(restart_event.wait())
 
             try:
                 done, _ = await asyncio.wait(
-                    {process_wait, shutdown_wait},
+                    {process_wait, shutdown_wait, restart_wait},
                     timeout=WEEKLY_RESTART_SECONDS,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -527,6 +536,13 @@ async def supervise(cwd: Path) -> None:
                         reason="shutdown requested",
                     )
                     return
+                if restart_wait in done:
+                    await _terminate_process_group(proc)
+                    await asyncio.gather(*readers, return_exceptions=True)
+                    restart_event.clear()
+                    crash_count = 0
+                    append_event("bot_restart_completed", "Bot restarted after an operator repair")
+                    continue
                 if process_wait not in done:
                     LOGGER.info("Bot running for 7 days; restarting gracefully")
                     append_event("weekly_restart", "Starting scheduled weekly bot restart")
@@ -545,10 +561,15 @@ async def supervise(cwd: Path) -> None:
                 await asyncio.gather(*readers, return_exceptions=True)
                 raise
             finally:
-                for waiter in (process_wait, shutdown_wait):
+                for waiter in (process_wait, shutdown_wait, restart_wait):
                     if not waiter.done():
                         waiter.cancel()
-                await asyncio.gather(process_wait, shutdown_wait, return_exceptions=True)
+                await asyncio.gather(
+                    process_wait,
+                    shutdown_wait,
+                    restart_wait,
+                    return_exceptions=True,
+                )
 
             await asyncio.gather(*readers, return_exceptions=True)
 

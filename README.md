@@ -173,6 +173,9 @@ health events.
 always writes a diagnostic ticket and never executes code. Repair execution is
 admin-only and disabled unless `MEDIA_BOT_ENABLE_REPAIR=true`; inferred Python
 packages are never installed automatically.
+With repair enabled, an admin can use `/fix <reason>` to let Codex Luna max
+mutate the workspace, run its tests, and have the supervisor reload the changed
+code; `/fix <reason> --model provider/model` selects a specific Codex model.
 
 Only download media you are authorized to access and use, and comply with the
 source platform's terms and applicable law.

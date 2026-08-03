@@ -65,22 +65,82 @@ class MenuTests(unittest.TestCase):
         self.assertNotIn("#fragment", redacted)
         self.assertIn("https://example.test/path", redacted)
 
-    def test_opencode_fix_accepts_provider_model(self):
+    def test_codex_fix_accepts_provider_model(self):
         async def run():
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 with patch.object(fix_agent, "FIX_SCRIPTS_DIR", root / "fixes"):
-                    script_path = await fix_agent.invoke_opencode_fix(
+                    script_path = await fix_agent.invoke_codex_fix(
                         {"id": "test", "message": "broken", "traceback": "trace"},
                         root,
                         model="openai/gpt-5",
                     )
                 script = Path(script_path).read_text()
-                self.assertIn("opencode run --model 'openai/gpt-5'", script)
+                self.assertIn(
+                    "'codex' exec --ephemeral --sandbox workspace-write",
+                    script,
+                )
+                self.assertIn("--model 'openai/gpt-5'", script)
+                self.assertIn('model_reasoning_effort="max"', script)
 
         asyncio.run(run())
 
-    def test_opencode_fix_rejects_unsafe_model(self):
+    def test_codex_fix_defaults_to_luna_max(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with patch.object(fix_agent, "FIX_SCRIPTS_DIR", root / "fixes"):
+                    script_path = await fix_agent.invoke_codex_fix(
+                        {"id": "default", "message": "broken"},
+                        root,
+                    )
+                script = Path(script_path).read_text()
+                self.assertIn("--model 'gpt-5.6-luna'", script)
+                self.assertIn('model_reasoning_effort="max"', script)
+
+        asyncio.run(run())
+
+    def test_codex_fix_prompt_contains_operator_reason_and_mutation_instruction(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with patch.object(fix_agent, "FIX_SCRIPTS_DIR", root / "fixes"):
+                    script_path = await fix_agent.invoke_codex_fix(
+                        {
+                            "id": "operator-request",
+                            "message": "database locked",
+                            "stderr": "sqlite3.OperationalError: database is locked",
+                        },
+                        root,
+                        operator_reason="repair the database crash loop",
+                    )
+                script = Path(script_path).read_text()
+                self.assertIn("repair the database crash loop", script)
+                self.assertIn("authorized mutation request", script)
+                self.assertIn("leave the workspace in the corrected state", script)
+                self.assertIn("database is locked", script)
+
+        asyncio.run(run())
+
+    def test_pending_error_files_ignore_completed_records_and_sort_newest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = root / "old.json"
+            new = root / "new.json"
+            old.write_text("{}")
+            new.write_text("{}")
+            (root / "fixed_old.json").write_text("{}")
+            (root / "failed_old.json").write_text("{}")
+            (root / "unfixed_old.json").write_text("{}")
+            (root / "report_user.json").write_text("{}")
+            old.touch()
+            new.touch()
+
+            pending = fix_agent.pending_error_files(root)
+
+        self.assertEqual([path.name for path in pending], ["new.json", "old.json"])
+
+    def test_codex_fix_rejects_unsafe_model(self):
         with self.assertRaises(ValueError):
             fix_agent.validate_model("openai/gpt-5; touch /tmp/bad")
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -15,6 +16,11 @@ LOGGER = logging.getLogger(__name__)
 ERRORS_DIR = Path("runtime/errors")
 FIX_SCRIPTS_DIR = Path("runtime/fix_scripts")
 KNOWN_FIXES_DIR = Path("runtime/known_fixes")
+CODEX_REPAIR_MODEL = "gpt-5.6-luna"
+CODEX_REPAIR_REASONING_EFFORT = "max"
+CODEX_REPAIR_EXECUTABLE = (
+    os.getenv("MEDIA_BOT_REPAIR_CODEX_EXECUTABLE", "").strip() or "codex"
+)
 
 _ERROR_CATEGORIES: dict[str, str] = {
     "yt-dlp": "ytdlp",
@@ -57,6 +63,20 @@ def load_error_log(error_path: Path) -> dict | None:
         return json.loads(error_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def pending_error_files(errors_dir: Path | None = None) -> list[Path]:
+    """Return only unprocessed error records, newest first."""
+    root = errors_dir or ERRORS_DIR
+    try:
+        files = [
+            path
+            for path in root.glob("*.json")
+            if not path.name.startswith(("fixed_", "failed_", "unfixed_", "report_"))
+        ]
+        return sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
 
 
 async def apply_known_fix(
@@ -137,39 +157,62 @@ async def _fix_dependency(error_message: str) -> str | None:
 
 def validate_model(model: str) -> str:
     model = model.strip()
-    if not re.fullmatch(r"[A-Za-z0-9._+-]+/[A-Za-z0-9._:/@+-]+", model):
-        raise ValueError("model must use provider/model format")
+    if not re.fullmatch(r"[A-Za-z0-9._:+@-]+(?:/[A-Za-z0-9._:/@+-]+)?", model):
+        raise ValueError("model must use a safe Codex model identifier")
     return model
 
 
-async def invoke_opencode_fix(
+async def invoke_codex_fix(
     error_info: dict,
     workspace: Path,
     model: str | None = None,
+    operator_reason: str | None = None,
 ) -> str | None:
     error_id = error_info.get("id", int(time.time()))
     error_message = redact_sensitive(error_info.get("message", ""), 2000)
-    traceback = redact_sensitive(error_info.get("traceback", ""), 4000)
+    traceback = redact_sensitive(
+        error_info.get("traceback") or error_info.get("stderr") or "",
+        4000,
+    )
     category = error_info.get("category", "unknown")
+    reason = redact_sensitive(operator_reason or "", 2000)
+
+    operator_request = ""
+    if reason:
+        operator_request = (
+            "The administrator explicitly requested this adjustment:\n"
+            f"{reason}\n\n"
+        )
 
     prompt = (
         f"The media-downloader Telegram bot at {workspace} encountered an error.\n\n"
+        f"{operator_request}"
         f"Error category: {category}\n"
         f"Error message: {error_message}\n\n"
         f"Traceback:\n{traceback[:2000]}\n\n"
-        f"Analyze the error and relevant code, then apply a fix. "
+        f"Inspect the relevant code and apply the smallest correct fix directly "
+        f"in the workspace. This is an authorized mutation request; do not only "
+        f"describe a patch or create a script for someone else to run. "
+        f"Do not modify secrets, user media, the runtime database, or error logs "
+        f"unless the requested adjustment explicitly requires it. "
         f"Run the tests with `python3 -m unittest discover tests/ -v` after applying the fix "
-        f"to verify it works."
+        f"to verify it works, and leave the workspace in the corrected state."
     )
 
     fix_script = FIX_SCRIPTS_DIR / f"fix_{error_id}.sh"
     FIX_SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-    model_arg = f" --model {shlex_quote(validate_model(model))}" if model else ""
+    repair_model = validate_model(model or CODEX_REPAIR_MODEL)
+    codex_config = shlex_quote(
+        f"model_reasoning_effort={json.dumps(CODEX_REPAIR_REASONING_EFFORT)}"
+    )
     fix_script.write_text(
         "#!/usr/bin/env bash\n"
         f"set -e\n"
         f"cd {shlex_quote(str(workspace))}\n"
-        f"opencode run{model_arg} {shlex_quote(prompt)}\n",
+        f"{shlex_quote(CODEX_REPAIR_EXECUTABLE)} exec --ephemeral "
+        f"--sandbox workspace-write "
+        f"--skip-git-repo-check --model {shlex_quote(repair_model)} "
+        f"-c {codex_config} {shlex_quote(prompt)}\n",
     )
     fix_script.chmod(0o755)
     return str(fix_script)
@@ -183,17 +226,20 @@ async def run_fix_script(
 ) -> tuple[int, str]:
     if not repair_enabled:
         return -1, "Repair script execution is disabled by MEDIA_BOT_ENABLE_REPAIR."
-    process = await asyncio.create_subprocess_exec(
-        "/usr/bin/env", "bash", script_path,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "/usr/bin/env", "bash", script_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return -1, f"Could not start Codex repair: {exc}"
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
-        return -1, "OpenCode repair timed out"
+        return -1, "Codex repair timed out"
     output = (stdout + stderr).decode("utf-8", "replace")
     return process.returncode or 0, output
 
@@ -249,13 +295,13 @@ async def watch_and_fix(
                         )
                     ef.replace(ERRORS_DIR / f"fixed_{ef.name}")
                 elif category == "unknown":
-                    LOGGER.info("Unknown error, invoking opencode for %s", ef.name)
+                    LOGGER.info("Unknown error, invoking Codex for %s", ef.name)
                     if report_callback:
                         await report_callback(
                             f"🤖 Unknown error [{category}]: {error_info.get('message', '')[:100]}\n"
                             f"Creating fix script..."
                         )
-                    fix_script_path = await invoke_opencode_fix(error_info, workspace)
+                    fix_script_path = await invoke_codex_fix(error_info, workspace)
                     if fix_script_path:
                         if report_callback:
                             await report_callback(

@@ -190,7 +190,7 @@ acceptance condition.
 | `media_bot/editor.py` | Caption, narration, banner, watermark, and render pipeline | `render_edit` and its stage helpers |
 | `media_bot/diagnostics.py` | JSONL event logging and recent-event retrieval | `append_event`, `recent_events` |
 | `media_bot/error_handler.py` | Persist unhandled Telegram handler exceptions | `error_handler`, `write_error_log` |
-| `media_bot/fix_agent.py` | Categorize errors and prepare/run repair actions | `apply_known_fix`, `invoke_opencode_fix`, `run_fix_script` |
+| `media_bot/fix_agent.py` | Categorize errors and prepare/run repair actions | `apply_known_fix`, `invoke_codex_fix`, `run_fix_script` |
 | `supervisor.py` | Run the bot, capture output, classify exits, report failures, restart with backoff | `supervise`, `notify_error` |
 | `restart_bot.py` | Stop project bot/supervisor processes and launch one supervisor | `_managed_processes`, `_stop_existing`, `main` |
 

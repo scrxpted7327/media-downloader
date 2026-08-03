@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from media_bot.__main__ import (
     _admin_authorized,
     _bind_flow_context,
+    _parse_fix_arguments,
     _render_edit_job,
     _send_watermark_review_album,
     cancel_job_command,
@@ -68,6 +69,16 @@ def _context(settings, **bot_data):
 
 
 class CommandContainmentTests(unittest.IsolatedAsyncioTestCase):
+    def test_fix_arguments_accept_a_reason_and_optional_model(self):
+        self.assertEqual(
+            _parse_fix_arguments(["database", "crash", "--model", "openai/gpt-5"]),
+            ("database crash", "openai/gpt-5"),
+        )
+        self.assertEqual(
+            _parse_fix_arguments(["openai/gpt-5"]),
+            ("", "openai/gpt-5"),
+        )
+
     async def test_allowed_group_does_not_grant_admin_role(self):
         update = _update(user_id=99, chat_id=-1001, chat_type="supergroup")
         settings = _settings(
@@ -222,6 +233,57 @@ class CommandContainmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.reply_photo.await_count, 0)
             message.reply_text.assert_awaited_once()
 
+    async def test_fix_reason_executes_mutation_and_requests_supervisor_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            errors = Path(directory) / "errors"
+            errors.mkdir()
+            (errors / "crash_recent.json").write_text(
+                json.dumps(
+                    {
+                        "id": "crash_recent",
+                        "message": "database locked",
+                        "stderr": "sqlite3.OperationalError: database is locked",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            update = _update()
+            context = _context(_settings(repair_enabled=True))
+            context.args = ["the", "database", "crash", "--model", "openai/gpt-5"]
+            with (
+                patch("media_bot.__main__.ERRORS_DIR", errors),
+                patch(
+                    "media_bot.__main__.invoke_codex_fix",
+                    new=AsyncMock(return_value="runtime/fix_scripts/fix_request.sh"),
+                ) as invoke_agent,
+                patch(
+                    "media_bot.__main__.run_fix_script",
+                    new=AsyncMock(return_value=(0, "tests passed")),
+                ) as run_script,
+                patch(
+                    "media_bot.__main__._request_supervisor_restart",
+                    return_value=True,
+                ) as request_restart,
+                patch("media_bot.__main__.append_event"),
+            ):
+                await fix_command(update, context)
+
+            self.assertEqual(invoke_agent.await_args.kwargs["model"], "openai/gpt-5")
+            self.assertEqual(
+                invoke_agent.await_args.kwargs["operator_reason"],
+                "the database crash",
+            )
+            self.assertIn("database locked", invoke_agent.await_args.args[0]["traceback"])
+            run_script.assert_awaited_once_with(
+                "runtime/fix_scripts/fix_request.sh",
+                repair_enabled=True,
+            )
+            request_restart.assert_called_once_with("the database crash")
+            self.assertIn(
+                "reloading the changed code",
+                update.effective_message.reply_text.await_args_list[-1].args[0],
+            )
+
     async def test_report_is_ticket_only_even_for_enabled_admin(self):
         with tempfile.TemporaryDirectory() as directory:
             errors = Path(directory) / "errors"
@@ -233,7 +295,7 @@ class CommandContainmentTests(unittest.IsolatedAsyncioTestCase):
                 patch("media_bot.__main__.recent_events", return_value=[]),
                 patch("media_bot.__main__.append_event"),
                 patch(
-                    "media_bot.__main__.invoke_opencode_fix",
+                    "media_bot.__main__.invoke_codex_fix",
                     new=AsyncMock(),
                 ) as invoke_agent,
             ):

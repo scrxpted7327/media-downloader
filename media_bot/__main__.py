@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import sys
 import tempfile
@@ -62,11 +63,14 @@ from .diagnostics import (
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
 from .fix_agent import (
+    CODEX_REPAIR_MODEL,
+    CODEX_REPAIR_REASONING_EFFORT,
     ERRORS_DIR,
     apply_known_fix,
     categorize_error,
-    invoke_opencode_fix,
+    invoke_codex_fix,
     load_error_log,
+    pending_error_files,
     run_fix_script,
     validate_model,
 )
@@ -137,6 +141,7 @@ install_event_logging()
 RESTART_MARKER = Path("runtime/restart-requested")
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
 SUPERVISOR_STATE_PATH = Path("runtime/supervisor-state.json")
+SUPERVISOR_RESTART_SIGNAL = signal.SIGUSR2
 FLOW_TTL_SECONDS = 15 * 60
 STARTED_MONOTONIC = time.monotonic()
 
@@ -1262,8 +1267,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         help_text += (
             "\n\nOperator commands:\n"
             "/status - service health and repair status\n"
-            "/fix [provider/model] - run approved repairs; reply /fix to a bot "
-            "message for a durable state/supervisor check "
+            f"/fix <reason> [--model {CODEX_REPAIR_MODEL}] - apply a repair and reload "
+            "or reply /fix to a bot message for a durable state/supervisor check "
             f"(currently {repair_state})"
         )
     await message.reply_text(help_text)
@@ -2726,6 +2731,74 @@ async def _reply_fix_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lines.extend(["", "No code repair was executed by this reply-state check."])
     await message.reply_text("\n".join(lines))
 
+def _parse_fix_arguments(args: list[str]) -> tuple[str, str | None]:
+    """Parse `/fix <reason>` while retaining the old single-model form."""
+    values = list(args)
+    model: str | None = None
+
+    for index, value in enumerate(values):
+        if value == "--model":
+            if index + 1 >= len(values):
+                raise ValueError("--model requires a Codex model identifier")
+            model = validate_model(values[index + 1])
+            del values[index:index + 2]
+            break
+        if value.startswith("--model="):
+            model = validate_model(value.split("=", 1)[1])
+            del values[index]
+            break
+
+    # Keep `/fix openai/model` working for operators who used the original
+    # command syntax. Natural-language reasons remain unconstrained text.
+    if model is None and len(values) == 1 and "/" in values[0]:
+        model = validate_model(values.pop())
+
+    return " ".join(values).strip(), model
+
+
+def _operator_fix_info(reason: str, pending: list[Path], user_id: int) -> dict:
+    """Build a bounded repair request with the newest supervisor context."""
+    context: list[str] = []
+    for error_path in pending[:5]:
+        error_info = load_error_log(error_path)
+        if error_info is None:
+            continue
+        detail = error_info.get("traceback") or error_info.get("stderr") or ""
+        context.append(
+            f"{error_path.name}: {error_info.get('message', '')}\n"
+            f"{detail}"
+        )
+    return {
+        "id": f"fix_request_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}_{user_id}",
+        "message": reason,
+        "category": "operator_request",
+        "traceback": "\n\n".join(context) or "No pending supervisor error context was available.",
+    }
+
+
+def _request_supervisor_restart(reason: str) -> bool:
+    """Ask the parent supervisor to reload code changed by an operator repair."""
+    parent_pid = os.getppid()
+    try:
+        args = Path(f"/proc/{parent_pid}/cmdline").read_bytes().split(b"\0")
+        decoded = [arg.decode("utf-8", "replace") for arg in args if arg]
+    except OSError:
+        return False
+    if not any(Path(arg).name == "supervisor.py" for arg in decoded[1:]):
+        return False
+
+    try:
+        RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        RESTART_MARKER.write_text(
+            f"requested_at={time.time()}\nreason={redact_sensitive(reason, 500)}\n",
+            encoding="utf-8",
+        )
+        os.kill(parent_pid, SUPERVISOR_RESTART_SIGNAL)
+    except (OSError, ProcessLookupError):
+        RESTART_MARKER.unlink(missing_ok=True)
+        return False
+    return True
+
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings: Settings = context.application.bot_data["settings"]
@@ -2750,25 +2823,74 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     if user is None:
         return
-    model = context.args[0] if context.args else None
-    if len(context.args) > 1:
-        await message.reply_text("Usage: /fix [provider/model]")
+    try:
+        reason, model = _parse_fix_arguments(list(context.args or []))
+    except ValueError as exc:
+        await message.reply_text(
+            f"Invalid repair request: {exc}\n"
+            f"Usage: /fix <reason> [--model {CODEX_REPAIR_MODEL}]"
+        )
         return
-    if model:
+
+    repair_model = model or CODEX_REPAIR_MODEL
+    model_text = f" using {repair_model} ({CODEX_REPAIR_REASONING_EFFORT})"
+    pending = pending_error_files(ERRORS_DIR)
+
+    if reason:
+        await message.reply_text(
+            f"🔧 Applying requested repair{model_text}: {reason[:500]}\n"
+            f"Using up to {min(len(pending), 5)} recent supervisor error records for context..."
+        )
+        error_info = _operator_fix_info(reason, pending, user.id)
         try:
-            model = validate_model(model)
-        except ValueError as exc:
-            await message.reply_text(f"Invalid model: {exc}\nUsage: /fix [provider/model]")
+            script_path = await invoke_codex_fix(
+                error_info,
+                Path.cwd(),
+                model=model,
+                operator_reason=reason,
+            )
+            if not script_path:
+                await message.reply_text("⚠️ The repair agent did not create an executable repair.")
+                return
+            code, output = await run_fix_script(
+                script_path,
+                repair_enabled=settings.repair_enabled,
+            )
+        except Exception as exc:
+            code = -1
+            output = f"{exc.__class__.__name__}: {exc}"
+
+        append_event(
+            "fix_agent",
+            output[-5000:],
+            error_id=error_info["id"],
+            model=repair_model,
+            reason=reason,
+            exit_code=code,
+            user_id=user.id,
+        )
+        if code != 0:
+            await message.reply_text(
+                f"⚠️ Requested repair failed (exit {code}).\n"
+                f"{redact_sensitive(output[-1200:])}"
+            )
             return
 
-    model_text = f" using {model}" if model else ""
+        restart_requested = _request_supervisor_restart(reason)
+        restart_text = (
+            " The supervisor is reloading the changed code now."
+            if restart_requested
+            else " Run `python restart_bot.py` to reload the changed code."
+        )
+        await message.reply_text(f"✅ Repair applied successfully.{restart_text}")
+        return
+
+    model_text = f" using {repair_model} ({CODEX_REPAIR_REASONING_EFFORT})"
     progress = await message.reply_text(
         f"🔍 Supervisor is scanning for errors to fix{model_text}…\n"
         "I’ll keep this message updated while checks or repairs run."
     )
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
-    error_files = sorted(ERRORS_DIR.glob("*.json"))
-    pending = [ef for ef in error_files if not ef.name.startswith(("fixed_", "failed_", "unfixed_"))]
     if not pending:
         await _safe_status_edit(progress, "✅ Supervisor scan complete. No pending errors found.")
         return
@@ -2803,8 +2925,8 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             script_path = await _run_with_status_heartbeat(
                 progress,
-                "🤖 OpenCode repair analysis is still running…",
-                lambda: invoke_opencode_fix(error_info, workspace, model=model),
+                "🤖 Codex repair analysis is still running…",
+                lambda: invoke_codex_fix(error_info, workspace, model=model),
             )
             if script_path:
                 code, output = await _run_with_status_heartbeat(
@@ -2818,15 +2940,15 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     "fix_agent",
                     output[-5000:],
                     error_id=error_info.get("id"),
-                    model=model,
+                    model=repair_model,
                     exit_code=code,
                     user_id=user.id,
                 )
                 if code == 0:
-                    report_lines.append(f"🤖 Fixed with OpenCode{model_text}: {error_info.get('message', '')[:80]}")
+                    report_lines.append(f"🤖 Fixed with Codex{model_text}: {error_info.get('message', '')[:80]}")
                     ef.replace(ERRORS_DIR / f"fixed_{ef.name}")
                 else:
-                    report_lines.append(f"⚠️ OpenCode failed (exit {code}): {output[-200:]}")
+                    report_lines.append(f"⚠️ Codex failed (exit {code}): {output[-200:]}")
                     ef.replace(ERRORS_DIR / f"failed_{ef.name}")
         elif fix_result is None:
             report_lines.append(f"✅ Fixed [{category}]: {error_info.get('message', '')[:80]}")
@@ -2850,7 +2972,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     error_files = list(ERRORS_DIR.glob("*.json"))
-    pending = sum(1 for ef in error_files if not ef.name.startswith(("fixed_", "failed_", "unfixed_")))
+    pending = len(pending_error_files(ERRORS_DIR))
     fixed = sum(1 for ef in error_files if ef.name.startswith("fixed_"))
     failed = sum(1 for ef in error_files if ef.name.startswith("failed_"))
     unfixed = sum(1 for ef in error_files if ef.name.startswith("unfixed_"))
@@ -2921,7 +3043,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Unknown (needs review): {unfixed}",
         "",
         "Commands:",
-        "/fix - attempt to auto-fix pending errors",
+        "/fix <reason> - mutate the code for an operator-requested repair",
         "/status - this status report",
     ]
     await message.reply_text("\n".join(lines))
