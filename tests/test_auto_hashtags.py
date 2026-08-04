@@ -10,6 +10,7 @@ from media_bot.auto_hashtags import (
     CodexUnavailable,
     MetadataResult,
     build_codex_command,
+    build_metadata_prompt,
     extract_frames,
     generate_metadata,
     normalize_hashtags,
@@ -43,12 +44,30 @@ class MetadataShapeTests(unittest.TestCase):
         with self.assertRaises(MetadataValidationError):
             normalize_hashtags(["#one", "#two", "#three", "#four", "not-a-tag"])
 
-    def test_description_is_bounded(self):
+    def test_title_is_bounded(self):
         result = parse_metadata_output({
-            "description": "x" * 2_000,
+            "title": "x" * 2_000,
             "hashtags": [f"#tag{number}" for number in range(5)],
         })
-        self.assertEqual(len(result.description), 1_000)
+        self.assertEqual(len(result.title), 100)
+
+    def test_hashtag_string_is_bounded_and_keeps_model_order(self):
+        result = parse_metadata_output({
+            "title": "A clip",
+            "hashtags": [
+                "#popular", "#video", "#news", "#clip", "#fun",
+                "#" + "x" * 101,
+            ],
+        })
+        self.assertEqual(result.hashtags[:2], ("#popular", "#video"))
+        self.assertLessEqual(len(" ".join(result.hashtags)), 100)
+
+    def test_prompt_requests_reach_order_without_inventing_tags(self):
+        prompt = build_metadata_prompt("speech", 8)
+        self.assertIn('"title"', prompt)
+        self.assertIn("no longer than 100 characters", prompt)
+        self.assertIn("likely reach", prompt)
+        self.assertIn("Do not invent a popular tag", prompt)
 
     def test_frame_times_are_evenly_spaced(self):
         times = sample_frame_times(80, 8)
@@ -263,7 +282,7 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(updated.metadata_hashtags), [f"#tag{index}" for index in range(8)])
         self.assertEqual(updated.metadata_reply_message_id, 20)
         bot.send_message.assert_awaited_once()
-        self.assertIn("Description and hashtags", bot.send_message.await_args.kwargs["text"])
+        self.assertIn("Title and hashtags", bot.send_message.await_args.kwargs["text"])
         self.assertEqual(generate.await_args.args[0], self.original)
 
     async def test_codex_unavailable_skips_metadata_without_affecting_render_status(self):

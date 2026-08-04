@@ -135,7 +135,11 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
         return WatermarkAnalysis(width, height, len(edges), (), (), False, time.monotonic() - started)
 
     duration = frame_count / max(1.0, fps)
-    candidates = _find_candidates(edges, grays, width, height, sw, sh, cv2)
+    letterbox_bounds = _detect_letterbox_bounds(grays)
+    candidates = _find_candidates(
+        edges, grays, width, height, sw, sh, cv2,
+        letterbox_bounds=letterbox_bounds,
+    )
     candidates.extend(_tiktok_candidates(
         tiktok_observations, sample_seconds, duration,
     ))
@@ -150,6 +154,7 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
             [edges[index] for index in selected_indices],
             [grays[index] for index in selected_indices],
             width, height, sw, sh, cv2, threshold=.55,
+            letterbox_bounds=letterbox_bounds,
         )
         candidates.extend(
             replace(
@@ -200,6 +205,36 @@ def analyze_video(path: Path, sample_count: int = SAMPLE_COUNT) -> WatermarkAnal
                              round(time.monotonic() - started, 3))
 
 
+def _detect_letterbox_bounds(
+    grays: list[np.ndarray],
+) -> tuple[int, int] | None:
+    """Find persistent uniform black rows so they cannot become edit regions."""
+    if not grays:
+        return None
+    stack = np.stack(grays).astype(np.float32)
+    row_means = stack.mean(axis=2)
+    row_spreads = stack.std(axis=2)
+    dark_uniform = (
+        (row_means <= 24.0) & (row_spreads <= 16.0)
+    ).mean(axis=0) >= 0.8
+
+    top = 0
+    while top < len(dark_uniform) and dark_uniform[top]:
+        top += 1
+    bottom_rows = 0
+    while bottom_rows < len(dark_uniform) and dark_uniform[-1 - bottom_rows]:
+        bottom_rows += 1
+    if top < 2:
+        top = 0
+    if bottom_rows < 2:
+        bottom_rows = 0
+    if top == 0 and bottom_rows == 0:
+        return None
+    if top + bottom_rows > len(dark_uniform) * 0.45:
+        return None
+    return top, len(dark_uniform) - bottom_rows
+
+
 def _find_candidates(
     edges: list[np.ndarray],
     grays: list[np.ndarray],
@@ -209,6 +244,7 @@ def _find_candidates(
     sh: int,
     cv2,
     threshold: float = .58,
+    letterbox_bounds: tuple[int, int] | None = None,
 ) -> list[WatermarkCandidate]:
     edge_stack = np.stack(edges)
     persistence_map = edge_stack.mean(axis=0)
@@ -216,6 +252,12 @@ def _find_candidates(
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 3))
     persistent = cv2.morphologyEx(persistent, cv2.MORPH_CLOSE, kernel, iterations=2)
     persistent = cv2.dilate(persistent, kernel, iterations=2)
+    if letterbox_bounds is not None:
+        top, bottom = letterbox_bounds
+        if top:
+            persistent[:top, :] = 0
+        if bottom < sh:
+            persistent[bottom:, :] = 0
     count, _, stats, _ = cv2.connectedComponentsWithStats(persistent, 8)
     gray_stack = np.stack(grays).astype(np.float32)
     temporal_std = gray_stack.std(axis=0)
@@ -223,6 +265,11 @@ def _find_candidates(
     frame_area = sw * sh
     for component in range(1, count):
         x, y, w, h, area = (int(v) for v in stats[component])
+        if letterbox_bounds is not None:
+            top, bottom = letterbox_bounds
+            margin = max(2, round(sh * .01))
+            if (top and y < top + margin) or (bottom < sh and y + h > bottom - margin):
+                continue
         # A TV corner bug often touches a full-width lower-third/ticker and is
         # therefore returned as one oversized component. Isolate the compact
         # upper-left brand block instead of discarding the entire component.

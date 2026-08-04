@@ -54,6 +54,19 @@ def _top_center_pill_video(path: Path) -> None:
     writer.release()
 
 
+def _letterboxed_video(path: Path) -> None:
+    writer = cv2.VideoWriter(
+        str(path), cv2.VideoWriter_fourcc(*"mp4v"), 12, (320, 180),
+    )
+    for index in range(36):
+        frame = np.zeros((180, 320, 3), np.uint8)
+        frame[28:152] = (35 + index * 2, 55, 80)
+        x = (index * 9) % 250
+        cv2.rectangle(frame, (x, 58), (x + 60, 122), (30, 180, 80), -1)
+        writer.write(frame)
+    writer.release()
+
+
 def _moving_tiktok_video(path: Path) -> None:
     writer = cv2.VideoWriter(
         str(path), cv2.VideoWriter_fourcc(*"mp4v"), 12, (320, 180),
@@ -111,6 +124,13 @@ class WatermarkAnalysisTests(unittest.TestCase):
             path = Path(directory) / "clean.mp4"
             _video(path, logo=False)
             self.assertEqual(analyze_video(path, sample_count=24).candidates, ())
+
+    def test_ignores_persistent_black_letterbox_bars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "letterboxed.mp4"
+            _letterboxed_video(path)
+            analysis = analyze_video(path, sample_count=24)
+            self.assertEqual(analysis.candidates, ())
 
     def test_detects_small_top_center_username_pill(self):
         with tempfile.TemporaryDirectory() as directory:

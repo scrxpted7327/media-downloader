@@ -1,4 +1,4 @@
-"""Generate evidence-bound descriptions and hashtags for rendered videos.
+"""Generate evidence-bound titles and hashtags for rendered videos.
 
 The module deliberately keeps the media pipeline separate from Telegram and the
 database.  That makes the expensive work easy to run in a bounded queue and
@@ -26,7 +26,11 @@ from .editor import transcribe_audio
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_FRAME_COUNT = 8
-MAX_DESCRIPTION_LENGTH = 1_000
+MAX_TITLE_LENGTH = 100
+# Keep the old name for callers that still refer to the database field as a
+# description. The user-facing contract is now a 100-character title.
+MAX_DESCRIPTION_LENGTH = MAX_TITLE_LENGTH
+MAX_HASHTAGS_CHARACTERS = 100
 MIN_HASHTAGS = 5
 MAX_HASHTAGS = 12
 
@@ -51,8 +55,14 @@ class MetadataValidationError(MetadataError):
 
 @dataclass(frozen=True)
 class MetadataResult:
+    # Stored as metadata_description for database compatibility.
     description: str
     hashtags: tuple[str, ...]
+
+    @property
+    def title(self) -> str:
+        """Return the generated title using the user-facing name."""
+        return self.description
 
 
 def _normalize_text(value: str) -> str:
@@ -60,15 +70,20 @@ def _normalize_text(value: str) -> str:
     return " ".join(value.split()).strip()
 
 
-def normalize_description(value: str) -> str:
-    """Normalize whitespace and enforce the user-facing description limit."""
+def normalize_title(value: str) -> str:
+    """Normalize whitespace and enforce the 100-character title limit."""
     if not isinstance(value, str):
-        raise MetadataValidationError("description must be a string")
-    description = _normalize_text(value)
-    description = description[:MAX_DESCRIPTION_LENGTH].rstrip()
-    if not description:
-        raise MetadataValidationError("description cannot be empty")
-    return description
+        raise MetadataValidationError("title must be a string")
+    title = _normalize_text(value)
+    title = title[:MAX_TITLE_LENGTH].rstrip()
+    if not title:
+        raise MetadataValidationError("title cannot be empty")
+    return title
+
+
+def normalize_description(value: str) -> str:
+    """Compatibility alias for the former description field."""
+    return normalize_title(value)
 
 
 _HASHTAG_PATTERN = re.compile(r"^#[\w]+$", re.UNICODE)
@@ -92,6 +107,11 @@ def normalize_hashtags(value: object) -> tuple[str, ...]:
             continue
         key = tag.casefold()
         if key in seen:
+            continue
+        if len(tag) > MAX_HASHTAGS_CHARACTERS:
+            continue
+        proposed = " ".join([*result, tag])
+        if len(proposed) > MAX_HASHTAGS_CHARACTERS:
             continue
         seen.add(key)
         result.append(tag)
@@ -141,8 +161,13 @@ def parse_metadata_output(payload: str | bytes | dict[str, object]) -> MetadataR
 
     if not isinstance(data, dict):
         raise MetadataValidationError("Codex output must be a JSON object")
+    title = data.get("title")
+    if title is None:
+        # Accept one-generation legacy output while the stricter schema and
+        # prompt move the live generator to the title field.
+        title = data.get("description")
     return MetadataResult(
-        description=normalize_description(data.get("description")),
+        description=normalize_title(title),
         hashtags=normalize_hashtags(data.get("hashtags")),
     )
 
@@ -225,13 +250,17 @@ only when it is clearly spoken or visibly written in the supplied evidence.
 When evidence is ambiguous, describe only the observable action, objects,
 setting, and mood without guessing.
 
-Write the description in the transcript's dominant language. If there is no
-speech, write it in English. Return only JSON matching the requested schema:
-{{"description":"...","hashtags":["#tag1", "#tag2"]}}
+Write the title in the transcript's dominant language. If there is no speech,
+write it in English. Return only JSON matching the requested schema:
+{{"title":"...","hashtags":["#tag1", "#tag2"]}}
 
-The description must be concise and no longer than 1,000 characters. Provide
-between 5 and 12 distinct, evidence-grounded hashtags. Hashtags must start
-with # and contain only letters, numbers, or underscores.
+The title must be concise and no longer than 100 characters. Provide between 5
+and 12 distinct, evidence-grounded hashtags. Order hashtags by likely reach:
+start with broad, common, high-volume tags that are directly supported by the
+evidence, then use narrower descriptive tags. Do not invent a popular tag just
+to chase views. The hashtags joined with single spaces must fit within 100
+characters total. Hashtags must start with # and contain only letters,
+numbers, or underscores.
 
 Source-audio transcript:
 ---
@@ -275,9 +304,9 @@ def build_codex_command(
 _OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["description", "hashtags"],
+    "required": ["title", "hashtags"],
     "properties": {
-        "description": {"type": "string", "maxLength": MAX_DESCRIPTION_LENGTH},
+        "title": {"type": "string", "maxLength": MAX_TITLE_LENGTH},
         "hashtags": {
             "type": "array",
             "minItems": MIN_HASHTAGS,

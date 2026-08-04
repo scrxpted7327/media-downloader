@@ -690,7 +690,7 @@ async def render_captions(
                 await progress_callback(50)
             await _run_ffmpeg_with_progress(
                 ["ffmpeg", "-y", "-i", str(input_path),
-                 "-vf", f"ass={str(ass_path)}",
+                 "-vf", f"ass={str(ass_path)},setsar=1",
                  "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
                  "-c:a", "copy", "-movflags", "+faststart", str(output_path)],
                 timeout_seconds,
@@ -739,7 +739,7 @@ async def render_captions(
             f"x=(w-text_w)/2:y={y_expr}:enable='between(t,0,t+86400)'"
         )
         cmd = [
-            "ffmpeg", "-y", "-i", str(input_path), "-vf", drawtext,
+            "ffmpeg", "-y", "-i", str(input_path), "-vf", f"{drawtext},setsar=1",
             "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
             "-c:a", "copy", "-movflags", "+faststart", str(output_path),
         ]
@@ -985,7 +985,7 @@ async def render_voice_outro(
             )
         filter_graph = ";".join([
             f"[0:v]tpad=stop_mode=clone:stop_duration={outro_duration:.6f},"
-            "format=yuv420p[vout]",
+            "format=yuv420p,setsar=1[vout]",
             base_audio,
             f"[1:a]aresample={audio_rate}:filter_type=kaiser,"
             f"apad,atrim=duration={outro_duration:.6f}[plug]",
@@ -1066,7 +1066,7 @@ async def render_banner(
     }
     pos = position_map.get(position.lower(), position_map["bottom"])
 
-    filter_chain = f"[1:v]{overlay}[b];[0:v][b]overlay={pos}"
+    filter_chain = f"[1:v]{overlay}[b];[0:v][b]overlay={pos},setsar=1"
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
@@ -1182,11 +1182,25 @@ async def remove_watermark(
                 timeout_seconds, progress_callback,
             )
 
+    if position == "auto" and candidates is not None:
+        LOGGER.info(
+            "Watermark analysis found no reliable regions in %s; skipping removal",
+            input_path.name,
+        )
+        if progress_callback is not None:
+            setattr(progress_callback, "watermark_skipped", True)
+        return input_path
+
     if position == "auto":
         detected = await _detect_watermark_position(input_path, timeout_seconds)
         if detected is None:
-            LOGGER.warning("Could not auto-detect watermark, falling back to top-right")
-            position = "top-right"
+            LOGGER.warning(
+                "Could not reliably auto-detect watermark in %s; skipping removal",
+                input_path.name,
+            )
+            if progress_callback is not None:
+                setattr(progress_callback, "watermark_skipped", True)
+            return input_path
         else:
             position = detected
 
@@ -1210,7 +1224,7 @@ async def remove_watermark(
 
     cmd = [
         "ffmpeg", "-y", "-i", str(input_path),
-        "-vf", f"{delogo},format=yuv420p",
+        "-vf", f"{delogo},format=yuv420p,setsar=1",
         "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
         "-c:a", "copy",
         "-movflags", "+faststart",
@@ -1273,6 +1287,7 @@ async def _remove_watermark_regions(
     if not filters:
         return input_path
     filters.append("format=yuv420p")
+    filters.append("setsar=1")
     cmd = [
         "ffmpeg", "-y", "-i", str(input_path), "-vf", ",".join(filters),
         "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
@@ -1323,12 +1338,14 @@ async def _detect_watermark_position(input_path: Path, timeout_seconds: int) -> 
         for pos, (x1, y1, x2, y2) in regions.items():
             crop1 = img1.crop((x1, y1, x2, y2))
             crop2 = img2.crop((x1, y1, x2, y2))
+            if _is_uniform_dark(crop1) and _is_uniform_dark(crop2):
+                continue
             diff = _image_difference(crop1, crop2)
             if diff < best_score:
                 best_score = diff
                 best_pos = pos
 
-        if best_score < 15.0:
+        if best_pos is not None and best_score < .15:
             return best_pos
         return None
     finally:
@@ -1347,6 +1364,17 @@ def _image_difference(img1: Image.Image, img2: Image.Image) -> float:
         db = p1[2] - p2[2]
         total += math.sqrt(dr * dr + dg * dg + db * db) / 441.67
     return total / count
+
+
+def _is_uniform_dark(image: Image.Image) -> bool:
+    grayscale = image.convert("L")
+    pixels = list(grayscale.getdata())
+    if not pixels:
+        return True
+    mean = sum(pixels) / len(pixels)
+    spread = (sum((pixel - mean) ** 2 for pixel in pixels) / len(pixels)) ** .5
+    dark_fraction = sum(pixel <= 24 for pixel in pixels) / len(pixels)
+    return mean <= 24 and spread <= 16 and dark_fraction >= .9
 
 
 def _get_video_dimensions(path: Path) -> tuple[int, int]:
@@ -1409,7 +1437,7 @@ async def render_channel_banner(
             "-i", str(banner_img_path),
             "-filter_complex",
             f"[1:v]scale={vid_w}:{banner_height}[b];"
-            f"[0:v][b]overlay=0:{vid_h - banner_height}",
+            f"[0:v][b]overlay=0:{vid_h - banner_height},setsar=1",
             "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
             "-c:a", "copy",
             "-movflags", "+faststart",
@@ -1577,6 +1605,7 @@ async def overlay_replacement_watermark(
             f"y={y}+({region_height}-text_h)/2"
         )
     filters.append("format=yuv420p")
+    filters.append("setsar=1")
     command = [
         "ffmpeg", "-y", "-i", str(input_path), "-vf", ",".join(filters),
         "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
@@ -1623,6 +1652,15 @@ async def render_edit(
     watermark_text: str | None = None,
     voice_outro: str | None = None,
 ) -> tuple[Path, str | None]:
+    watermark_mode = (watermark_mode or "keep").strip().lower()
+    if watermark_mode not in {"keep", "remove", "swap"}:
+        raise DownloadError(f"unsupported watermark mode: {watermark_mode}")
+    watermark_requested = watermark_removal or watermark_mode in {"remove", "swap"}
+    if watermark_requested and watermark_mode == "keep":
+        # Preserve compatibility with older edit rows that only stored the
+        # boolean watermark_removal field.
+        watermark_mode = "remove"
+
     current = input_path
     step_idx = 0
     advance = getattr(progress_callback, "set_step", None)
@@ -1638,7 +1676,7 @@ async def render_edit(
         return path
 
     try:
-        if watermark_removal:
+        if watermark_requested:
             tmp = _stage("wm")
             if advance:
                 advance(step_idx)

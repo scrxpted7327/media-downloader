@@ -52,8 +52,12 @@ The pinned Apache-2.0 LaMa ONNX model is downloaded lazily to
 fails, the render completes with adaptive FFmpeg `delogo` regions and reports
 the fallback. Presets can Keep, Remove, or Swap detected watermarks; Swap
 removes selected regions and centers the preset's replacement username/text
-inside each region. Choosing a named watermark position remains a manual
-override.
+inside each region. The edit menu always exposes the replacement text field;
+it is applied when Swap is selected. Choosing a named watermark position
+remains a manual override. Automatic removal skips the edit when no reliable
+watermark region is found, rather than damaging an arbitrary corner or a
+letterboxed black bar. Filtered stages preserve the source frame geometry and
+reset the sample aspect ratio so letterboxing is not zoomed away.
 
 ### Optional Ryzen Whisper worker
 
@@ -113,11 +117,16 @@ Use `/queue` to see your queued/running job IDs and
 `/canceljob download:<id>`, `/canceljob render:<id>`, or
 `/canceljob metadata:<edit_id>` to request cancellation.
 
-After a rendered video is delivered, the bot queues evidence-bound description
-and hashtag generation in the authenticated local Codex CLI. It transcribes
+Every bot render includes a spoken Like & Subscribe end plug by default. The
+Voice settings menu can turn it off. After a rendered video is delivered, the
+bot queues evidence-bound title and hashtag generation in the authenticated
+local Codex CLI. It transcribes
 the original source audio and samples eight frames from the original source,
-so watermarks, banners, and other edit overlays do not become the description's
-subject. The result is delivered as a separate Telegram message. The default
+so watermarks, banners, and other edit overlays do not become the title's
+subject. Titles are capped at 100 characters, and the space-joined hashtag set
+is capped at 100 characters. Hashtags are requested in likely-reach order while
+remaining evidence-grounded. The result is delivered as a separate Telegram
+message. The default
 runtime settings are `gpt-5.6-luna`, `max` reasoning, one metadata worker, and a
 1,800-second subprocess limit. Set `MEDIA_BOT_AUTO_HASHTAGS_CODEX_HOME` when
 Codex authentication is stored in a non-default home. A missing or unavailable

@@ -43,6 +43,7 @@ class ImageDifferenceTests(unittest.TestCase):
         img2 = Image.new("RGB", (10, 10), (0, 0, 255))
         diff = _image_difference(img1, img2)
         self.assertGreater(diff, 0.0)
+        self.assertLessEqual(diff, 1.0)
 
 
 class SegmentsToSrtTests(unittest.TestCase):
@@ -488,6 +489,55 @@ class RenderEditIntegrationTests(unittest.TestCase):
 
             self.assertTrue(output.is_file())
             self.assertGreater(output.stat().st_size, 0)
+
+    def test_auto_watermark_removal_skips_when_no_region_is_reliable(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+
+            with (
+                patch(
+                    "media_bot.editor._detect_watermark_position",
+                    new=AsyncMock(return_value=None),
+                ),
+                patch(
+                    "media_bot.editor._run_ffmpeg_with_progress",
+                    new_callable=AsyncMock,
+                ) as run_ffmpeg,
+            ):
+                result = asyncio.run(remove_watermark(
+                    source, output, position="auto", timeout_seconds=30,
+                ))
+
+            self.assertEqual(result, source)
+            self.assertFalse(output.exists())
+            run_ffmpeg.assert_not_awaited()
+
+    def test_empty_watermark_analysis_does_not_use_legacy_corner_detection(self):
+        with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
+            root = Path(directory)
+            source = root / "input.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"video")
+
+            with (
+                patch(
+                    "media_bot.editor._detect_watermark_position",
+                    new=AsyncMock(side_effect=AssertionError("legacy detector used")),
+                ),
+                patch(
+                    "media_bot.editor._run_ffmpeg_with_progress",
+                    new_callable=AsyncMock,
+                ) as run_ffmpeg,
+            ):
+                result = asyncio.run(remove_watermark(
+                    source, output, position="auto", candidates=[], timeout_seconds=30,
+                ))
+
+            self.assertEqual(result, source)
+            run_ffmpeg.assert_not_awaited()
 
     def test_render_edit_banner_and_watermark(self):
         if not Path(shutil.which("ffmpeg") or "").is_file():

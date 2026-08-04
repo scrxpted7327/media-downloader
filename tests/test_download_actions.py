@@ -528,6 +528,11 @@ class DownloadEditActionTests(unittest.TestCase):
                 saved_markup.inline_keyboard[0][0].text,
                 "🗑️ Unsave from Pool",
             )
+            self.assertEqual(saved_markup.inline_keyboard[1][0].text, "✏️ Edit Again")
+            self.assertEqual(
+                saved_markup.inline_keyboard[1][0].callback_data,
+                f"editcfg:{edit.id}:menu",
+            )
 
             update, query = _make_update(f"download:editunsaveconfirm:{edit.id}")
             query.edit_message_reply_markup = AsyncMock()

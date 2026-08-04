@@ -378,7 +378,7 @@ def _render_preparation_text(
     watermark_position: str,
     banner_path: str | None,
     channel_banner: bool,
-    voice_outro: str = "none",
+    voice_outro: str = "like_subscribe",
 ) -> str:
     """Explain the resolved render plan before expensive work begins."""
     source_label = (source.title or source.url or "source video").strip()
@@ -496,16 +496,20 @@ async def _download_actions_keyboard(
 
 
 def _render_pool_keyboard(edit_id: int, *, saved: bool) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
             "🗑️ Unsave from Pool" if saved else "💾 Save to Pool",
             callback_data=(
                 f"download:editunsaveconfirm:{edit_id}"
                 if saved
                 else f"download:editsave:{edit_id}"
             ),
-        )
-    ]])
+        )],
+        [InlineKeyboardButton(
+            "✏️ Edit Again",
+            callback_data=f"editcfg:{edit_id}:menu",
+        )],
+    ])
 
 
 async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id: int) -> None:
@@ -1877,10 +1881,10 @@ async def watermark_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update_edit_job(
             db_path, edit_id, watermark_candidates="[]", status="pending",
         )
-        await query.edit_message_caption("Watermark removal skipped. Resuming render…")
+        await query.edit_message_text("Watermark removal skipped. Resuming render…")
     elif action == "apply":
         await update_edit_job(db_path, edit_id, status="pending")
-        await query.edit_message_caption("Selection accepted. Resuming render…")
+        await query.edit_message_text("Selection accepted. Resuming render…")
     else:
         return
     await _enqueue_render(update, context, edit_id)
@@ -2058,7 +2062,7 @@ async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> Non
         hashtags = " ".join(result.hashtags)
         reply_kwargs: dict[str, object] = {
             "chat_id": source.chat_id,
-            "text": f"📝 Description and hashtags for job #{edit_id}\n\n"
+            "text": f"📝 Title and hashtags for job #{edit_id}\n\n"
             f"{result.description}\n\n{hashtags}",
         }
         if edit.render_delivery_message_id is not None:
@@ -2137,7 +2141,7 @@ async def _enqueue_metadata(
         progress_kwargs: dict[str, object] = {
             "chat_id": source.chat_id,
             "text": (
-                f"📝 Generating description and hashtags from the original source "
+                f"📝 Generating title and hashtags from the original source "
                 f"for job #{edit_id}…"
             ),
         }
@@ -2265,7 +2269,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         v_mode = edit.voice_mode if edit.voice_mode is not None else (preset.voice_mode if preset else None)
         v_mode = (v_mode or "normal").strip().lower()
         v_outro = edit.voice_outro if edit.voice_outro is not None else (preset.voice_outro if preset else None)
-        v_outro = (v_outro or "none").strip().lower()
+        v_outro = (v_outro or "like_subscribe").strip().lower()
         v_quality = edit.voice_quality if edit.voice_quality is not None else (preset.voice_quality or "basic" if preset else "basic")
         v_speed = edit.voice_speed if edit.voice_speed is not None else (preset.voice_speed or 1.0 if preset else 1.0)
         tts_eng = edit.tts_engine if edit.tts_engine is not None else (preset.tts_engine if preset else None)
@@ -2278,6 +2282,9 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             preset.watermark_mode if preset and preset.watermark_mode else
             ("remove" if wm_removal else "keep")
         )
+        wm_mode = (wm_mode or "keep").strip().lower()
+        if wm_mode not in {"keep", "remove", "swap"}:
+            raise DownloadError(f"Unsupported watermark mode: {wm_mode}")
         wm_text = edit.watermark_text if edit.watermark_text is not None else (
             preset.watermark_text if preset else None
         )
@@ -2345,13 +2352,13 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
                 except Exception as exc:
                     LOGGER.warning("Persistent watermark analysis unavailable: %s", exc)
                     append_event(
-                        "watermark_analysis", "Analysis unavailable; using legacy delogo detection",
+                        "watermark_analysis", "Analysis unavailable; automatic removal skipped",
                         edit_id=edit_id, user_id=edit.user_id, error=str(exc),
                         fallback_used=True,
                     )
                     analysis = None
                 if analysis is None:
-                    wm_candidates = None
+                    wm_candidates = []
                 else:
                     confidence = max((item.confidence for item in analysis.candidates), default=0.0)
                     edit = await update_edit_job(
@@ -2487,13 +2494,18 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         "\n⚠️ LaMa was unavailable; adaptive FFmpeg removal was used."
         if getattr(reporter, "watermark_fallback_used", False) else ""
     )
-    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…{fallback_note}")
+    skipped_watermark_note = (
+        "\nℹ️ No reliable watermark region was found; the original frame was preserved."
+        if getattr(reporter, "watermark_skipped", False) else ""
+    )
+    render_note = f"{fallback_note}{skipped_watermark_note}"
+    await _safe_status_edit(msg, f"✅ Render complete. Uploading job #{edit.id}…{render_note}")
     delivery_message = None
     try:
         delivery_message = await _send_document_with_retry(
             update.effective_message,
             out_path,
-            f"✅ Render complete. Job #{edit.id} ready.{fallback_note}",
+            f"✅ Render complete. Job #{edit.id} ready.{render_note}",
             min(settings.upload_timeout_seconds, 120),
             _render_pool_keyboard(edit.id, saved=False),
         )
@@ -2506,7 +2518,7 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             )
         except Exception as link_exc:
             delivery_message = await update.effective_message.reply_text(
-                f"✅ Render complete. Job #{edit.id} ready.{fallback_note}\n"
+                f"✅ Render complete. Job #{edit.id} ready.{render_note}\n"
                 f"⚠️ Could not send the file ({exc}) or fallback link ({link_exc}).",
                 reply_markup=_render_pool_keyboard(edit.id, saved=False),
             )

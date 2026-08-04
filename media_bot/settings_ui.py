@@ -268,7 +268,7 @@ def _voice_summary(values: dict[str, Any]) -> str:
     mode = values.get("voice_mode") or "normal"
     if mode == "swearify":
         parts.append("🤬 Swearify")
-    if values.get("voice_outro") == "like_subscribe":
+    if values.get("voice_outro") in (None, "like_subscribe"):
         parts.append("📣 Like & Subscribe")
     v = values.get("voice_over_voice")
     if v:
@@ -433,16 +433,14 @@ def _build_config_rows(
     color = _fmt_current(values.get("caption_color"), color=True)
     style = _fmt_current(values.get("caption_style"))
     pos = _caption_position_label(values.get("caption_position"))
-    v_name = _fmt_current(values.get("voice_over_voice") or "default")
-    v_quality = _fmt_current(values.get("voice_quality") or "basic")
-    v_mode = "🤬 Swearify" if values.get("voice_mode") == "swearify" else "Manual"
+    voice_summary = _voice_summary(values)
     b_path = _fmt_current(values.get("banner_path"))
     rows = [
         [InlineKeyboardButton(f"🎨 Caption Colour [{color}]", callback_data=f"{field_prefix}:caption_color")],
         [InlineKeyboardButton(f"✍️ Caption Style [{style}]", callback_data=f"{field_prefix}:caption_style")],
         [InlineKeyboardButton(f"📍 Caption Position [{pos}]", callback_data=f"{field_prefix}:caption_position")],
         [InlineKeyboardButton(
-            f"🎤 Voice Settings [{v_mode} {v_name} {v_quality}]",
+            f"🎤 Voice Settings [{voice_summary}]",
             callback_data=f"{field_prefix}:voice_menu",
         )],
         [InlineKeyboardButton(f"🖼️ Banner [{b_path}]", callback_data=f"{field_prefix}:banner_menu")],
@@ -461,12 +459,11 @@ def _build_config_rows(
             f"🧭 Watermark Position [{wm_pos}]",
             callback_data=f"{field_prefix}:watermark_position",
         )])
-        if wm_mode == "swap":
-            wm_text = _fmt_current(values.get("watermark_text"))
-            rows.append([InlineKeyboardButton(
-                f"✏️ Replacement Watermark [{wm_text}]",
-                callback_data=f"{field_prefix}:watermark_text",
-            )])
+        wm_text = _fmt_current(values.get("watermark_text"))
+        rows.append([InlineKeyboardButton(
+            f"✏️ Replacement Watermark [{wm_text}]",
+            callback_data=f"{field_prefix}:watermark_text",
+        )])
     toggles = Menu()
     for label, field_name in (
         ("Auto Captions", "auto_captions"),
@@ -679,7 +676,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
 
     if data == "preset_create:voice:done":
         flow.data.setdefault("voice_mode", "normal")
-        flow.data.setdefault("voice_outro", "none")
+        flow.data.setdefault("voice_outro", "like_subscribe")
         flow.data.setdefault("voice_quality", "basic")
         flow.data.setdefault("voice_speed", 1.0)
         flow.data.setdefault("tts_engine", "auto")
@@ -1209,7 +1206,7 @@ async def settings_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         flow.data["caption_style"] = "basic"
         flow.data["caption_position"] = "bottom"
         flow.data["voice_mode"] = "normal"
-        flow.data["voice_outro"] = "none"
+        flow.data["voice_outro"] = "like_subscribe"
         flow.data["voice_quality"] = "basic"
         flow.data["voice_speed"] = 1.0
         flow.data["tts_engine"] = "auto"
@@ -2116,6 +2113,15 @@ async def handle_editconfig_callback(update: Update, context: ContextTypes.DEFAU
             query,
             f"Choose {pretty}:",
             _choice_keyboard(field, f"{prefix}:menu", f"{prefix}:set:{field}"),
+        )
+        return None
+
+    if field == "watermark_text":
+        await _edit_message(
+            query,
+            "Send the replacement watermark text to add in Swap mode "
+            "(for example @my_channel), or tap Skip to clear it.",
+            _text_input_keyboard(f"{prefix}:menu", f"{prefix}:skip:{field}"),
         )
         return None
 
