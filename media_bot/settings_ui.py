@@ -296,7 +296,7 @@ def _tts_engine_overview(engine: str) -> str:
         f"Current TTS engine: {engine}\n{detail}\n\n"
         "Manual narration uses Voice Text. Swearify generates a profane comedic "
         "roast from the clip's transcript and frames, then burns captions for that audio. "
-        "Like & Subscribe appends a spoken end plug while holding the final frame."
+        "Like & Subscribe appends the supplied 1.5-second animation over the held final frame."
     )
 
 
@@ -529,7 +529,7 @@ async def _resume_preset_create_step(update: Update, context: ContextTypes.DEFAU
         await _show_options(update, context, action, "Voice mode:", "voice_mode",
             *_FIELD_CHOICES["voice_mode"])
     elif action == _State.PRESET_CREATE_VOICE_OUTRO:
-        await _show_options(update, context, action, "End voice plug:", "voice_outro",
+        await _show_options(update, context, action, "End plug:", "voice_outro",
             *_FIELD_CHOICES["voice_outro"])
     elif action == _State.PRESET_CREATE_VOICE_TEXT:
         await _edit_message(query, "Voice-over text to speak (or /skip for none):")
@@ -706,7 +706,7 @@ async def _handle_preset_create_callback(update: Update, context: ContextTypes.D
                 *_FIELD_CHOICES["voice_mode"])
         elif inner == "voice_outro":
             flow.action = _State.PRESET_CREATE_VOICE_OUTRO
-            await _show_options(update, context, flow.action, "End voice plug:", "voice_outro",
+            await _show_options(update, context, flow.action, "End plug:", "voice_outro",
                 *_FIELD_CHOICES["voice_outro"])
         elif inner == "voice_over_voice":
             flow.action = _State.PRESET_CREATE_VOICE

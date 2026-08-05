@@ -12,7 +12,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from media_bot.editor import (
-    DEFAULT_VOICE_OUTRO_TEXT,
     _ass_timestamp,
     _caption_chunks,
     _caption_position_override,
@@ -298,7 +297,7 @@ class RenderEditIntegrationTests(unittest.TestCase):
             ).stdout.strip())
             self.assertGreaterEqual(duration, 1.8)
 
-    def test_voice_outro_appends_audio_and_holds_video_frame(self):
+    def test_like_subscribe_outro_is_exactly_one_point_five_seconds(self):
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             self.skipTest("ffmpeg/ffprobe not available")
         with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
@@ -307,35 +306,38 @@ class RenderEditIntegrationTests(unittest.TestCase):
             output = root / "output.mp4"
             _create_test_video_with_audio(source, duration=2)
 
-            async def make_one_second_voice(_text, path, _voice, _speed, _timeout):
-                with wave.open(str(path), "wb") as audio:
-                    audio.setnchannels(1)
-                    audio.setsampwidth(2)
-                    audio.setframerate(16_000)
-                    audio.writeframes(b"\0\0" * 16_000)
+            asyncio.run(render_voice_outro(source, output, timeout_seconds=60))
 
-            with (
-                patch("media_bot.editor._detect_tts_engine", return_value="test"),
-                patch.dict("media_bot.editor._TTS_ENGINES", {"test": make_one_second_voice}),
-            ):
-                asyncio.run(render_voice_outro(
-                    source,
-                    output,
-                    DEFAULT_VOICE_OUTRO_TEXT,
-                    tts_engine="test",
-                    timeout_seconds=30,
-                ))
-
-            duration = float(subprocess.run(
+            source_duration = float(subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", str(source),
+                ],
+                capture_output=True, check=True, text=True,
+            ).stdout.strip())
+            output_duration = float(subprocess.run(
                 [
                     "ffprobe", "-v", "error", "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1", str(output),
                 ],
                 capture_output=True, check=True, text=True,
             ).stdout.strip())
-            self.assertGreaterEqual(duration, 2.8)
+            self.assertAlmostEqual(output_duration - source_duration, 1.5, delta=0.03)
 
-    def test_voice_outro_supports_video_without_source_audio(self):
+            frame = root / "plug-frame.png"
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-ss", f"{source_duration + 0.3:.3f}",
+                    "-i", str(output), "-frames:v", "1", str(frame),
+                ],
+                capture_output=True, check=True,
+            )
+            from PIL import Image
+            red, green, blue = Image.open(frame).convert("RGB").getpixel((5, 5))
+            self.assertGreater(red, green + 30)
+            self.assertGreater(red, blue + 30)
+
+    def test_like_subscribe_outro_supports_video_without_source_audio(self):
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             self.skipTest("ffmpeg/ffprobe not available")
         with tempfile.TemporaryDirectory(prefix="media-bot-test-") as directory:
@@ -344,20 +346,7 @@ class RenderEditIntegrationTests(unittest.TestCase):
             output = root / "output.mp4"
             _create_test_video(source, duration=1)
 
-            async def make_voice(_text, path, _voice, _speed, _timeout):
-                with wave.open(str(path), "wb") as audio:
-                    audio.setnchannels(1)
-                    audio.setsampwidth(2)
-                    audio.setframerate(16_000)
-                    audio.writeframes(b"\0\0" * 8_000)
-
-            with (
-                patch("media_bot.editor._detect_tts_engine", return_value="test"),
-                patch.dict("media_bot.editor._TTS_ENGINES", {"test": make_voice}),
-            ):
-                asyncio.run(render_voice_outro(
-                    source, output, tts_engine="test", timeout_seconds=30,
-                ))
+            asyncio.run(render_voice_outro(source, output, timeout_seconds=60))
 
             self.assertTrue(output.is_file())
             self.assertGreater(output.stat().st_size, 0)

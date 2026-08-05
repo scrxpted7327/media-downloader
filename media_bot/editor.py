@@ -41,6 +41,8 @@ _VOICE_PRESETS = {
 
 DEFAULT_VOICE_OUTRO_TEXT = "If you enjoyed this video, please like and subscribe for more."
 VOICE_OUTRO_LIKE_SUBSCRIBE = "like_subscribe"
+LIKE_SUBSCRIBE_ASSET = Path(__file__).with_name("assets") / "like_subscribe.mov"
+LIKE_SUBSCRIBE_OUTRO_DURATION = 1.5
 
 _CHANNEL_BANNER_HEIGHT_RATIO = .15
 
@@ -940,78 +942,115 @@ async def render_voice_outro(
     timeout_seconds: int = 600,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
-    """Append a spoken plug while holding the final video frame on screen."""
+    """Append the supplied green-screen Like & Subscribe plug."""
     if not input_video.is_file():
-        raise DownloadError(f"input video not found for voice outro ({input_video.name})")
+        raise DownloadError(f"input video not found for Like & Subscribe plug ({input_video.name})")
     if shutil.which("ffmpeg") is None:
-        raise DownloadError("ffmpeg is required for a voice outro")
-    if not voice_text or not voice_text.strip():
-        raise DownloadError("voice outro text is empty")
+        raise DownloadError("ffmpeg is required for the Like & Subscribe plug")
+    if not LIKE_SUBSCRIBE_ASSET.is_file():
+        raise DownloadError(f"Like & Subscribe asset not found ({LIKE_SUBSCRIBE_ASSET})")
 
     base_duration_us = _get_duration_us(input_video)
     if not base_duration_us or base_duration_us <= 0:
-        raise DownloadError(f"could not determine video duration for voice outro ({input_video.name})")
-    has_audio = _has_audio_stream(input_video)
-    preset = _VOICE_PRESETS.get(quality.lower(), _VOICE_PRESETS["basic"])
-
-    tmpdir = tempfile.TemporaryDirectory(prefix="media-bot-tts-outro-")
-    engine = tts_engine or "auto"
-    try:
-        tmp_audio, engine = await _synthesize_tts_audio(
-            voice_text.strip(),
-            Path(tmpdir.name),
-            tts_engine,
-            voice,
-            speed,
-            timeout_seconds,
-            progress_callback=progress_callback,
+        raise DownloadError(
+            f"could not determine video duration for Like & Subscribe plug ({input_video.name})"
         )
-        outro_duration_us = _get_duration_us(tmp_audio)
-        if not outro_duration_us or outro_duration_us <= 0:
-            raise DownloadError(f"TTS engine ({engine}) produced audio with no duration")
+    asset_duration_us = _get_duration_us(LIKE_SUBSCRIBE_ASSET)
+    if not asset_duration_us or asset_duration_us <= 0:
+        raise DownloadError("could not determine Like & Subscribe asset duration")
 
-        base_duration = base_duration_us / 1_000_000
-        outro_duration = outro_duration_us / 1_000_000
-        audio_rate = preset["ar"]
-        if has_audio:
-            base_audio = (
-                f"[0:a]aresample={audio_rate}:filter_type=kaiser,"
-                f"apad,atrim=duration={base_duration:.6f}[base]"
-            )
-        else:
-            base_audio = (
-                f"anullsrc=r={audio_rate}:cl=stereo,"
-                f"atrim=duration={base_duration:.6f}[base]"
-            )
-        filter_graph = ";".join([
-            f"[0:v]tpad=stop_mode=clone:stop_duration={outro_duration:.6f},"
-            "format=yuv420p,setsar=1[vout]",
-            base_audio,
-            f"[1:a]aresample={audio_rate}:filter_type=kaiser,"
-            f"apad,atrim=duration={outro_duration:.6f}[plug]",
-            "[base][plug]concat=n=2:v=0:a=1[aout]",
-        ])
+    base_duration = base_duration_us / 1_000_000
+    asset_duration = asset_duration_us / 1_000_000
+    outro_duration = LIKE_SUBSCRIBE_OUTRO_DURATION
+    total_duration = base_duration + outro_duration
+    speed_factor = asset_duration / outro_duration
+    video_width, video_height = _get_video_dimensions(input_video)
+    canvas_width = max(2, video_width // 2 * 2)
+    canvas_height = max(2, video_height // 2 * 2)
+    base_has_audio = _has_audio_stream(input_video)
+    asset_has_audio = _has_audio_stream(LIKE_SUBSCRIBE_ASSET)
+
+    # atempo accepts a bounded factor on older FFmpeg builds, so split a large
+    # speed-up into safe stages. The supplied clip is approximately 5.6x faster
+    # here, which becomes 2x, 2x, and the remaining factor.
+    atempo_filters: list[str] = []
+    remaining_factor = speed_factor
+    while remaining_factor > 2.0:
+        atempo_filters.append("atempo=2.0")
+        remaining_factor /= 2.0
+    while remaining_factor < 0.5:
+        atempo_filters.append("atempo=0.5")
+        remaining_factor /= 0.5
+    atempo_filters.append(f"atempo={remaining_factor:.9f}")
+    asset_audio_speed = ",".join(atempo_filters)
+
+    base_video = (
+        f"[0:v]scale={canvas_width}:{canvas_height}:flags=lanczos,"
+        "setpts=PTS-STARTPTS,"
+        f"tpad=stop_mode=clone:stop_duration={outro_duration:.6f},"
+        "format=yuv420p,setsar=1[basev]"
+    )
+    plug_video = (
+        f"[1:v]setpts=(PTS-STARTPTS)/{speed_factor:.9f},"
+        f"trim=duration={outro_duration:.6f},setpts=PTS-STARTPTS,"
+        "chromakey=0x00ff00:0.20:0.08,"
+        f"scale={canvas_width}:{canvas_height}:"
+        "force_original_aspect_ratio=decrease:flags=lanczos,"
+        "format=rgba,"
+        f"pad={canvas_width}:{canvas_height}:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+        f"setpts=PTS-STARTPTS+{base_duration:.6f}/TB[plugv]"
+    )
+    if base_has_audio:
+        base_audio = (
+            f"[0:a]asetpts=PTS-STARTPTS,aresample=48000:async=1,apad,"
+            f"atrim=duration={base_duration:.6f}[basea]"
+        )
+    else:
+        base_audio = (
+            f"anullsrc=r=48000:cl=stereo,"
+            f"atrim=duration={base_duration:.6f}[basea]"
+        )
+    if asset_has_audio:
+        plug_audio = (
+            f"[1:a]asetpts=PTS-STARTPTS,{asset_audio_speed},"
+            f"aresample=48000:async=1,atrim=duration={outro_duration:.6f},"
+            f"apad,atrim=duration={outro_duration:.6f}[pluga]"
+        )
+    else:
+        plug_audio = (
+            f"anullsrc=r=48000:cl=stereo,"
+            f"atrim=duration={outro_duration:.6f}[pluga]"
+        )
+    filter_graph = ";".join([
+        base_video,
+        plug_video,
+        "[basev][plugv]overlay=eof_action=pass:repeatlast=0:format=auto,"
+        "format=yuv420p,setsar=1[vout]",
+        base_audio,
+        plug_audio,
+        f"[basea][pluga]concat=n=2:v=0:a=1,"
+        f"atrim=duration={total_duration:.6f}[aout]",
+    ])
+    try:
         if progress_callback:
             await progress_callback(50)
         await _run_ffmpeg_with_progress(
             [
                 "ffmpeg", "-y",
                 "-i", str(input_video),
-                "-i", str(tmp_audio),
+                "-i", str(LIKE_SUBSCRIBE_ASSET),
                 "-filter_complex", filter_graph,
                 "-map", "[vout]", "-map", "[aout]",
                 "-c:v", _detect_video_encoder(), "-preset", "fast", "-crf", "23",
                 "-pix_fmt", "yuv420p",
-                "-c:a", preset["codec"],
-                "-ac", preset["ac"],
-                "-ar", preset["ar"],
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
                 "-movflags", "+faststart",
-                "-shortest",
+                "-t", f"{total_duration:.6f}",
                 str(output_path),
             ],
             timeout_seconds,
-            f"voice outro merge failed for {input_video.name}",
-            total_duration_us=base_duration_us + outro_duration_us,
+            f"Like & Subscribe plug merge failed for {input_video.name}",
+            total_duration_us=base_duration_us + int(outro_duration * 1_000_000),
             progress_callback=progress_callback,
         )
         if progress_callback:
@@ -1019,12 +1058,10 @@ async def render_voice_outro(
     except DownloadError:
         raise
     except Exception as exc:
-        raise DownloadError(f"voice outro failed ({engine}): {exc}") from exc
-    finally:
-        tmpdir.cleanup()
+        raise DownloadError(f"Like & Subscribe plug failed: {exc}") from exc
 
     if not output_path.is_file():
-        raise DownloadError(f"voice outro produced no output file ({output_path.name})")
+        raise DownloadError(f"Like & Subscribe plug produced no output file ({output_path.name})")
     return output_path
 
 

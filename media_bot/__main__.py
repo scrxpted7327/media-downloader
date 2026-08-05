@@ -432,7 +432,7 @@ def _render_preparation_text(
         f"Watermark: {watermark_detail}\n"
         f"Captions: {caption_detail}\n"
         f"Voice: {voice_detail}\n"
-        f"End voice plug: {outro_detail}\n"
+        f"End plug: {outro_detail}\n"
         f"Banner: {banner_detail}\n"
         f"Planned stages: {' → '.join(stages)}\n\n"
         "Auto Hashtags: queued after delivery from the original source when "

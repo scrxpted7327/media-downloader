@@ -93,10 +93,9 @@ threats, doxxing, protected-trait attacks, or unsupported claims. It uses the
 same `MEDIA_BOT_AUTO_HASHTAGS_CODEX_*` settings as metadata generation and
 fails the render with an actionable error when Codex is unavailable.
 
-Voice settings also include an optional `Like & Subscribe` end plug. It uses
-the selected TTS voice to append a short call-to-action after the original
-audio, holds the final video frame while it plays, and includes the plug in
-automatic captions when Auto Captions is enabled.
+Voice settings also include an optional `Like & Subscribe` end plug. It keys
+the supplied green-screen animation over the held final video frame, speeds it
+to exactly 1.5 seconds, and carries its audio through the end of the render.
 
 ## Telegram setup
 
@@ -117,7 +116,7 @@ Use `/queue` to see your queued/running job IDs and
 `/canceljob download:<id>`, `/canceljob render:<id>`, or
 `/canceljob metadata:<edit_id>` to request cancellation.
 
-Every bot render includes a spoken Like & Subscribe end plug by default. The
+Every bot render includes a visual Like & Subscribe end plug by default. The
 Voice settings menu can turn it off. After a rendered video is delivered, the
 bot queues evidence-bound title and hashtag generation in the authenticated
 local Codex CLI. It transcribes
