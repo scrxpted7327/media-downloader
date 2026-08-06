@@ -433,6 +433,54 @@ class DownloadEditActionTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_description_copy_button_serializes_native_copy_text(self):
+        from telegram import InlineKeyboardMarkup
+
+        from media_bot.__main__ import _add_description_copy_button
+
+        keyboard = InlineKeyboardMarkup([])
+        markup = _add_description_copy_button(keyboard, "A grounded clip")
+        copy_button = markup.inline_keyboard[-1][0]
+
+        self.assertEqual(copy_button.text, "📋 Copy Description")
+        self.assertEqual(copy_button.copy_text.text, "A grounded clip")
+        self.assertEqual(
+            copy_button.to_dict()["copy_text"],
+            {"text": "A grounded clip"},
+        )
+        self.assertIs(_add_description_copy_button(keyboard, "x" * 257), keyboard)
+
+    def test_source_description_has_native_copy_button(self):
+        from media_bot.__main__ import _send_secure_link
+
+        async def run():
+            await init_db(self.db_path)
+            job = await create_job(self.db_path, "https://example.com/v", 1, 2)
+            await update_job(
+                self.db_path,
+                job.id,
+                status="uploaded",
+                source_caption="Source video description",
+            )
+            status = MagicMock()
+            status.edit_text = AsyncMock()
+            with patch("media_bot.storage.list_presets", new_callable=AsyncMock, return_value=[]), \
+                 patch("media_bot.storage.get_or_create_user_settings", new_callable=AsyncMock) as gus:
+                gus.return_value = SimpleNamespace(preset_name=None)
+                await _send_secure_link(status, job.id, self.db_path, 1)
+
+            markup = status.edit_text.await_args.kwargs["reply_markup"]
+            copy_button = next(
+                button
+                for row in markup.inline_keyboard
+                for button in row
+                if button.copy_text is not None
+            )
+            self.assertEqual(copy_button.text, "📋 Copy Description")
+            self.assertEqual(copy_button.copy_text.text, "Source video description")
+
+        asyncio.run(run())
+
     def test_download_preset_uses_shared_render_pipeline(self):
         from media_bot.__main__ import download_callback
 

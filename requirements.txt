@@ -4,7 +4,7 @@ aiosqlite==0.22.1
 python-telegram-bot[job-queue]==22.8
 
 # Supported download backends and metadata
-gallery-dl==1.32.7
+gallery-dl==1.32.9
 yt-dlp==2026.7.4
 
 # Editing, captions, speech, and watermark processing

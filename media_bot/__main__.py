@@ -17,8 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from aiohttp import web
-from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
+from telegram import CopyTextButton, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, InlineKeyboardButtonLimit
 from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
@@ -137,6 +137,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logging.getLogger("httpx").setLevel(logging.WARNING)
 LOGGER = logging.getLogger(__name__)
 install_event_logging()
+
+_COPY_TEXT_LIMIT = InlineKeyboardButtonLimit.MAX_COPY_TEXT
 
 RESTART_MARKER = Path("runtime/restart-requested")
 RESTART_ACK = Path("runtime/restart-shutdown-notified")
@@ -456,6 +458,27 @@ def _admin_authorized(update: Update, settings: Settings) -> bool:
     return bool(user and user.id in settings.admin_user_ids)
 
 
+def _add_description_copy_button(
+    keyboard: InlineKeyboardMarkup | None,
+    description: str | None,
+) -> InlineKeyboardMarkup | None:
+    """Append Telegram's native one-tap copy button for a bounded description."""
+    copy_text = " ".join((description or "").split()).strip()
+    # Telegram limits CopyTextButton text to 256 characters. Do not silently
+    # copy only a prefix of a longer source description.
+    if not copy_text or len(copy_text) > _COPY_TEXT_LIMIT:
+        return keyboard
+
+    rows = [list(row) for row in keyboard.inline_keyboard] if keyboard else []
+    rows.append([
+        InlineKeyboardButton(
+            "📋 Copy Description",
+            copy_text=CopyTextButton(text=copy_text),
+        ),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 async def _download_actions_keyboard(
     job_id: int, db_path: Path, user_id: int
 ) -> InlineKeyboardMarkup:
@@ -521,6 +544,7 @@ async def _send_secure_link(status_message, job_id: int, db_path: Path, user_id:
     if job.source_caption:
         caption = " ".join(job.source_caption.split())
         details.append(caption[:300] + ("…" if len(caption) > 300 else ""))
+        keyboard = _add_description_copy_button(keyboard, caption)
     suffix = "\n\n" + "\n".join(details) if details else ""
     text = f"✅ Download complete. Job #{job.id}. Choose an action:{suffix}"
     thumbnail = Path(job.thumbnail_path) if job.thumbnail_path else None
@@ -825,7 +849,18 @@ async def _process_single_url(
     except DownloadError as exc:
         LOGGER.warning("Download failed for %s: %s", url, exc)
         try:
-            await status.edit_text(f"❌ Download failed: {exc}")
+            detail = str(exc)
+            lowered = detail.casefold()
+            if is_tiktok_url(url) and (
+                "solving javascript challenge" in lowered
+                or "403 forbidden" in lowered
+            ):
+                detail = (
+                    "TikTok blocked automated access with a JavaScript challenge "
+                    "(HTTP 403). This bot cannot bypass that challenge. "
+                    "Download the video in TikTok and send the saved file here."
+                )
+            await status.edit_text(f"❌ Download failed: {detail}")
         except Exception:
             pass
         await update_job(db_path, job.id, status="failed", error_message=str(exc))
@@ -2064,6 +2099,7 @@ async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> Non
             "chat_id": source.chat_id,
             "text": f"📝 Title and hashtags for job #{edit_id}\n\n"
             f"{result.description}\n\n{hashtags}",
+            "reply_markup": _add_description_copy_button(None, result.description),
         }
         if edit.render_delivery_message_id is not None:
             reply_kwargs["reply_to_message_id"] = edit.render_delivery_message_id
@@ -3277,10 +3313,12 @@ def main() -> None:
     application = builder.post_init(_post_init).post_shutdown(_post_shutdown).build()
     application.bot_data["settings"] = settings
     application.bot_data["ytdlp"] = ytdlp
-    gallerydl_path = shutil.which("gallery-dl")
-    if gallerydl_path is None:
-        gallerydl_path = str(Path(sys.executable).with_name("gallery-dl"))
-    application.bot_data["gallerydl"] = Path(gallerydl_path)
+    venv_gallerydl = Path(sys.executable).with_name("gallery-dl")
+    if venv_gallerydl.is_file() and os.access(venv_gallerydl, os.X_OK):
+        application.bot_data["gallerydl"] = venv_gallerydl
+    else:
+        gallerydl_path = shutil.which("gallery-dl")
+        application.bot_data["gallerydl"] = Path(gallerydl_path) if gallerydl_path else venv_gallerydl
     application.bot_data["db_path"] = db_path
     application.bot_data["storage_dir"] = storage_dir
     application.bot_data["download_work"] = WorkQueue(

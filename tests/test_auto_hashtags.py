@@ -283,6 +283,10 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.metadata_reply_message_id, 20)
         bot.send_message.assert_awaited_once()
         self.assertIn("Title and hashtags", bot.send_message.await_args.kwargs["text"])
+        markup = bot.send_message.await_args.kwargs["reply_markup"]
+        copy_button = markup.inline_keyboard[-1][0]
+        self.assertEqual(copy_button.text, "📋 Copy Description")
+        self.assertEqual(copy_button.copy_text.text, "A grounded clip")
         self.assertEqual(generate.await_args.args[0], self.original)
 
     async def test_codex_unavailable_skips_metadata_without_affecting_render_status(self):

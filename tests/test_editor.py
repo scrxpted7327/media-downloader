@@ -171,7 +171,7 @@ class RenderEditIntegrationTests(unittest.TestCase):
 
             async def fake_ffmpeg(command, *_args, **_kwargs):
                 ass_argument = command[command.index("-vf") + 1]
-                ass_path = Path(ass_argument.removeprefix("ass="))
+                ass_path = Path(ass_argument.removeprefix("ass=").split(",", 1)[0])
                 captured_ass.append(ass_path.read_text(encoding="utf-8"))
                 output.write_bytes(b"rendered")
 
