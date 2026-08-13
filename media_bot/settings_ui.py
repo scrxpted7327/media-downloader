@@ -1744,6 +1744,13 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     user = update.effective_user
     if user is None:
         return
+    chat = update.effective_chat
+    pool_owner_id = (
+        chat.id
+        if chat is not None
+        and getattr(chat, "type", None) in {"group", "supergroup", "channel"}
+        else user.id
+    )
     try:
         edit = await require_owned_edit(db_path, edit_id, user.id)
         await require_owned_job(db_path, edit.source_job_id, user.id)
@@ -1756,7 +1763,7 @@ async def _add_edit_to_pool(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     pool_item = await create_durable_pool_item(
         db_path,
         storage_dir,
-        user.id,
+        pool_owner_id,
         Path(edit.file_path),
         source_job_id=edit.source_job_id,
         edit_job_id=edit.id,
