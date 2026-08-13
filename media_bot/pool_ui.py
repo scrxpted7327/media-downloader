@@ -51,10 +51,10 @@ async def _answer_callback(query, text: str | None = None, *, show_alert: bool =
 
 def _pool_owner_id(update: Update) -> int | None:
     """Use the chat as the pool owner outside private conversations."""
-    chat = update.effective_chat
+    chat = getattr(update, "effective_chat", None)
     if chat is not None and getattr(chat, "type", "private") != "private":
         return chat.id
-    user = update.effective_user
+    user = getattr(update, "effective_user", None)
     return user.id if user is not None else None
 
 
