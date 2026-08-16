@@ -282,12 +282,43 @@ class MetadataStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(updated.metadata_hashtags), [f"#tag{index}" for index in range(8)])
         self.assertEqual(updated.metadata_reply_message_id, 20)
         bot.send_message.assert_awaited_once()
-        self.assertIn("Title and hashtags", bot.send_message.await_args.kwargs["text"])
-        markup = bot.send_message.await_args.kwargs["reply_markup"]
-        copy_button = markup.inline_keyboard[-1][0]
-        self.assertEqual(copy_button.text, "📋 Copy Description")
-        self.assertEqual(copy_button.copy_text.text, "A grounded clip")
+        send_kwargs = bot.send_message.await_args.kwargs
+        self.assertIn("Description:\nA grounded clip", send_kwargs["text"])
+        self.assertIn("Hashtags:\n#tag0 #tag1", send_kwargs["text"])
+        buttons = [
+            button
+            for row in send_kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertEqual([button.text for button in buttons], [
+            "📋 Copy description",
+            "📋 Copy hashtags",
+        ])
+        self.assertEqual(
+            [button.copy_text.text for button in buttons],
+            ["A grounded clip", " ".join(f"#tag{index}" for index in range(8))],
+        )
         self.assertEqual(generate.await_args.args[0], self.original)
+
+    async def test_long_descriptions_get_complete_copyable_parts(self):
+        from media_bot.__main__ import _metadata_copy_keyboard
+
+        description = " ".join(f"word{index}" for index in range(100))
+        markup = _metadata_copy_keyboard(description, "#one #two #three #four #five")
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        description_buttons = [
+            button for button in buttons if button.text.startswith("📋 Copy description")
+        ]
+
+        self.assertGreater(len(description_buttons), 1)
+        self.assertEqual(
+            " ".join(button.copy_text.text for button in description_buttons),
+            description,
+        )
+        self.assertTrue(all(
+            len(button.copy_text.text.encode("utf-16-le")) // 2 <= 256
+            for button in buttons
+        ))
 
     async def test_codex_unavailable_skips_metadata_without_affecting_render_status(self):
         work = WorkQueue(name="metadata", workers=1, capacity=2, per_user_capacity=2)

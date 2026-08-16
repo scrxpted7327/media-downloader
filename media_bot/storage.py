@@ -34,6 +34,25 @@ class JobRecord:
     created_at: datetime
     updated_at: datetime
     error_message: str | None
+    owner_kind: str = "telegram"
+    owner_id: str | None = None
+    source_channel: str = "TELEGRAM"
+    requested_format: str | None = None
+    requested_quality: str | None = None
+    requested_options: str | None = None
+    phase: str | None = None
+    progress_percent: float | None = None
+    bytes_downloaded: int | None = None
+    bytes_total: int | None = None
+    speed: str | None = None
+    eta_seconds: int | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    error_code: str | None = None
+    output_filename: str | None = None
+    output_mime_type: str | None = None
+    output_metadata: str | None = None
 
 
 @dataclass(frozen=True)
@@ -233,11 +252,14 @@ class UnsafeStoragePath(ValueError):
 
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 
 _JOB_UPDATE_FIELDS = frozenset({
     "status", "file_path", "file_size", "local_api_used", "status_message_id",
-    "title", "source_caption", "thumbnail_path", "error_message",
+    "title", "source_caption", "thumbnail_path", "error_message", "phase",
+    "progress_percent", "bytes_downloaded", "bytes_total", "speed", "eta_seconds",
+    "started_at", "completed_at", "failed_at", "error_code", "output_filename",
+    "output_mime_type", "output_metadata",
 })
 _USER_SETTINGS_UPDATE_FIELDS = frozenset({
     "preset_name", "crop_preset", "caption_text", "voice_over_voice",
@@ -329,7 +351,26 @@ _SCHEMA_SQL = """
         thumbnail_path TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        error_message TEXT
+        error_message TEXT,
+        owner_kind TEXT NOT NULL DEFAULT 'telegram',
+        owner_id TEXT,
+        source_channel TEXT NOT NULL DEFAULT 'TELEGRAM',
+        requested_format TEXT,
+        requested_quality TEXT,
+        requested_options TEXT,
+        phase TEXT,
+        progress_percent REAL,
+        bytes_downloaded INTEGER,
+        bytes_total INTEGER,
+        speed TEXT,
+        eta_seconds INTEGER,
+        started_at TEXT,
+        completed_at TEXT,
+        failed_at TEXT,
+        error_code TEXT,
+        output_filename TEXT,
+        output_mime_type TEXT,
+        output_metadata TEXT
     );
     CREATE TABLE IF NOT EXISTS edit_jobs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -497,6 +538,8 @@ _SCHEMA_SQL = """
     );
     CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
     CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner_kind, owner_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_jobs_source_channel ON jobs(source_channel);
     CREATE INDEX IF NOT EXISTS idx_tokens_job ON download_tokens(job_id);
     CREATE INDEX IF NOT EXISTS idx_tokens_expires ON download_tokens(expires_at);
     CREATE INDEX IF NOT EXISTS idx_presets_user ON presets(user_id);
@@ -591,6 +634,28 @@ _RENDER_MESSAGE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("render_status_message_id", "INTEGER"),
 )
 
+_MEDIA_JOB_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("owner_kind", "TEXT NOT NULL DEFAULT 'telegram'"),
+    ("owner_id", "TEXT"),
+    ("source_channel", "TEXT NOT NULL DEFAULT 'TELEGRAM'"),
+    ("requested_format", "TEXT"),
+    ("requested_quality", "TEXT"),
+    ("requested_options", "TEXT"),
+    ("phase", "TEXT"),
+    ("progress_percent", "REAL"),
+    ("bytes_downloaded", "INTEGER"),
+    ("bytes_total", "INTEGER"),
+    ("speed", "TEXT"),
+    ("eta_seconds", "INTEGER"),
+    ("started_at", "TEXT"),
+    ("completed_at", "TEXT"),
+    ("failed_at", "TEXT"),
+    ("error_code", "TEXT"),
+    ("output_filename", "TEXT"),
+    ("output_mime_type", "TEXT"),
+    ("output_metadata", "TEXT"),
+)
+
 
 async def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -660,6 +725,38 @@ async def _apply_migrations(db: aiosqlite.Connection) -> None:
                     f'ALTER TABLE "{table}" ADD COLUMN "voice_outro" TEXT'
                 )
         await _mark_migration(db, 7, "add voice-over outro")
+    if 8 not in applied:
+        existing = await _column_names(db, "jobs")
+        for column, definition in _MEDIA_JOB_COLUMNS:
+            if column not in existing:
+                await db.execute(
+                    f'ALTER TABLE "jobs" ADD COLUMN "{column}" {definition}'
+                )
+        await db.execute(
+            "UPDATE jobs SET owner_kind = 'telegram' "
+            "WHERE owner_kind IS NULL OR owner_kind = ''"
+        )
+        await db.execute(
+            "UPDATE jobs SET source_channel = 'TELEGRAM' "
+            "WHERE source_channel IS NULL OR source_channel = ''"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_owner "
+            "ON jobs(owner_kind, owner_id, created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_source_channel ON jobs(source_channel)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS media_internal_request_nonces ("
+            "request_id TEXT PRIMARY KEY, received_at TEXT NOT NULL, "
+            "expires_at TEXT NOT NULL, acting_user_id TEXT NOT NULL)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_nonces_expires "
+            "ON media_internal_request_nonces(expires_at)"
+        )
+        await _mark_migration(db, 8, "add multi-user media job ownership")
 
 
 async def _mark_migration(db: aiosqlite.Connection, version: int, name: str) -> None:
@@ -872,17 +969,69 @@ async def foreign_key_violations(db_path: Path) -> list[aiosqlite.Row]:
             return list(await cursor.fetchall())
 
 
-async def create_job(db_path: Path, url: str, user_id: int, chat_id: int) -> JobRecord:
+async def create_job(
+    db_path: Path,
+    url: str,
+    user_id: int,
+    chat_id: int,
+    *,
+    owner_kind: str = "telegram",
+    owner_id: str | None = None,
+    source_channel: str = "TELEGRAM",
+    requested_format: str | None = None,
+    requested_quality: str | None = None,
+    requested_options: str | None = None,
+) -> JobRecord:
+    if not owner_kind or not source_channel:
+        raise ValueError("job ownership and source channel are required")
     async with open_database(db_path) as db:
         cursor = await db.execute(
-            "INSERT INTO jobs (url, user_id, chat_id) VALUES (?, ?, ?)",
-            (url, user_id, chat_id),
+            "INSERT INTO jobs (url, user_id, chat_id, owner_kind, owner_id, source_channel, "
+            "requested_format, requested_quality, requested_options) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                url, user_id, chat_id, owner_kind, owner_id, source_channel,
+                requested_format, requested_quality, requested_options,
+            ),
         )
         await db.commit()
         job_id = cursor.lastrowid
         async with db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)) as cur:
             row = await cur.fetchone()
         return _row_to_job(row)
+
+
+async def create_external_job(
+    db_path: Path,
+    url: str,
+    *,
+    owner_kind: str,
+    owner_id: str,
+    source_channel: str = "PWA",
+    requested_format: str | None = None,
+    requested_quality: str | None = None,
+    requested_options: str | None = None,
+) -> JobRecord:
+    """Create a job for a non-Telegram identity namespace.
+
+    The legacy numeric columns remain populated for compatibility with the
+    Telegram/editor schema, but ownership is derived from the explicit opaque
+    external owner fields.
+    """
+    if not owner_id.strip():
+        raise ValueError("external job owner is required")
+    return await create_job(
+        db_path,
+        url,
+        0,
+        0,
+        owner_kind=owner_kind,
+        owner_id=owner_id,
+        source_channel=source_channel,
+        requested_format=requested_format,
+        requested_quality=requested_quality,
+        requested_options=requested_options,
+    )
 
 
 async def update_job(db_path: Path, job_id: int, **kwargs) -> JobRecord | None:
@@ -917,6 +1066,78 @@ async def list_user_jobs(db_path: Path, user_id: int, limit: int = 20) -> list[J
         ) as cur:
             rows = await cur.fetchall()
         return [_row_to_job(row) for row in rows]
+
+
+async def get_job_for_owner(
+    db_path: Path, job_id: int, *, owner_kind: str, owner_id: str,
+) -> JobRecord | None:
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT * FROM jobs WHERE id = ? AND owner_kind = ? AND owner_id = ?",
+            (job_id, owner_kind, owner_id),
+        ) as cur:
+            row = await cur.fetchone()
+    return _row_to_job(row) if row else None
+
+
+async def list_jobs_for_owner(
+    db_path: Path,
+    *,
+    owner_kind: str,
+    owner_id: str,
+    limit: int = 50,
+    status: str | None = None,
+) -> list[JobRecord]:
+    bounded_limit = max(1, min(int(limit), 100))
+    query = (
+        "SELECT * FROM jobs WHERE owner_kind = ? AND owner_id = ?"
+    )
+    params: list[object] = [owner_kind, owner_id]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(bounded_limit)
+    async with open_database(db_path) as db:
+        async with db.execute(query, params) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_job(row) for row in rows]
+
+
+async def claim_internal_request_id(
+    db_path: Path,
+    request_id: str,
+    acting_user_id: str,
+    ttl_seconds: int,
+) -> bool:
+    """Atomically claim a bounded-lifetime private mutation request ID."""
+    if not request_id or not acting_user_id:
+        return False
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(seconds=max(1, int(ttl_seconds)))
+    now_text = now.isoformat()
+    async with open_database(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute(
+                "DELETE FROM media_internal_request_nonces WHERE expires_at <= ?",
+                (now_text,),
+            )
+            try:
+                await db.execute(
+                    "INSERT INTO media_internal_request_nonces "
+                    "(request_id, received_at, expires_at, acting_user_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (request_id, now_text, expires.isoformat(), acting_user_id),
+                )
+            except aiosqlite.IntegrityError:
+                await db.rollback()
+                return False
+            await db.commit()
+            return True
+        except Exception:
+            await db.rollback()
+            raise
 
 
 async def list_all_jobs(db_path: Path, limit: int = 30) -> list[JobRecord]:
@@ -2134,6 +2355,8 @@ async def delete_job_with_artifacts(
     job_id: int,
     *,
     user_id: int | None = None,
+    owner_kind: str | None = None,
+    owner_id: str | None = None,
 ) -> CleanupResult:
     """Delete a job, its edit records, and all unreferenced in-root artifacts."""
 
@@ -2141,10 +2364,15 @@ async def delete_job_with_artifacts(
         await db.execute("BEGIN IMMEDIATE")
         try:
             query = "SELECT * FROM jobs WHERE id = ?"
-            params: tuple[int, ...] = (job_id,)
+            params: tuple[object, ...] = (job_id,)
             if user_id is not None:
                 query += " AND user_id = ?"
                 params = (job_id, user_id)
+            if owner_kind is not None or owner_id is not None:
+                if owner_kind is None or owner_id is None:
+                    raise ValueError("owner_kind and owner_id must be provided together")
+                query += " AND owner_kind = ? AND owner_id = ?"
+                params = (*params, owner_kind, owner_id)
             async with db.execute(query, params) as row_cursor:
                 job = await row_cursor.fetchone()
             if job is None:
@@ -2179,10 +2407,15 @@ async def delete_job_with_artifacts(
                 "DELETE FROM edit_jobs WHERE source_job_id = ?", (job_id,)
             )
             delete_query = "DELETE FROM jobs WHERE id = ?"
-            delete_params: tuple[int, ...] = (job_id,)
+            delete_params: tuple[object, ...] = (job_id,)
             if user_id is not None:
                 delete_query += " AND user_id = ?"
                 delete_params = (job_id, user_id)
+            if owner_kind is not None or owner_id is not None:
+                if owner_kind is None or owner_id is None:
+                    raise ValueError("owner_kind and owner_id must be provided together")
+                delete_query += " AND owner_kind = ? AND owner_id = ?"
+                delete_params = (*delete_params, owner_kind, owner_id)
             job_cursor = await db.execute(delete_query, delete_params)
             await db.commit()
         except Exception:
@@ -2278,7 +2511,7 @@ async def cleanup_old_jobs(db_path: Path, storage_dir: Path, retention_days: int
     async with open_database(db_path) as db:
         async with db.execute(
             "SELECT id FROM jobs "
-            "WHERE status IN ('uploaded', 'deleted', 'failed') "
+            "WHERE status IN ('uploaded', 'completed', 'cancelled', 'deleted', 'failed') "
             "AND datetime(updated_at) < datetime(?) ORDER BY id",
             (cutoff.isoformat(),),
         ) as cur:
@@ -2308,6 +2541,25 @@ def _row_to_job(row: aiosqlite.Row) -> JobRecord:
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         error_message=row["error_message"],
+        owner_kind=_safe_text(row, "owner_kind", "telegram") or "telegram",
+        owner_id=_safe_text(row, "owner_id"),
+        source_channel=_safe_text(row, "source_channel", "TELEGRAM") or "TELEGRAM",
+        requested_format=_safe_text(row, "requested_format"),
+        requested_quality=_safe_text(row, "requested_quality"),
+        requested_options=_safe_text(row, "requested_options"),
+        phase=_safe_text(row, "phase"),
+        progress_percent=_safe_float(row, "progress_percent"),
+        bytes_downloaded=_safe_int(row, "bytes_downloaded"),
+        bytes_total=_safe_int(row, "bytes_total"),
+        speed=_safe_text(row, "speed"),
+        eta_seconds=_safe_int(row, "eta_seconds"),
+        started_at=_optional_datetime(row, "started_at"),
+        completed_at=_optional_datetime(row, "completed_at"),
+        failed_at=_optional_datetime(row, "failed_at"),
+        error_code=_safe_text(row, "error_code"),
+        output_filename=_safe_text(row, "output_filename"),
+        output_mime_type=_safe_text(row, "output_mime_type"),
+        output_metadata=_safe_text(row, "output_metadata"),
     )
 
 
@@ -2476,6 +2728,28 @@ def _safe_int(row: aiosqlite.Row, key: str) -> int | None:
     try:
         return row[key]
     except (IndexError, KeyError):
+        return None
+
+
+def _safe_value(row: aiosqlite.Row, key: str, default: object = None) -> object:
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _safe_text(row: aiosqlite.Row, key: str, default: str | None = None) -> str | None:
+    value = _safe_value(row, key, default)
+    return None if value is None else str(value)
+
+
+def _safe_float(row: aiosqlite.Row, key: str) -> float | None:
+    value = _safe_value(row, key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 

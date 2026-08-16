@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 LOGGER = logging.getLogger(__name__)
 WorkFactory = Callable[[], Awaitable[None]]
+WorkOwner = str | int
 
 
 class WorkRejected(RuntimeError):
@@ -22,7 +23,7 @@ class WorkAlreadyQueued(WorkRejected):
 
 @dataclass(frozen=True)
 class WorkItem:
-    user_id: int
+    user_id: WorkOwner
     label: str
     factory: WorkFactory
 
@@ -45,7 +46,7 @@ class WorkQueue:
         self.capacity = capacity
         self.per_user_capacity = per_user_capacity
         self._queue: asyncio.Queue[WorkItem | None] = asyncio.Queue(maxsize=capacity)
-        self._pending: Counter[int] = Counter()
+        self._pending: Counter[WorkOwner] = Counter()
         self._tasks: list[asyncio.Task[None]] = []
         self._items: dict[str, WorkItem] = {}
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -61,7 +62,7 @@ class WorkQueue:
             for index in range(self.workers)
         ]
 
-    def submit(self, *, user_id: int, label: str, factory: WorkFactory) -> None:
+    def submit(self, *, user_id: WorkOwner, label: str, factory: WorkFactory) -> None:
         if self._stopping:
             raise WorkRejected(f"{self.name} queue is stopping")
         if label in self._items:
@@ -78,7 +79,7 @@ class WorkQueue:
         self._pending[user_id] += 1
         self._items[label] = item
 
-    def cancel(self, *, user_id: int, label: str) -> bool:
+    def cancel(self, *, user_id: WorkOwner, label: str) -> bool:
         """Request cancellation of one queued/running item owned by ``user_id``."""
         item = self._items.get(label)
         if item is None or item.user_id != user_id:
@@ -99,7 +100,7 @@ class WorkQueue:
         """Return whether an active item was explicitly cancelled by its owner."""
         return label in self._cancelled
 
-    def items_for_user(self, user_id: int) -> tuple[tuple[str, str], ...]:
+    def items_for_user(self, user_id: WorkOwner) -> tuple[tuple[str, str], ...]:
         """Return stable labels and states for one user's admitted work."""
         return tuple(
             (
@@ -180,5 +181,5 @@ class WorkQueue:
     def active(self) -> int:
         return len(self._active)
 
-    def pending_for_user(self, user_id: int) -> int:
+    def pending_for_user(self, user_id: WorkOwner) -> int:
         return self._pending[user_id]

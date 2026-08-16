@@ -121,11 +121,13 @@ Voice settings menu can turn it off. After a rendered video is delivered, the
 bot queues evidence-bound title and hashtag generation in the authenticated
 local Codex CLI. It transcribes
 the original source audio and samples eight frames from the original source,
-so watermarks, banners, and other edit overlays do not become the title's
-subject. Titles are capped at 100 characters, and the space-joined hashtag set
-is capped at 100 characters. Hashtags are requested in likely-reach order while
-remaining evidence-grounded. The result is delivered as a separate Telegram
-message. The default
+so watermarks, banners, and other edit overlays do not become the description's
+subject. Generated text is capped at 100 characters, and the space-joined
+hashtag set is capped at 100 characters. Hashtags are requested in likely-reach
+order while remaining evidence-grounded. The result is delivered as a separate
+Telegram message with native click-to-copy buttons for the description and
+hashtags. Long descriptions are split into complete copyable parts to honor
+Telegram's button limit. The default
 runtime settings are `gpt-5.6-luna`, `max` reasoning, one metadata worker, and a
 1,800-second subprocess limit. Set `MEDIA_BOT_AUTO_HASHTAGS_CODEX_HOME` when
 Codex authentication is stored in a non-default home. A missing or unavailable
@@ -205,3 +207,44 @@ The embedded loopback HTTP service exposes `/healthz` for a local service
 manager or reverse proxy. Diagnostic event and supervisor logs rotate with
 bounded backups, and download-token request paths are excluded from access
 logging.
+
+### Private watchMyWallet PWA API
+
+The bot process also embeds a second, private aiohttp API for the
+watchMyWallet backend-for-frontend. It shares the Telegram download queue,
+SQLite database, storage root, and downloader/transcoder implementation; it
+does not start a second worker pool. The legacy secure-link server remains on
+`MEDIA_BOT_DOWNLOAD_PORT` (8080 by default; use 8083 when watchMyWallet owns
+8080 on the same host). The PWA API defaults to
+loopback `MEDIA_BOT_API_PORT=8082` and must not be exposed through Cloudflare.
+
+The private API requires both `MEDIA_BOT_API_KEY` and a short-lived,
+HMAC-SHA256 signed ActingUserContext from watchMyWallet. The service key
+authenticates watchMyWallet as the caller; the signed context supplies the
+opaque represented user ID. PWA jobs are stored with `owner_kind=watchmywallet`
+and `source_channel=PWA`, so Telegram numeric identities and PWA users never
+share an ownership namespace.
+
+Private routes are:
+
+```text
+GET    /api/media/health
+POST   /api/media/jobs
+GET    /api/media/jobs
+GET    /api/media/jobs/{job_id}
+POST   /api/media/jobs/{job_id}/cancel
+GET    /api/media/jobs/{job_id}/result
+DELETE /api/media/jobs/{job_id}
+```
+
+Run the existing bot service after configuring the private variables:
+
+```sh
+python3 -m media_bot
+```
+
+This starts Telegram, the legacy loopback download endpoint, and the private
+PWA API in one process. The private API uses the same bounded queue as
+Telegram, while the PWA result route streams only a contained file belonging
+to the validated acting user. Replayed signed mutations are rejected through
+the bounded `media_internal_request_nonces` table.

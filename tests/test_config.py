@@ -20,6 +20,25 @@ class SettingsTests(unittest.TestCase):
             settings = Settings.from_environment()
         self.assertEqual(settings.download_bind_host, "127.0.0.1")
         self.assertIsNone(settings.download_public_origin)
+        self.assertEqual(settings.media_api_bind_host, "127.0.0.1")
+        self.assertEqual(settings.media_api_port, 8082)
+        self.assertIsNone(settings.media_api_key)
+
+    def test_private_media_api_configuration_is_separate_from_download_links(self):
+        with self._environment(
+            MEDIA_BOT_API_BIND_HOST="127.0.0.1",
+            MEDIA_BOT_API_PORT="9092",
+            MEDIA_BOT_API_KEY="media-key",
+            WATCHMYWALLET_INTERNAL_SIGNING_SECRET="signing-key",
+            WATCHMYWALLET_ACTING_CONTEXT_MAX_AGE_SECONDS="45",
+            WATCHMYWALLET_ACTING_CONTEXT_CLOCK_SKEW_SECONDS="7",
+        ):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.media_api_port, 9092)
+        self.assertEqual(settings.media_api_key, "media-key")
+        self.assertEqual(settings.internal_signing_secret, "signing-key")
+        self.assertEqual(settings.acting_context_max_age_seconds, 45)
+        self.assertEqual(settings.acting_context_clock_skew_seconds, 7)
 
     def test_validates_and_normalizes_public_origin(self):
         with self._environment(

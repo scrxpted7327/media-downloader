@@ -203,6 +203,9 @@ async def download_media(
     max_filesize_mb: int,
     timeout_seconds: int,
     progress_callback: ProgressCallback | None = None,
+    *,
+    format_name: str = "video",
+    quality: str = "best",
 ) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     temporary = tempfile.TemporaryDirectory(prefix="media-bot-")
     directory = Path(temporary.name)
@@ -211,14 +214,40 @@ async def download_media(
     process_wait: asyncio.Task[int] | None = None
     monitor: asyncio.Task[None] | None = None
     maximum_bytes, maximum_files = _working_tree_limits(max_filesize_mb)
+    if format_name not in {"video", "audio"}:
+        raise DownloadError("unsupported media format")
+    quality_limits = {
+        "best": None,
+        "2160p": 2160,
+        "1440p": 1440,
+        "1080p": 1080,
+        "720p": 720,
+        "480p": 480,
+    }
+    if quality not in quality_limits:
+        raise DownloadError("unsupported media quality")
+    if format_name == "audio":
+        format_selector = "bestaudio/best"
+    elif quality_limits[quality] is None:
+        format_selector = "bestvideo[ext!=webm]+bestaudio/best[ext!=webm]/best"
+    else:
+        maximum_height = quality_limits[quality]
+        format_selector = (
+            f"bestvideo[height<={maximum_height}][ext!=webm]+"
+            f"bestaudio/best[height<={maximum_height}][ext!=webm]/best"
+        )
     command = [
         str(ytdlp), "--no-playlist", "--no-config", "--restrict-filenames", "--max-filesize", f"{max_filesize_mb}M",
         "--socket-timeout", "30", "--retries", "2", "--concurrent-fragments", "4", "--newline",
-        "--format", "bestvideo[ext!=webm]+bestaudio/best[ext!=webm]/best",
+        "--format", format_selector,
         "--write-info-json", "--write-thumbnail",
         "--output", str(directory / "%(title).120B-%(id)s.%(ext)s"),
         "--print", "after_move:filepath", "--", url,
     ]
+    if format_name == "audio":
+        # These are fixed, reviewed options; the PWA never supplies raw
+        # yt-dlp or ffmpeg arguments.
+        command[1:1] = ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
     async def _abort() -> None:
         auxiliary = [task for task in (process_wait, monitor) if task is not None]
         for task in auxiliary:

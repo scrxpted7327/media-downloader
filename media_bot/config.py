@@ -54,6 +54,12 @@ class Settings:
     download_public_origin: str | None = None
     download_bind_host: str = "127.0.0.1"
     download_port: int = 8080
+    media_api_bind_host: str = "127.0.0.1"
+    media_api_port: int = 8082
+    media_api_key: str | None = field(default=None, repr=False)
+    internal_signing_secret: str | None = field(default=None, repr=False)
+    acting_context_max_age_seconds: int = 60
+    acting_context_clock_skew_seconds: int = 5
     storage_dir: Path = field(default_factory=lambda: Path("runtime/jobs"))
     db_path: Path = field(default_factory=lambda: Path("runtime/jobs/media-bot.db"))
     token_expiry_minutes: int = 15
@@ -146,6 +152,18 @@ class Settings:
         if not download_bind_host:
             raise ValueError("MEDIA_BOT_DOWNLOAD_BIND_HOST cannot be empty")
         download_port = int(os.getenv("MEDIA_BOT_DOWNLOAD_PORT") or "8080")
+        media_api_bind_host = os.getenv("MEDIA_BOT_API_BIND_HOST", "127.0.0.1").strip()
+        media_api_port = int(os.getenv("MEDIA_BOT_API_PORT") or "8082")
+        media_api_key = os.getenv("MEDIA_BOT_API_KEY", "").strip() or None
+        internal_signing_secret = (
+            os.getenv("WATCHMYWALLET_INTERNAL_SIGNING_SECRET", "").strip() or None
+        )
+        acting_context_max_age_seconds = int(
+            os.getenv("WATCHMYWALLET_ACTING_CONTEXT_MAX_AGE_SECONDS") or "60"
+        )
+        acting_context_clock_skew_seconds = int(
+            os.getenv("WATCHMYWALLET_ACTING_CONTEXT_CLOCK_SKEW_SECONDS") or "5"
+        )
         storage_dir = Path(os.getenv("MEDIA_BOT_STORAGE_DIR") or "runtime/jobs").expanduser()
         db_path = Path(os.getenv("MEDIA_BOT_DB_PATH") or "runtime/jobs/media-bot.db").expanduser()
         token_expiry = int(os.getenv("MEDIA_BOT_TOKEN_EXPIRY_MINUTES") or "15")
@@ -196,8 +214,16 @@ class Settings:
         )
         if max_size < 1 or timeout < 1 or upload_timeout < 1:
             raise ValueError("download size and timeouts must be positive")
-        if not (1 <= download_port <= 65535):
-            raise ValueError("download port must be a valid TCP port")
+        if not media_api_bind_host:
+            raise ValueError("MEDIA_BOT_API_BIND_HOST cannot be empty")
+        if not (1 <= download_port <= 65535) or not (1 <= media_api_port <= 65535):
+            raise ValueError("download and media API ports must be valid TCP ports")
+        if download_bind_host == media_api_bind_host and download_port == media_api_port:
+            raise ValueError("download and media API endpoints must not use the same address")
+        if acting_context_max_age_seconds < 1 or acting_context_max_age_seconds > 300:
+            raise ValueError("acting context max age must be between 1 and 300 seconds")
+        if acting_context_clock_skew_seconds < 0 or acting_context_clock_skew_seconds > 60:
+            raise ValueError("acting context clock skew must be between 0 and 60 seconds")
         if not (1 <= token_expiry <= 1440):
             raise ValueError("token expiry must be between 1 and 1440 minutes")
         if min(
@@ -228,6 +254,12 @@ class Settings:
             download_public_origin=download_public_origin,
             download_bind_host=download_bind_host,
             download_port=download_port,
+            media_api_bind_host=media_api_bind_host,
+            media_api_port=media_api_port,
+            media_api_key=media_api_key,
+            internal_signing_secret=internal_signing_secret,
+            acting_context_max_age_seconds=acting_context_max_age_seconds,
+            acting_context_clock_skew_seconds=acting_context_clock_skew_seconds,
             storage_dir=storage_dir,
             db_path=db_path,
             token_expiry_minutes=token_expiry,

@@ -53,6 +53,7 @@ from .downloader import (
     read_source_metadata,
 )
 from .download_server import create_download_app
+from .api import MediaApiRuntime, create_media_api_app
 from .diagnostics import (
     append_event,
     install_event_logging,
@@ -132,6 +133,7 @@ from .storage import (
 from .tools import prefer_ffmpeg_full, provision_ytdlp
 from .watermark import WatermarkAnalysis, analyze_video, create_candidate_previews
 from .work_queue import WorkAlreadyQueued, WorkQueue, WorkRejected
+from .pwa_service import PwaMediaService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -2030,6 +2032,81 @@ def _metadata_settings(settings: Settings) -> tuple[str, str, str, int, Path | N
     return model, reasoning, executable, timeout, Path(codex_home) if codex_home else None
 
 
+def _copy_text_length(value: str) -> int:
+    """Return Telegram's UTF-16 code-unit length for a copy-text payload."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _split_copy_text(value: str) -> list[str]:
+    """Split text into complete copyable chunks without losing words."""
+    words = value.split()
+    if not words:
+        return []
+    if _copy_text_length(value) <= _COPY_TEXT_LIMIT:
+        return [value]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for word in words:
+        word_length = _copy_text_length(word)
+        if word_length > _COPY_TEXT_LIMIT:
+            if current:
+                chunks.append(" ".join(current))
+                current = []
+                current_length = 0
+            remaining = word
+            while remaining:
+                piece: list[str] = []
+                piece_length = 0
+                for character in remaining:
+                    character_length = _copy_text_length(character)
+                    if piece and piece_length + character_length > _COPY_TEXT_LIMIT:
+                        break
+                    piece.append(character)
+                    piece_length += character_length
+                piece_text = "".join(piece)
+                chunks.append(piece_text)
+                remaining = remaining[len(piece_text):]
+            continue
+
+        separator_length = 1 if current else 0
+        if current and current_length + separator_length + word_length > _COPY_TEXT_LIMIT:
+            chunks.append(" ".join(current))
+            current = []
+            current_length = 0
+        current.append(word)
+        current_length += (1 if len(current) > 1 else 0) + word_length
+
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def _metadata_copy_keyboard(description: str, hashtags: str) -> InlineKeyboardMarkup:
+    """Build native Telegram copy buttons for generated metadata."""
+    description_parts = _split_copy_text(description)
+    hashtag_parts = _split_copy_text(hashtags)
+
+    def buttons(label: str, parts: list[str]) -> list[InlineKeyboardButton]:
+        total = len(parts)
+        return [
+            InlineKeyboardButton(
+                f"📋 Copy {label}" if total == 1 else f"📋 Copy {label} {index}/{total}",
+                copy_text=CopyTextButton(text=part),
+            )
+            for index, part in enumerate(parts, start=1)
+        ]
+
+    description_buttons = buttons("description", description_parts)
+    hashtag_buttons = buttons("hashtags", hashtag_parts)
+    if len(description_buttons) == len(hashtag_buttons) == 1:
+        return InlineKeyboardMarkup([[description_buttons[0], hashtag_buttons[0]]])
+    return InlineKeyboardMarkup(
+        [[button] for button in (*description_buttons, *hashtag_buttons)]
+    )
+
+
 async def _metadata_progress(
     context: ContextTypes.DEFAULT_TYPE,
     edit_id: int,
@@ -2126,9 +2203,12 @@ async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> Non
         hashtags = " ".join(result.hashtags)
         reply_kwargs: dict[str, object] = {
             "chat_id": source.chat_id,
-            "text": f"📝 Title and hashtags for job #{edit_id}\n\n"
-            f"{result.description}\n\n{hashtags}",
-            "reply_markup": _add_description_copy_button(None, result.description),
+            "text": (
+                f"📝 Description and hashtags for job #{edit_id}\n\n"
+                f"Description:\n{result.description}\n\n"
+                f"Hashtags:\n{hashtags}"
+            ),
+            "reply_markup": _metadata_copy_keyboard(result.description, hashtags),
         }
         if edit.render_delivery_message_id is not None:
             reply_kwargs["reply_to_message_id"] = edit.render_delivery_message_id
@@ -3284,6 +3364,35 @@ async def _post_init(application: Application) -> None:
     application.bot_data["download_runner"] = runner
     LOGGER.info("Download server started on port %d", settings.download_port)
 
+    pwa_service = PwaMediaService(
+        db_path=db_path,
+        storage_dir=storage_dir,
+        ytdlp=application.bot_data["ytdlp"],
+        gallerydl=application.bot_data["gallerydl"],
+        work=application.bot_data["download_work"],
+        max_filesize_mb=settings.max_filesize_mb,
+        timeout_seconds=settings.timeout_seconds,
+    )
+    media_api = create_media_api_app(
+        MediaApiRuntime(
+            service=pwa_service,
+            api_key=settings.media_api_key,
+            signing_secret=settings.internal_signing_secret,
+            acting_context_max_age_seconds=settings.acting_context_max_age_seconds,
+            acting_context_clock_skew_seconds=settings.acting_context_clock_skew_seconds,
+        )
+    )
+    media_api_runner = web.AppRunner(media_api, access_log=None)
+    await media_api_runner.setup()
+    media_api_site = web.TCPSite(
+        media_api_runner,
+        settings.media_api_bind_host,
+        settings.media_api_port,
+    )
+    await media_api_site.start()
+    application.bot_data["media_api_runner"] = media_api_runner
+    LOGGER.info("Private media API started on %s:%d", settings.media_api_bind_host, settings.media_api_port)
+
     interrupted_jobs, interrupted_edits = await reconcile_interrupted_work(db_path)
     if interrupted_jobs or interrupted_edits:
         LOGGER.warning(
@@ -3308,9 +3417,10 @@ async def _post_shutdown(application: Application) -> None:
         work = application.bot_data.get(key)
         if work is not None:
             await work.stop()
-    runner = application.bot_data.get("download_runner")
-    if runner is not None:
-        await runner.cleanup()
+    for key in ("media_api_runner", "download_runner"):
+        runner = application.bot_data.get(key)
+        if runner is not None:
+            await runner.cleanup()
 
 
 def main() -> None:
