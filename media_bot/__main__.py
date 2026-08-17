@@ -5,8 +5,8 @@ import json
 import logging
 import os
 import re
-import signal
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -17,7 +17,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from aiohttp import web
-from telegram import CopyTextButton, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ChatAction, InlineKeyboardButtonLimit
 from telegram.error import RetryAfter
 from telegram.ext import (
@@ -29,19 +35,29 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
-from .auto_hashtags import (
-    CodexUnavailable,
-    MetadataError,
-    MetadataResult,
-    generate_metadata,
-)
+
 from .access import (
     NOT_FOUND_OR_UNAUTHORIZED,
     ResourceNotFound,
     require_owned_edit,
     require_owned_job,
 )
+from .api import MediaApiRuntime, create_media_api_app
+from .auto_hashtags import (
+    CodexUnavailable,
+    MetadataError,
+    MetadataResult,
+    generate_metadata,
+)
 from .config import Settings
+from .diagnostics import (
+    append_event,
+    install_event_logging,
+    recent_events,
+    redact_sensitive,
+    write_redacted_json,
+)
+from .download_server import create_download_app
 from .downloader import (
     DownloadError,
     create_thumbnail,
@@ -51,15 +67,6 @@ from .downloader import (
     download_tiktok_slideshow,
     persist_download,
     read_source_metadata,
-)
-from .download_server import create_download_app
-from .api import MediaApiRuntime, create_media_api_app
-from .diagnostics import (
-    append_event,
-    install_event_logging,
-    recent_events,
-    redact_sensitive,
-    write_redacted_json,
 )
 from .editor import list_tts_voices, render_edit
 from .error_handler import error_handler
@@ -82,6 +89,7 @@ from .platforms import (
     is_tiktok_url,
     normalize_tiktok_profile,
 )
+from .pwa_service import PwaMediaService
 from .settings_ui import (
     _edit_message,
     _effective_edit_snapshot,
@@ -93,47 +101,46 @@ from .settings_ui import (
     settings_text_handler,
     show_editconfig_menu,
 )
-from .swearify import SwearifyError, generate_swearify_script
 from .storage import (
+    claim_metadata_job,
     cleanup_download_messages,
     cleanup_edit_artifacts,
     cleanup_expired_tokens,
     cleanup_old_jobs,
-    claim_metadata_job,
-    create_durable_pool_item,
     create_download_token,
+    create_durable_pool_item,
     create_edit_job,
     create_job,
     create_preset,
     delete_durable_pool_item,
     delete_job_with_artifacts,
-    foreign_key_violations,
     find_edit_by_message,
     find_job_by_message,
+    foreign_key_violations,
     get_edit_job,
     get_job,
     get_saved_edit_pool_item,
     get_saved_source_pool_item,
     init_db,
-    list_metadata_jobs,
-    list_resumable_metadata_jobs,
     list_all_jobs,
+    list_metadata_jobs,
     list_presets,
+    list_resumable_metadata_jobs,
     list_user_jobs,
     mark_download_message_deleted,
     open_database,
+    queue_metadata_job,
     reconcile_interrupted_work,
     reset_source_edits,
     stage_edit_source,
     store_download_message,
-    queue_metadata_job,
     update_edit_job,
     update_job,
 )
+from .swearify import SwearifyError, generate_swearify_script
 from .tools import prefer_ffmpeg_full, provision_ytdlp
 from .watermark import WatermarkAnalysis, analyze_video, create_candidate_previews
 from .work_queue import WorkAlreadyQueued, WorkQueue, WorkRejected
-from .pwa_service import PwaMediaService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -3372,6 +3379,10 @@ async def _post_init(application: Application) -> None:
         work=application.bot_data["download_work"],
         max_filesize_mb=settings.max_filesize_mb,
         timeout_seconds=settings.timeout_seconds,
+        variant_work=application.bot_data["variant_work"],
+        library_max_filesize_mb=settings.library_max_filesize_mb,
+        library_min_free_space_mb=settings.library_min_free_space_mb,
+        library_max_size_mb=settings.library_max_size_mb,
     )
     media_api = create_media_api_app(
         MediaApiRuntime(
@@ -3403,6 +3414,7 @@ async def _post_init(application: Application) -> None:
     application.bot_data["download_work"].start()
     application.bot_data["render_work"].start()
     application.bot_data["metadata_work"].start()
+    application.bot_data["variant_work"].start()
     await _resume_metadata_work(application)
 
     cleaned = await cleanup_download_messages(db_path, application.bot)
@@ -3413,7 +3425,7 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
-    for key in ("download_work", "render_work", "metadata_work"):
+    for key in ("download_work", "render_work", "metadata_work", "variant_work"):
         work = application.bot_data.get(key)
         if work is not None:
             await work.stop()
@@ -3475,6 +3487,12 @@ def main() -> None:
     application.bot_data["metadata_work"] = WorkQueue(
         name="metadata",
         workers=settings.metadata_workers,
+        capacity=settings.work_queue_capacity,
+        per_user_capacity=settings.per_user_work_capacity,
+    )
+    application.bot_data["variant_work"] = WorkQueue(
+        name="library-variant",
+        workers=settings.variant_workers,
         capacity=settings.work_queue_capacity,
         per_user_capacity=settings.per_user_work_capacity,
     )

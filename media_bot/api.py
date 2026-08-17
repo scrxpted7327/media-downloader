@@ -17,11 +17,15 @@ from typing import Any
 
 from aiohttp import web
 
-from .acting_context import ActingContextError, ActingUserContext, validate_acting_context
+from .acting_context import (
+    ActingContextError,
+    ActingUserContext,
+    validate_acting_context,
+)
 from .download_server import resolve_contained_file
+from .library import PRESET_SPECS, asset_payload, variant_payload
 from .pwa_service import PwaMediaService
 from .storage import claim_internal_request_id, open_database
-
 
 CONTEXT_HEADER = "X-WatchMyWallet-Acting-User"
 SIGNATURE_HEADER = "X-WatchMyWallet-Acting-Signature"
@@ -160,6 +164,24 @@ def _job_id(request: web.Request) -> int | web.Response:
     if value <= 0:
         return _error(404, "media job not found")
     return value
+
+
+def _asset_id(request: web.Request) -> int | web.Response:
+    raw = request.match_info.get("asset_id", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return _error(404, "media asset not found")
+    return value if value > 0 else _error(404, "media asset not found")
+
+
+def _variant_id(request: web.Request) -> int | web.Response:
+    raw = request.match_info.get("variant_id", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return _error(404, "media variant not found")
+    return value if value > 0 else _error(404, "media variant not found")
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -312,6 +334,202 @@ async def handle_result(request: web.Request) -> web.Response:
     )
 
 
+async def handle_library_list(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.read"):
+        return _error(403, "media library read permission is required")
+    try:
+        limit = int(request.query.get("limit", "50"))
+    except ValueError:
+        return _error(400, "limit must be an integer")
+    bundles = await runtime.service.list_library(
+        limit=limit,
+        query=request.query.get("q"),
+        sort=request.query.get("sort"),
+    )
+    items = [asset_payload(asset, variants) for asset, variants in bundles]
+    return web.json_response({"items": items, "presets": list(PRESET_SPECS)})
+
+
+async def handle_library_asset(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.read"):
+        return _error(403, "media library read permission is required")
+    asset_id = _asset_id(request)
+    if isinstance(asset_id, web.Response):
+        return asset_id
+    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    if bundle is None:
+        return _error(404, "media asset not found")
+    asset, variants = bundle
+    return web.json_response(asset_payload(asset, variants))
+
+
+async def handle_library_variants(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.read"):
+        return _error(403, "media library read permission is required")
+    asset_id = _asset_id(request)
+    if isinstance(asset_id, web.Response):
+        return asset_id
+    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    if bundle is None:
+        return _error(404, "media asset not found")
+    _, variants = bundle
+    return web.json_response({"items": [variant_payload(item) for item in variants]})
+
+
+async def handle_library_variant_request(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.variant_request"):
+        return _error(403, "media library variant permission is required")
+    replay_error = await _claim_mutation(request, runtime, context)
+    if replay_error is not None:
+        return replay_error
+    asset_id = _asset_id(request)
+    if isinstance(asset_id, web.Response):
+        return asset_id
+    payload = await _request_json(request)
+    if isinstance(payload, web.Response):
+        return payload
+    preset_key = payload.get("preset_key")
+    if not isinstance(preset_key, str) or preset_key not in PRESET_SPECS:
+        return _error(422, "unsupported media library preset")
+    try:
+        variant, created = await runtime.service.request_variant(
+            requester_id=context.user_id, asset_id=asset_id, preset_key=preset_key
+        )
+    except LookupError:
+        return _error(404, "media asset not found")
+    except ValueError as exc:
+        return _error(409, str(exc))
+    if variant is None:
+        return _error(500, "media variant could not be reserved")
+    return web.json_response(
+        {**variant_payload(variant), "created": created}, status=202
+    )
+
+
+async def handle_library_stream(request: web.Request, *, download: bool) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    required_permission = "media.library.download" if download else "media.library.read"
+    if not context.has_permission(required_permission):
+        return _error(403, "media library permission is required")
+    asset_id = _asset_id(request)
+    if isinstance(asset_id, web.Response):
+        return asset_id
+    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    if bundle is None:
+        return _error(404, "media asset not found")
+    _, variants = bundle
+    raw_variant = request.query.get("variant_id")
+    selected = None
+    if raw_variant:
+        try:
+            selected = next(item for item in variants if item.id == int(raw_variant))
+        except (ValueError, StopIteration):
+            return _error(404, "media variant not found")
+    else:
+        selected = next((item for item in variants if item.status == "ready"), None)
+    if selected is None or selected.status != "ready" or not selected.file_path:
+        return _error(409, "requested media variant is not ready", code="variant_pending")
+    resolved = resolve_contained_file(runtime.service.storage_dir, Path(selected.file_path))
+    if resolved is None:
+        return _error(404, "media variant not found")
+    filename = resolved.name.replace('"', "")
+    disposition = "attachment" if download else "inline"
+    return web.FileResponse(
+        resolved,
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "Content-Type": selected.mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=60",
+        },
+    )
+
+
+async def handle_library_thumbnail(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.read"):
+        return _error(403, "media library read permission is required")
+    asset_id = _asset_id(request)
+    if isinstance(asset_id, web.Response):
+        return asset_id
+    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    if bundle is None or not bundle[0].thumbnail_path:
+        return _error(404, "media thumbnail not found")
+    resolved = resolve_contained_file(
+        runtime.service.storage_dir, Path(bundle[0].thumbnail_path)
+    )
+    if resolved is None:
+        return _error(404, "media thumbnail not found")
+    return web.FileResponse(
+        resolved,
+        headers={
+            "Content-Type": mimetypes.guess_type(resolved.name)[0] or "image/jpeg",
+            "Cache-Control": "private, max-age=60",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def handle_library_delete(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.manage"):
+        return _error(403, "media library management permission is required")
+    replay_error = await _claim_mutation(request, runtime, context)
+    if replay_error is not None:
+        return replay_error
+    asset_id = _asset_id(request)
+    if isinstance(asset_id, web.Response):
+        return asset_id
+    asset, variants = await runtime.service.delete_library_asset(asset_id=asset_id)
+    if asset is None:
+        return _error(404, "media asset not found")
+    return web.json_response({"deleted": True, "asset_id": str(asset.id), "variant_count": len(variants)})
+
+
+async def handle_library_variant_delete(request: web.Request) -> web.Response:
+    runtime: MediaApiRuntime = request.app[RUNTIME_KEY]
+    context = _acting_context(request, runtime)
+    if isinstance(context, web.Response):
+        return context
+    if not context.has_permission("media.library.manage"):
+        return _error(403, "media library management permission is required")
+    replay_error = await _claim_mutation(request, runtime, context)
+    if replay_error is not None:
+        return replay_error
+    variant_id = _variant_id(request)
+    if isinstance(variant_id, web.Response):
+        return variant_id
+    variant = await runtime.service.delete_library_variant(variant_id=variant_id)
+    if variant is None:
+        return _error(404, "media variant not found")
+    return web.json_response({"deleted": True, "variant_id": str(variant.id)})
+
+
 def create_media_api_app(runtime: MediaApiRuntime) -> web.Application:
     app = web.Application(client_max_size=MAX_BODY_BYTES)
     app[RUNTIME_KEY] = runtime
@@ -324,6 +542,27 @@ def create_media_api_app(runtime: MediaApiRuntime) -> web.Application:
     app.router.add_post("/api/media/jobs/{job_id}/cancel", handle_cancel_job)
     app.router.add_get("/api/media/jobs/{job_id}/result", handle_result)
     app.router.add_delete("/api/media/jobs/{job_id}", handle_delete_job)
+    app.router.add_get("/api/media/library", handle_library_list)
+    app.router.add_get("/api/media/library/{asset_id}", handle_library_asset)
+    app.router.add_get("/api/media/library/{asset_id}/variants", handle_library_variants)
+    app.router.add_post("/api/media/library/{asset_id}/variants", handle_library_variant_request)
+    app.router.add_get(
+        "/api/media/library/{asset_id}/stream",
+        lambda request: handle_library_stream(request, download=False),
+    )
+    app.router.add_get(
+        "/api/media/library/{asset_id}/thumbnail",
+        handle_library_thumbnail,
+    )
+    app.router.add_get(
+        "/api/media/library/{asset_id}/download",
+        lambda request: handle_library_stream(request, download=True),
+    )
+    app.router.add_delete("/api/media/library/{asset_id}", handle_library_delete)
+    app.router.add_delete(
+        "/api/media/library/{asset_id}/variants/{variant_id}",
+        handle_library_variant_delete,
+    )
     return app
 
 

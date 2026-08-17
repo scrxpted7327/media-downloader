@@ -187,6 +187,51 @@ class PoolItem:
 
 
 @dataclass(frozen=True)
+class MediaAsset:
+    id: int
+    scope: str
+    status: str
+    source_platform: str | None
+    source_media_id: str | None
+    source_key: str
+    source_canonical_url: str
+    title: str | None
+    uploader: str | None
+    duration_seconds: float | None
+    upload_date: str | None
+    thumbnail_path: str | None
+    created_from_job_id: int | None
+    created_by_owner_id: str | None
+    created_at: datetime
+    updated_at: datetime
+    last_accessed_at: datetime | None
+
+
+@dataclass(frozen=True)
+class MediaVariant:
+    id: int
+    asset_id: int
+    preset_key: str
+    status: str
+    file_path: str | None
+    file_size: int | None
+    mime_type: str | None
+    container: str | None
+    video_codec: str | None
+    audio_codec: str | None
+    width: int | None
+    height: int | None
+    duration_seconds: float | None
+    sha256: str | None
+    source_variant_id: int | None
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
+    last_accessed_at: datetime | None
+
+
+@dataclass(frozen=True)
 class Classification:
     id: int
     name: str
@@ -252,7 +297,7 @@ class UnsafeStoragePath(ValueError):
 
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
-LATEST_SCHEMA_VERSION = 8
+LATEST_SCHEMA_VERSION = 9
 
 _JOB_UPDATE_FIELDS = frozenset({
     "status", "file_path", "file_size", "local_api_used", "status_message_id",
@@ -757,6 +802,48 @@ async def _apply_migrations(db: aiosqlite.Connection) -> None:
             "ON media_internal_request_nonces(expires_at)"
         )
         await _mark_migration(db, 8, "add multi-user media job ownership")
+    if 9 not in applied:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS media_assets ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "scope TEXT NOT NULL DEFAULT 'shared', "
+            "status TEXT NOT NULL DEFAULT 'ready', "
+            "source_platform TEXT, source_media_id TEXT, source_key TEXT NOT NULL UNIQUE, "
+            "source_canonical_url TEXT NOT NULL, title TEXT, uploader TEXT, "
+            "duration_seconds REAL, upload_date TEXT, thumbnail_path TEXT, "
+            "created_from_job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL, "
+            "created_by_owner_id TEXT, "
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "last_accessed_at TEXT)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS media_variants ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE, "
+            "preset_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', "
+            "file_path TEXT, file_size INTEGER, mime_type TEXT, container TEXT, "
+            "video_codec TEXT, audio_codec TEXT, width INTEGER, height INTEGER, "
+            "duration_seconds REAL, sha256 TEXT, "
+            "source_variant_id INTEGER REFERENCES media_variants(id) ON DELETE SET NULL, "
+            "error_code TEXT, error_message TEXT, "
+            "created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "updated_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            "last_accessed_at TEXT, UNIQUE(asset_id, preset_key))"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_assets_source_platform "
+            "ON media_assets(source_platform, source_media_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_assets_created "
+            "ON media_assets(created_at, id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_media_variants_asset_status "
+            "ON media_variants(asset_id, status)"
+        )
+        await _mark_migration(db, 9, "add durable shared media library")
 
 
 async def _mark_migration(db: aiosqlite.Connection, version: int, name: str) -> None:
@@ -1102,6 +1189,255 @@ async def list_jobs_for_owner(
         async with db.execute(query, params) as cur:
             rows = await cur.fetchall()
     return [_row_to_job(row) for row in rows]
+
+
+async def get_media_asset(db_path: Path, asset_id: int) -> MediaAsset | None:
+    async with open_database(db_path) as db:
+        async with db.execute("SELECT * FROM media_assets WHERE id = ?", (asset_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_media_asset(row) if row else None
+
+
+async def list_media_assets(
+    db_path: Path,
+    *,
+    limit: int = 50,
+    query: str | None = None,
+    sort: str | None = None,
+) -> list[MediaAsset]:
+    bounded_limit = max(1, min(int(limit), 100))
+    statement = "SELECT * FROM media_assets WHERE scope = 'shared' AND status != 'deleted'"
+    params: list[object] = []
+    cleaned_query = (query or "").strip()[:120]
+    if cleaned_query:
+        statement += " AND (title LIKE ? OR uploader LIKE ? OR source_platform LIKE ?)"
+        term = f"%{cleaned_query}%"
+        params.extend((term, term, term))
+    if sort == "title":
+        statement += " ORDER BY lower(COALESCE(title, source_canonical_url)), id DESC"
+    elif sort == "duration":
+        statement += " ORDER BY duration_seconds IS NULL, duration_seconds, id DESC"
+    else:
+        statement += " ORDER BY created_at DESC, id DESC"
+    statement += " LIMIT ?"
+    params.append(bounded_limit)
+    async with open_database(db_path) as db:
+        async with db.execute(statement, params) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_media_asset(row) for row in rows]
+
+
+async def create_or_get_media_asset(
+    db_path: Path,
+    *,
+    source_platform: str | None,
+    source_media_id: str | None,
+    source_key: str,
+    source_canonical_url: str,
+    title: str | None,
+    uploader: str | None,
+    duration_seconds: float | None,
+    upload_date: str | None,
+    thumbnail_path: str | None,
+    created_from_job_id: int | None,
+    created_by_owner_id: str | None,
+) -> tuple[MediaAsset, bool]:
+    """Reserve one shared asset identity, collapsing concurrent promotions."""
+    async with open_database(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO media_assets ("
+                "scope, status, source_platform, source_media_id, source_key, "
+                "source_canonical_url, title, uploader, duration_seconds, upload_date, "
+                "thumbnail_path, created_from_job_id, created_by_owner_id) "
+                "VALUES ('shared', 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    source_platform,
+                    source_media_id,
+                    source_key,
+                    source_canonical_url,
+                    title,
+                    uploader,
+                    duration_seconds,
+                    upload_date,
+                    thumbnail_path,
+                    created_from_job_id,
+                    created_by_owner_id,
+                ),
+            )
+            created = cursor.rowcount > 0
+            if not created:
+                await db.execute(
+                    "UPDATE media_assets SET "
+                    "title = COALESCE(title, ?), uploader = COALESCE(uploader, ?), "
+                    "duration_seconds = COALESCE(duration_seconds, ?), "
+                    "upload_date = COALESCE(upload_date, ?), "
+                    "thumbnail_path = COALESCE(thumbnail_path, ?), "
+                    "updated_at = datetime('now') WHERE source_key = ?",
+                    (
+                        title,
+                        uploader,
+                        duration_seconds,
+                        upload_date,
+                        thumbnail_path,
+                        source_key,
+                    ),
+                )
+            async with db.execute(
+                "SELECT * FROM media_assets WHERE source_key = ?", (source_key,)
+            ) as cur:
+                row = await cur.fetchone()
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    assert row is not None
+    return _row_to_media_asset(row), created
+
+
+async def update_media_asset(
+    db_path: Path, asset_id: int, **values: object
+) -> MediaAsset | None:
+    allowed = frozenset({
+        "status", "title", "uploader", "duration_seconds", "upload_date",
+        "thumbnail_path", "last_accessed_at",
+    })
+    invalid = set(values).difference(allowed)
+    if invalid:
+        raise ValueError(f"unsupported media asset fields: {', '.join(sorted(invalid))}")
+    if not values:
+        return await get_media_asset(db_path, asset_id)
+    clause = ", ".join(f"{key} = ?" for key in values)
+    async with open_database(db_path) as db:
+        await db.execute(
+            f"UPDATE media_assets SET {clause}, updated_at = datetime('now') WHERE id = ?",
+            (*values.values(), asset_id),
+        )
+        await db.commit()
+        async with db.execute("SELECT * FROM media_assets WHERE id = ?", (asset_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_media_asset(row) if row else None
+
+
+async def list_media_variants(db_path: Path, asset_id: int) -> list[MediaVariant]:
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT * FROM media_variants WHERE asset_id = ? ORDER BY id", (asset_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_media_variant(row) for row in rows]
+
+
+async def get_media_variant(db_path: Path, variant_id: int) -> MediaVariant | None:
+    async with open_database(db_path) as db:
+        async with db.execute("SELECT * FROM media_variants WHERE id = ?", (variant_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_media_variant(row) if row else None
+
+
+async def create_or_get_media_variant(
+    db_path: Path,
+    *,
+    asset_id: int,
+    preset_key: str,
+    status: str = "queued",
+    file_path: str | None = None,
+    source_variant_id: int | None = None,
+) -> tuple[MediaVariant, bool]:
+    async with open_database(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO media_variants "
+                "(asset_id, preset_key, status, file_path, source_variant_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (asset_id, preset_key, status, file_path, source_variant_id),
+            )
+            created = cursor.rowcount > 0
+            async with db.execute(
+                "SELECT * FROM media_variants WHERE asset_id = ? AND preset_key = ?",
+                (asset_id, preset_key),
+            ) as cur:
+                row = await cur.fetchone()
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    assert row is not None
+    return _row_to_media_variant(row), created
+
+
+async def update_media_variant(
+    db_path: Path, variant_id: int, **values: object
+) -> MediaVariant | None:
+    allowed = frozenset({
+        "status", "file_path", "file_size", "mime_type", "container",
+        "video_codec", "audio_codec", "width", "height", "duration_seconds",
+        "sha256", "source_variant_id", "error_code", "error_message",
+        "last_accessed_at",
+    })
+    invalid = set(values).difference(allowed)
+    if invalid:
+        raise ValueError(f"unsupported media variant fields: {', '.join(sorted(invalid))}")
+    if not values:
+        return await get_media_variant(db_path, variant_id)
+    clause = ", ".join(f"{key} = ?" for key in values)
+    async with open_database(db_path) as db:
+        await db.execute(
+            f"UPDATE media_variants SET {clause}, updated_at = datetime('now') WHERE id = ?",
+            (*values.values(), variant_id),
+        )
+        await db.commit()
+        async with db.execute("SELECT * FROM media_variants WHERE id = ?", (variant_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_media_variant(row) if row else None
+
+
+async def delete_media_variant(db_path: Path, variant_id: int) -> MediaVariant | None:
+    async with open_database(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("SELECT * FROM media_variants WHERE id = ?", (variant_id,)) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                await db.rollback()
+                return None
+            await db.execute("DELETE FROM media_variants WHERE id = ?", (variant_id,))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    return _row_to_media_variant(row)
+
+
+async def delete_media_asset(db_path: Path, asset_id: int) -> tuple[MediaAsset | None, list[MediaVariant]]:
+    async with open_database(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("SELECT * FROM media_assets WHERE id = ?", (asset_id,)) as cur:
+                asset_row = await cur.fetchone()
+            if asset_row is None:
+                await db.rollback()
+                return None, []
+            async with db.execute("SELECT * FROM media_variants WHERE asset_id = ?", (asset_id,)) as cur:
+                variant_rows = await cur.fetchall()
+            await db.execute("DELETE FROM media_assets WHERE id = ?", (asset_id,))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    return _row_to_media_asset(asset_row), [_row_to_media_variant(row) for row in variant_rows]
+
+
+async def media_library_storage_bytes(db_path: Path) -> int:
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT COALESCE(SUM(file_size), 0) AS total FROM media_variants "
+            "WHERE status = 'ready'"
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row["total"] or 0) if row else 0
 
 
 async def claim_internal_request_id(
@@ -2165,6 +2501,15 @@ async def _pool_reference_paths(db: aiosqlite.Connection) -> set[Path]:
     return references
 
 
+async def _media_library_reference_paths(db: aiosqlite.Connection) -> set[Path]:
+    async with db.execute(
+        "SELECT thumbnail_path FROM media_assets WHERE thumbnail_path IS NOT NULL "
+        "UNION ALL SELECT file_path FROM media_variants WHERE file_path IS NOT NULL"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {_canonical_path(row[0]) for row in rows if row[0]}
+
+
 def _edit_artifact_paths(row: aiosqlite.Row, storage_dir: Path) -> set[Path]:
     paths = {
         Path(row[column])
@@ -2254,6 +2599,7 @@ async def cleanup_edit_artifacts(
         if row is None:
             return CleanupResult()
         preserved = await _pool_reference_paths(db)
+        preserved.update(await _media_library_reference_paths(db))
 
     if preserve_output:
         for column in ("file_path", "subtitles_path"):
@@ -2297,6 +2643,7 @@ async def delete_edit_job_with_artifacts(
                 return CleanupResult()
             artifacts = _edit_artifact_paths(row, storage_dir)
             preserved = await _pool_reference_paths(db)
+            preserved.update(await _media_library_reference_paths(db))
             await db.execute(
                 "UPDATE pool_items SET edit_job_id = NULL WHERE edit_job_id = ?",
                 (edit_id,),
@@ -2387,6 +2734,7 @@ async def delete_job_with_artifacts(
                 artifacts.update(_edit_artifact_paths(edit, storage_dir))
             edit_ids = [edit["id"] for edit in edits]
             preserved = await _pool_reference_paths(db)
+            preserved.update(await _media_library_reference_paths(db))
             await db.execute(
                 "UPDATE pool_items SET source_job_id = NULL WHERE source_job_id = ?",
                 (job_id,),
@@ -2457,6 +2805,7 @@ async def delete_durable_pool_item(
                 (pool_item_id, user_id),
             )
             remaining_references = await _pool_reference_paths(db)
+            remaining_references.update(await _media_library_reference_paths(db))
             await db.commit()
         except Exception:
             await db.rollback()
@@ -2687,6 +3036,53 @@ def _row_to_pool_item(row: aiosqlite.Row) -> PoolItem:
         status=row["status"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _row_to_media_asset(row: aiosqlite.Row) -> MediaAsset:
+    return MediaAsset(
+        id=row["id"],
+        scope=row["scope"],
+        status=row["status"],
+        source_platform=row["source_platform"],
+        source_media_id=row["source_media_id"],
+        source_key=row["source_key"],
+        source_canonical_url=row["source_canonical_url"],
+        title=row["title"],
+        uploader=row["uploader"],
+        duration_seconds=_safe_float(row, "duration_seconds"),
+        upload_date=row["upload_date"],
+        thumbnail_path=row["thumbnail_path"],
+        created_from_job_id=_safe_int(row, "created_from_job_id"),
+        created_by_owner_id=row["created_by_owner_id"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        last_accessed_at=_optional_datetime(row, "last_accessed_at"),
+    )
+
+
+def _row_to_media_variant(row: aiosqlite.Row) -> MediaVariant:
+    return MediaVariant(
+        id=row["id"],
+        asset_id=row["asset_id"],
+        preset_key=row["preset_key"],
+        status=row["status"],
+        file_path=row["file_path"],
+        file_size=_safe_int(row, "file_size"),
+        mime_type=row["mime_type"],
+        container=row["container"],
+        video_codec=row["video_codec"],
+        audio_codec=row["audio_codec"],
+        width=_safe_int(row, "width"),
+        height=_safe_int(row, "height"),
+        duration_seconds=_safe_float(row, "duration_seconds"),
+        sha256=row["sha256"],
+        source_variant_id=_safe_int(row, "source_variant_id"),
+        error_code=row["error_code"],
+        error_message=row["error_message"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        last_accessed_at=_optional_datetime(row, "last_accessed_at"),
     )
 
 

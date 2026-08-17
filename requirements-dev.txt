@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Local validation tools.  Production starts from requirements.txt only.
+pytest>=8,<10
+ruff>=0.8

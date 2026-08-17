@@ -6,15 +6,15 @@ import json
 import logging
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import zipfile
-from pathlib import Path
-from collections.abc import Awaitable, Callable
 from collections import deque
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from .tools import prefer_ffmpeg_full
 
@@ -326,23 +326,48 @@ async def download_media(
     return temporary, result
 
 
-def read_source_metadata(directory: Path) -> tuple[str | None, str | None]:
-    """Read title and source caption from a yt-dlp sidecar when available."""
+def read_source_details(directory: Path) -> dict[str, object]:
+    """Read a small allowlisted metadata subset from a yt-dlp sidecar."""
     info_path = next(directory.glob("*.info.json"), None) or next(directory.glob("*.json"), None)
     if info_path is None:
-        return None, None
+        return {}
     try:
         data = json.loads(info_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None, None
-    title = str(data.get("title") or "").strip() or None
-    caption = str(
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    details: dict[str, object] = {}
+    for output_key, input_keys in {
+        "source_platform": ("extractor_key", "extractor"),
+        "source_media_id": ("id",),
+        "source_canonical_url": ("webpage_url", "original_url"),
+        "title": ("title",),
+        "uploader": ("uploader", "channel", "creator"),
+        "duration_seconds": ("duration",),
+        "upload_date": ("upload_date",),
+        "thumbnail": ("thumbnail",),
+    }.items():
+        for input_key in input_keys:
+            value = data.get(input_key)
+            if value not in (None, ""):
+                details[output_key] = value
+                break
+    details["source_caption"] = str(
         data.get("description")
         or data.get("caption")
         or data.get("content")
         or data.get("text")
         or ""
     ).strip() or None
+    return details
+
+
+def read_source_metadata(directory: Path) -> tuple[str | None, str | None]:
+    """Compatibility wrapper for Telegram/editor callers."""
+    details = read_source_details(directory)
+    title = str(details.get("title") or "").strip() or None
+    caption = str(details.get("source_caption") or "").strip() or None
     return title, caption
 
 

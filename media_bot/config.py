@@ -78,6 +78,10 @@ class Settings:
     metadata_workers: int = 1
     metadata_timeout_seconds: int = 1800
     metadata_codex_home: Path | None = None
+    library_max_filesize_mb: int = 2048
+    library_min_free_space_mb: int = 1024
+    library_max_size_mb: int = 0
+    variant_workers: int = 1
 
     @property
     def auto_hashtags_model(self) -> str:
@@ -113,7 +117,7 @@ class Settings:
         return self.metadata_codex_home
 
     @classmethod
-    def from_environment(cls) -> "Settings":
+    def from_environment(cls) -> Settings:
         _load_dotenv()
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         users = _id_set("TELEGRAM_ALLOWED_USER_IDS")
@@ -212,6 +216,16 @@ class Settings:
             Path(metadata_codex_home_raw).expanduser()
             if metadata_codex_home_raw else None
         )
+        library_max_filesize_mb = int(
+            os.getenv("MEDIA_BOT_LIBRARY_MAX_FILESIZE_MB") or "2048"
+        )
+        library_min_free_space_mb = int(
+            os.getenv("MEDIA_BOT_LIBRARY_MIN_FREE_SPACE_MB") or "1024"
+        )
+        library_max_size_mb = int(
+            os.getenv("MEDIA_BOT_LIBRARY_MAX_SIZE_MB") or "0"
+        )
+        variant_workers = int(os.getenv("MEDIA_BOT_LIBRARY_VARIANT_WORKERS") or "1")
         if max_size < 1 or timeout < 1 or upload_timeout < 1:
             raise ValueError("download size and timeouts must be positive")
         if not media_api_bind_host:
@@ -234,12 +248,17 @@ class Settings:
             metadata_workers,
             work_queue_capacity,
             per_user_work_capacity,
+            library_max_filesize_mb,
+            library_min_free_space_mb,
+            variant_workers,
         ) < 1:
             raise ValueError("retention, size, worker, and queue limits must be positive")
         if not metadata_model or not metadata_reasoning_effort or not metadata_codex_executable:
             raise ValueError("metadata model, reasoning effort, and Codex executable cannot be empty")
         if not (1 <= metadata_timeout_seconds <= 1800):
             raise ValueError("metadata timeout must be between 1 and 1800 seconds")
+        if library_max_size_mb < 0:
+            raise ValueError("library max size cannot be negative")
         return cls(
             token=token,
             allowed_user_ids=users,
@@ -278,4 +297,8 @@ class Settings:
             metadata_workers=metadata_workers,
             metadata_timeout_seconds=metadata_timeout_seconds,
             metadata_codex_home=metadata_codex_home,
+            library_max_filesize_mb=library_max_filesize_mb,
+            library_min_free_space_mb=library_min_free_space_mb,
+            library_max_size_mb=library_max_size_mb,
+            variant_workers=variant_workers,
         )
