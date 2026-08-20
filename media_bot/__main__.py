@@ -68,7 +68,10 @@ from .downloader import (
     persist_download,
     read_source_metadata,
 )
+from .acquisition import AcquisitionState, ProgressEvent
 from .editor import list_tts_voices, render_edit
+from .edit_workflow import EditWorkflow, MetadataOutput, RenderArtifact, WorkflowState
+from .edit_workflow_sqlite import SQLiteWorkflowPersistence
 from .error_handler import error_handler
 from .fix_agent import (
     CODEX_REPAIR_MODEL,
@@ -90,6 +93,7 @@ from .platforms import (
     normalize_tiktok_profile,
 )
 from .pwa_service import PwaMediaService
+from .telegram_acquisition import TelegramAcquisitionRuntime
 from .settings_ui import (
     _edit_message,
     _effective_edit_snapshot,
@@ -210,6 +214,41 @@ class DownloadReporter:
             await self.message.edit_text(text)
         except Exception:
             pass
+
+
+class _RecoveredTelegramStatus:
+    """Message-shaped delivery adapter used when a job survives a restart."""
+
+    def __init__(self, bot, job) -> None:
+        self.bot = bot
+        self.message_id = job.status_message_id
+        self.chat_id = job.chat_id
+        self.chat = SimpleNamespace(id=job.chat_id, type="private")
+
+    async def edit_text(self, text: str, **kwargs):
+        if self.message_id is not None:
+            try:
+                return await self.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.message_id,
+                    text=text,
+                    **kwargs,
+                )
+            except Exception:
+                LOGGER.debug("Could not edit recovered Telegram status", exc_info=True)
+        return await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+    async def reply_text(self, text: str, **kwargs):
+        return await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+    async def reply_photo(self, photo, **kwargs):
+        return await self.bot.send_photo(chat_id=self.chat_id, photo=photo, **kwargs)
+
+    async def delete(self) -> None:
+        if self.message_id is not None:
+            await self.bot.delete_message(
+                chat_id=self.chat_id, message_id=self.message_id
+            )
 
 
 def _format_duration(seconds: float) -> str:
@@ -787,15 +826,56 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     work: WorkQueue = context.application.bot_data["download_work"]
+    acquisition: TelegramAcquisitionRuntime | None = context.application.bot_data.get(
+        "telegram_acquisition"
+    )
     results = []
     for idx, url in enumerate(urls[:8]):
         if idx > 0:
             await asyncio.sleep(0.2)
         status = await message.reply_text("⏳ Download queued…")
         job = await create_job(db_path, url, user_id, chat_id)
-        await update_job(
+        job = await update_job(
             db_path, job.id, status="queued", status_message_id=status.message_id,
         )
+        assert job is not None
+        acquisition_job_id: str | None = None
+        if acquisition is not None:
+            try:
+                requester = await acquisition.submit(
+                    f"telegram:{job.id}",
+                    url,
+                    owner_id=str(user_id),
+                    job_id=job.id,
+                )
+                acquisition_job_id = requester.job_id
+                job = await update_job(
+                    db_path,
+                    job.id,
+                    output_metadata=json.dumps(
+                        {
+                            "acquisition_job_id": requester.job_id,
+                            "acquisition_claim_id": requester.claim_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                assert job is not None
+            except Exception as exc:
+                LOGGER.exception("Could not admit Telegram acquisition for job %s", job.id)
+                await update_job(
+                    db_path,
+                    job.id,
+                    status="failed",
+                    phase="failed",
+                    error_code="acquisition_admission_failed",
+                    error_message=str(exc)[:500],
+                    failed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                await status.edit_text("❌ Download could not be admitted.")
+                results.append(f"#{job.id}: REJECTED")
+                continue
         try:
             work.submit(
                 user_id=user_id,
@@ -807,6 +887,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             results.append(f"#{job.id}: QUEUED")
         except WorkRejected as exc:
+            if acquisition_job_id is not None and acquisition is not None:
+                await acquisition.cancel(acquisition_job_id)
             await update_job(db_path, job.id, status="failed", error_message=str(exc))
             await status.edit_text(f"❌ Download not queued: {exc}")
             results.append(f"#{job.id}: REJECTED")
@@ -820,12 +902,254 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("\n".join(lines))
 
 
+def _stored_acquisition_job_id(job) -> str | None:
+    if not job.output_metadata:
+        return None
+    try:
+        metadata = json.loads(job.output_metadata)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    value = metadata.get("acquisition_job_id") if isinstance(metadata, dict) else None
+    return str(value) if value else None
+
+
+async def _process_single_url_with_acquisition(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    job,
+    status,
+    url: str,
+    user_id: int,
+    settings: Settings,
+    db_path: Path,
+    acquisition: TelegramAcquisitionRuntime,
+) -> str:
+    requester_id = _stored_acquisition_job_id(job)
+    if requester_id is None:
+        requester = await acquisition.submit(
+            f"telegram:{job.id}", url, owner_id=str(user_id), job_id=job.id
+        )
+        requester_id = requester.job_id
+        job = await update_job(
+            db_path,
+            job.id,
+            output_metadata=json.dumps(
+                {
+                    "acquisition_job_id": requester.job_id,
+                    "acquisition_claim_id": requester.claim_id,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        if job is None:
+            raise RuntimeError("Telegram acquisition job disappeared")
+    else:
+        requester = await acquisition.get_requester(requester_id)
+        if requester is None:
+            requester = await acquisition.submit(
+                f"telegram:{job.id}", url, owner_id=str(user_id), job_id=job.id
+            )
+            requester_id = requester.job_id
+
+    reporter = DownloadReporter(status)
+
+    async def progress(event) -> None:
+        if not isinstance(event, ProgressEvent):
+            return
+        state_to_status = {
+            AcquisitionState.QUEUED: "queued",
+            AcquisitionState.RUNNING: "downloading",
+            AcquisitionState.PROCESSING: "processing",
+            AcquisitionState.COMPLETED: "completed",
+            AcquisitionState.FAILED: "failed",
+            AcquisitionState.CANCELLED: "cancelled",
+        }
+        values: dict[str, object] = {
+            "status": state_to_status[event.state],
+            "phase": event.phase,
+        }
+        if event.percent is not None:
+            values["progress_percent"] = float(max(0, min(99, event.percent)))
+        try:
+            await update_job(db_path, job.id, **values)
+            if event.phase == "download" and event.percent is not None:
+                await reporter.progress(event.percent)
+            elif event.phase == "promotion":
+                await status.edit_text("💾 Saving to the shared media library…")
+        except Exception:
+            LOGGER.debug("Could not update Telegram acquisition progress", exc_info=True)
+
+    acquisition.bind_progress(requester_id, progress)
+    try:
+        await update_job(
+            db_path,
+            job.id,
+            status="queued",
+            phase="queued",
+            started_at=datetime.now(timezone.utc).isoformat(),
+            error_code=None,
+            error_message=None,
+        )
+        result = await acquisition.run(requester_id)
+        claim = await acquisition.get_claim(result.claim_id)
+        if result.state is AcquisitionState.CANCELLED:
+            await status.edit_text("❌ Download cancelled.")
+            await update_job(
+                db_path,
+                job.id,
+                status="cancelled",
+                phase="cancelled",
+                error_code="cancelled_by_user",
+            )
+            return f"#{job.id}: CANCELLED"
+        if result.state is AcquisitionState.FAILED or claim is None or claim.output is None:
+            detail = result.error_message or (claim.error_message if claim else None)
+            detail = detail or "acquisition produced no output"
+            await status.edit_text(f"❌ Download failed: {detail}")
+            await update_job(
+                db_path,
+                job.id,
+                status="failed",
+                phase="failed",
+                error_code=result.error_code or "download_failed",
+                error_message=detail[:500],
+                failed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            return f"#{job.id}: FAILED"
+
+        output = claim.output
+        details = output.metadata.get("source_details")
+        if not isinstance(details, dict):
+            details = {}
+        title = str(details.get("title") or "").strip() or None
+        source_caption = str(details.get("source_caption") or "").strip() or None
+        metadata: dict[str, object] = {}
+        current_job = await get_job(db_path, job.id)
+        if current_job is not None and current_job.output_metadata:
+            try:
+                stored = json.loads(current_job.output_metadata)
+                if isinstance(stored, dict):
+                    metadata.update(stored)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if title:
+            metadata["title"] = title
+        if source_caption:
+            metadata["source_caption"] = source_caption
+        if result.output is not None:
+            metadata.update(
+                {
+                    "library_asset_id": result.output.asset_id,
+                    "library_variant_id": result.output.variant_id,
+                    "library_preset": result.output.metadata.get(
+                        "preset_key", claim.identity.preset
+                    ),
+                }
+            )
+        else:
+            metadata["library_promotion_status"] = "pending_or_failed"
+        await update_job(
+            db_path,
+            job.id,
+            status="completed",
+            phase="completed",
+            progress_percent=100.0,
+            file_path=str(output.path),
+            file_size=output.path.stat().st_size,
+            title=title,
+            source_caption=source_caption,
+            thumbnail_path=output.metadata.get("thumbnail_path"),
+            output_filename=output.metadata.get("output_filename") or output.path.name,
+            output_mime_type=output.metadata.get("output_mime_type"),
+            output_metadata=json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            error_code=None,
+            error_message=None,
+        )
+        try:
+            await _send_secure_link(status, job.id, db_path, user_id)
+        except Exception as exc:
+            await acquisition.record_delivery(requester_id, success=False, error=str(exc))
+            metadata["delivery_status"] = "failed"
+            await update_job(
+                db_path,
+                job.id,
+                status="completed",
+                phase="completed",
+                output_metadata=json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+            )
+            LOGGER.exception("Telegram delivery failed for completed job %s", job.id)
+            return f"#{job.id}: DELIVERY_FAILED"
+        await acquisition.record_delivery(requester_id, success=True)
+        await update_job(
+            db_path,
+            job.id,
+            status="uploaded",
+            local_api_used=bool(settings.local_api_url),
+        )
+        return f"#{job.id}: OK"
+    except asyncio.CancelledError:
+        work: WorkQueue = context.application.bot_data["download_work"]
+        if work.cancellation_requested(f"download:{job.id}"):
+            await update_job(
+                db_path,
+                job.id,
+                status="cancelled",
+                phase="cancelled",
+                error_code="cancelled_by_user",
+            )
+        else:
+            await update_job(
+                db_path,
+                job.id,
+                status="queued",
+                phase="queued",
+                error_code=None,
+                error_message=None,
+            )
+        raise
+    except Exception as exc:
+        LOGGER.exception("Unexpected Telegram acquisition failure for %s", url)
+        await update_job(
+            db_path,
+            job.id,
+            status="failed",
+            phase="failed",
+            error_code="download_failed",
+            error_message=str(exc)[:500],
+            failed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        try:
+            await status.edit_text(f"❌ Download failed: {exc}")
+        except Exception:
+            pass
+        return f"#{job.id}: ERROR"
+    finally:
+        acquisition.unbind_progress(requester_id)
+
+
 async def _process_single_url(
     update: Update, context: ContextTypes.DEFAULT_TYPE,
     job, status, url: str, user_id: int, chat_id: int,
     settings: Settings, ytdlp: Path, gallerydl: Path,
     db_path: Path, storage_dir: Path,
 ) -> str:
+    acquisition: TelegramAcquisitionRuntime | None = context.application.bot_data.get(
+        "telegram_acquisition"
+    )
+    if acquisition is not None:
+        return await _process_single_url_with_acquisition(
+            update,
+            context,
+            job,
+            status,
+            url,
+            user_id,
+            settings,
+            db_path,
+            acquisition,
+        )
     await update_job(db_path, job.id, status="downloading")
     await status.edit_text("🔍 Searching…")
     temporary = None
@@ -1619,12 +1943,35 @@ async def cancel_job_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text(NOT_FOUND_OR_UNAUTHORIZED)
             return
         work = context.application.bot_data["download_work"]
-        cancelled = work.cancel(user_id=user.id, label=f"download:{item_id}")
+        acquisition: TelegramAcquisitionRuntime | None = context.application.bot_data.get(
+            "telegram_acquisition"
+        )
+        acquisition_job_id = _stored_acquisition_job_id(job)
+        cancelled = False
+        if (
+            acquisition is not None
+            and acquisition_job_id is not None
+            and job.status not in {"completed", "uploaded", "failed", "cancelled"}
+        ):
+            try:
+                requester = await acquisition.cancel(acquisition_job_id)
+                cancelled = requester.state is AcquisitionState.CANCELLED
+            except KeyError:
+                LOGGER.debug("Telegram acquisition requester was already removed")
+        cancelled = work.cancel(user_id=user.id, label=f"download:{item_id}") or cancelled
         if not cancelled:
             cancelled = work.cancel(user_id=user.id, label=f"tiktok-account:{item_id}")
         if cancelled:
+            cancellation_updates = {
+                "status": "cancelled" if acquisition_job_id else "failed",
+                "error_message": "cancelled by user",
+            }
+            if acquisition_job_id:
+                cancellation_updates["phase"] = "cancelled"
             await update_job(
-                db_path, job.id, status="failed", error_message="cancelled by user",
+                db_path,
+                job.id,
+                **cancellation_updates,
             )
 
     if cancelled:
@@ -2177,20 +2524,77 @@ async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> Non
         await _metadata_progress(context, edit_id, f"original source: {stage}", percent)
 
     model, reasoning, executable, timeout, codex_home = _metadata_settings(settings)
+    workflow_persistence = SQLiteWorkflowPersistence(db_path)
+    await workflow_persistence.init()
+
+    class _ExistingArtifactRenderer:
+        async def render(self, request):
+            path = Path(source.file_path)
+            return RenderArtifact(
+                path=path,
+                size_bytes=path.stat().st_size,
+                validated=True,
+            )
+
+    class _MetadataEngine:
+        async def generate(self, artifact, *, request):
+            try:
+                generated: MetadataResult = await _run_with_progress_heartbeat(
+                    lambda: generate_metadata(
+                        artifact.path,
+                        model=model,
+                        reasoning_effort=reasoning,
+                        codex_executable=executable,
+                        timeout_seconds=timeout,
+                        codex_home=codex_home,
+                        progress_callback=progress,
+                    ),
+                    progress,
+                    "metadata analysis still running",
+                )
+            except CodexUnavailable as exc:
+                raise RuntimeError(f"CodexUnavailable: {exc}") from exc
+            except MetadataError as exc:
+                raise RuntimeError(f"MetadataError: {exc}") from exc
+            return MetadataOutput(
+                title=generated.description,
+                hashtags=generated.hashtags,
+                provenance={
+                    "model": model,
+                    "reasoning_effort": reasoning,
+                    "source": "original_media",
+                },
+            )
+
+    workflow = EditWorkflow(
+        renderer=_ExistingArtifactRenderer(),
+        metadata_engine=_MetadataEngine(),
+        persistence=workflow_persistence,
+    )
+    workflow_id = f"edit:{edit_id}"
     try:
-        result: MetadataResult = await _run_with_progress_heartbeat(
-            lambda: generate_metadata(
-                Path(source.file_path),
-                model=model,
-                reasoning_effort=reasoning,
-                codex_executable=executable,
-                timeout_seconds=timeout,
-                codex_home=codex_home,
-                progress_callback=progress,
-            ),
-            progress,
-            "metadata analysis still running",
-        )
+        existing_workflow = await workflow_persistence.load(workflow_id)
+        if existing_workflow is None:
+            await workflow.create(
+                workflow_id,
+                source_path=Path(source.file_path),
+                output_path=Path(source.file_path),
+                settings={
+                    "model": model,
+                    "reasoning_effort": reasoning,
+                    "source": "original_media",
+                },
+            )
+        workflow_record = await workflow.run(workflow_id)
+        metadata_output = workflow_record.attempt.metadata_output
+        if metadata_output is None:
+            detail = workflow_record.attempt.metadata.error or "metadata generation failed"
+            if detail.startswith("CodexUnavailable:"):
+                raise CodexUnavailable(detail.partition(":")[2].strip())
+            if detail.startswith("MetadataError:"):
+                raise MetadataError(detail.partition(":")[2].strip())
+            raise MetadataError(detail)
+        result = MetadataResult(metadata_output.title, metadata_output.hashtags)
         await update_edit_job(
             db_path,
             edit_id,
@@ -2229,6 +2633,7 @@ async def _metadata_job(context: ContextTypes.DEFAULT_TYPE, edit_id: int) -> Non
             metadata_reply_message_id=reply_message_id,
             metadata_completed_at=datetime.now(timezone.utc).isoformat(),
         )
+        await workflow.record_delivery(workflow_id, success=True)
         await progress("metadata delivery", 100)
     except asyncio.CancelledError:
         # WorkQueue.stop() cancels active tasks during a restart. Leave those
@@ -2585,36 +2990,127 @@ async def _render_edit_job(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             steps.append("Rendering")
 
         reporter = _ProgressReporter(msg, steps)
+        render_settings = {
+            "caption_text": cap_text,
+            "caption_color": cap_color,
+            "caption_style": cap_style,
+            "caption_position": cap_pos,
+            "auto_captions": bool(auto_cap),
+            "voice_text": v_text,
+            "voice_mode": v_mode,
+            "voice_outro": v_outro,
+            "voice": v_voice,
+            "voice_quality": v_quality,
+            "voice_speed": v_speed,
+            "tts_engine": tts_eng,
+            "banner_path": b_path,
+            "banner_position": b_pos,
+            "banner_scale": b_scale,
+            "watermark_removal": bool(wm_removal),
+            "watermark_position": wm_pos,
+            "channel_banner": bool(ch_banner),
+            "source_url": source.url,
+            "timeout_seconds": settings.timeout_seconds,
+            "watermark_candidates": wm_candidates,
+            "tools_dir": str(settings.tools_dir),
+            "watermark_mode": wm_mode,
+            "watermark_text": wm_text,
+        }
+        render_output: dict[str, Path | None] = {"subtitles_path": None}
 
-        out_path, subtitles_path = await render_edit(
-            input_path=Path(edit.file_path),
-            output_path=out_path,
-            caption_text=cap_text,
-            caption_color=cap_color,
-            caption_style=cap_style,
-            caption_position=cap_pos,
-            auto_captions=auto_cap,
-            voice_text=v_text,
-            voice_mode=v_mode,
-            voice_outro=v_outro,
-            voice=v_voice,
-            voice_quality=v_quality,
-            voice_speed=v_speed,
-            tts_engine=tts_eng,
-            banner_path=Path(b_path) if b_path else None,
-            banner_position=b_pos,
-            banner_scale=b_scale,
-            watermark_removal=wm_removal,
-            watermark_position=wm_pos,
-            channel_banner=ch_banner,
-            source_url=source.url,
-            timeout_seconds=settings.timeout_seconds,
-            progress_callback=reporter,
-            watermark_candidates=wm_candidates,
-            tools_dir=settings.tools_dir,
-            watermark_mode=wm_mode,
-            watermark_text=wm_text,
+        def thaw(value):
+            if isinstance(value, tuple):
+                if value and all(
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[0], str)
+                    for item in value
+                ):
+                    return {item[0]: thaw(item[1]) for item in value}
+                return [thaw(item) for item in value]
+            if isinstance(value, list):
+                return [thaw(item) for item in value]
+            return value
+
+        class _RenderEngine:
+            async def render(self, request):
+                values = {
+                    key: thaw(value)
+                    for key, value in request.settings.as_dict().items()
+                }
+                rendered, subtitles = await render_edit(
+                    input_path=request.source_path,
+                    output_path=request.output_path,
+                    caption_text=values["caption_text"],
+                    caption_color=values["caption_color"],
+                    caption_style=values["caption_style"],
+                    caption_position=values["caption_position"],
+                    auto_captions=values["auto_captions"],
+                    voice_text=values["voice_text"],
+                    voice_mode=values["voice_mode"],
+                    voice_outro=values["voice_outro"],
+                    voice=values["voice"],
+                    voice_quality=values["voice_quality"],
+                    voice_speed=values["voice_speed"],
+                    tts_engine=values["tts_engine"],
+                    banner_path=(
+                        Path(values["banner_path"])
+                        if values["banner_path"]
+                        else None
+                    ),
+                    banner_position=values["banner_position"],
+                    banner_scale=values["banner_scale"],
+                    watermark_removal=values["watermark_removal"],
+                    watermark_position=values["watermark_position"],
+                    channel_banner=values["channel_banner"],
+                    source_url=values["source_url"],
+                    timeout_seconds=values["timeout_seconds"],
+                    progress_callback=reporter,
+                    watermark_candidates=values["watermark_candidates"],
+                    tools_dir=Path(values["tools_dir"]),
+                    watermark_mode=values["watermark_mode"],
+                    watermark_text=values["watermark_text"],
+                )
+                render_output["subtitles_path"] = subtitles
+                return RenderArtifact(
+                    path=rendered,
+                    size_bytes=rendered.stat().st_size,
+                    validated=True,
+                )
+
+        class _DeferredMetadata:
+            async def generate(self, artifact, *, request):
+                del artifact, request
+                raise RuntimeError("metadata is scheduled as separate durable work")
+
+        workflow_persistence = SQLiteWorkflowPersistence(db_path)
+        await workflow_persistence.init()
+        workflow = EditWorkflow(
+            renderer=_RenderEngine(),
+            metadata_engine=_DeferredMetadata(),
+            persistence=workflow_persistence,
         )
+        workflow_id = f"render:{edit.id}"
+        existing_workflow = await workflow_persistence.load(workflow_id)
+        if existing_workflow is None:
+            await workflow.create(
+                workflow_id,
+                source_path=Path(edit.file_path),
+                output_path=out_path,
+                settings=render_settings,
+            )
+        elif existing_workflow.state in {
+            WorkflowState.FAILED,
+            WorkflowState.CANCELLED,
+        }:
+            await workflow.revise(workflow_id, render_settings)
+        workflow_record = await workflow.render_only(workflow_id)
+        if workflow_record.attempt.artifact is None:
+            raise DownloadError(
+                workflow_record.attempt.error or "render workflow produced no artifact"
+            )
+        out_path = workflow_record.attempt.artifact.path
+        subtitles_path = render_output["subtitles_path"]
         if out_path.stat().st_size > settings.max_filesize_mb * 1024 * 1024:
             out_path.unlink(missing_ok=True)
             raise DownloadError(
@@ -3356,6 +3852,61 @@ async def _resume_metadata_work(application: Application) -> None:
             )
 
 
+async def _resume_telegram_acquisition_work(application: Application) -> int:
+    """Requeue Telegram acquisitions after the higher-level restart pass."""
+    acquisition: TelegramAcquisitionRuntime | None = application.bot_data.get(
+        "telegram_acquisition"
+    )
+    if acquisition is None:
+        return 0
+    settings: Settings = application.bot_data["settings"]
+    db_path: Path = application.bot_data["db_path"]
+    storage_dir: Path = application.bot_data["storage_dir"]
+    work: WorkQueue = application.bot_data["download_work"]
+    rows = []
+    async with open_database(db_path) as db:
+        async with db.execute(
+            "SELECT id FROM jobs WHERE owner_kind = 'telegram' "
+            "AND status IN ('pending', 'queued', 'downloading', 'processing') "
+            "AND output_metadata IS NOT NULL "
+            "AND instr(output_metadata, 'acquisition_job_id') > 0 "
+            "ORDER BY created_at, id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+    resumed = 0
+    for row in rows:
+        job = await get_job(db_path, int(row["id"]))
+        if job is None or not _stored_acquisition_job_id(job):
+            continue
+        label = f"download:{job.id}"
+        if work.has_label(label):
+            continue
+        status = _RecoveredTelegramStatus(application.bot, job)
+        try:
+            work.submit(
+                user_id=job.user_id,
+                label=label,
+                factory=lambda job=job, status=status: _process_single_url(
+                    SimpleNamespace(),
+                    SimpleNamespace(application=application, bot=application.bot),
+                    job,
+                    status,
+                    job.url,
+                    job.user_id,
+                    job.chat_id,
+                    settings,
+                    application.bot_data["ytdlp"],
+                    application.bot_data["gallerydl"],
+                    db_path,
+                    storage_dir,
+                ),
+            )
+            resumed += 1
+        except WorkRejected as exc:
+            LOGGER.warning("Could not resume Telegram acquisition %s: %s", job.id, exc)
+    return resumed
+
+
 async def _post_init(application: Application) -> None:
     settings: Settings = application.bot_data["settings"]
     db_path: Path = application.bot_data["db_path"]
@@ -3384,6 +3935,18 @@ async def _post_init(application: Application) -> None:
         library_min_free_space_mb=settings.library_min_free_space_mb,
         library_max_size_mb=settings.library_max_size_mb,
     )
+    telegram_acquisition = TelegramAcquisitionRuntime(
+        db_path=db_path,
+        storage_dir=storage_dir,
+        ytdlp=application.bot_data["ytdlp"],
+        gallerydl=application.bot_data["gallerydl"],
+        max_filesize_mb=settings.max_filesize_mb,
+        timeout_seconds=settings.timeout_seconds,
+        library_max_size_mb=settings.library_max_size_mb,
+        library_min_free_space_mb=settings.library_min_free_space_mb,
+    )
+    await telegram_acquisition.init()
+    application.bot_data["telegram_acquisition"] = telegram_acquisition
     media_api = create_media_api_app(
         MediaApiRuntime(
             service=pwa_service,
@@ -3402,6 +3965,7 @@ async def _post_init(application: Application) -> None:
     )
     await media_api_site.start()
     application.bot_data["media_api_runner"] = media_api_runner
+    application.bot_data["pwa_service"] = pwa_service
     LOGGER.info("Private media API started on %s:%d", settings.media_api_bind_host, settings.media_api_port)
 
     interrupted_jobs, interrupted_edits = await reconcile_interrupted_work(db_path)
@@ -3415,6 +3979,13 @@ async def _post_init(application: Application) -> None:
     application.bot_data["render_work"].start()
     application.bot_data["metadata_work"].start()
     application.bot_data["variant_work"].start()
+    await telegram_acquisition.reconcile()
+    resumed_telegram = await _resume_telegram_acquisition_work(application)
+    if resumed_telegram:
+        LOGGER.info("Resumed %d durable Telegram acquisition jobs", resumed_telegram)
+    resumed_pwa = await pwa_service.resume_acquisition_work()
+    if resumed_pwa:
+        LOGGER.info("Resumed %d durable PWA acquisition jobs", resumed_pwa)
     await _resume_metadata_work(application)
 
     cleaned = await cleanup_download_messages(db_path, application.bot)

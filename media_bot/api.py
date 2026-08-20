@@ -24,6 +24,11 @@ from .acting_context import (
 )
 from .download_server import resolve_contained_file
 from .library import PRESET_SPECS, asset_payload, variant_payload
+from .shared_media_library import (
+    AssetNotFoundError,
+    InvalidPresetError,
+    VariantPendingError,
+)
 from .pwa_service import PwaMediaService
 from .storage import claim_internal_request_id, open_database
 
@@ -346,6 +351,7 @@ async def handle_library_list(request: web.Request) -> web.Response:
     except ValueError:
         return _error(400, "limit must be an integer")
     bundles = await runtime.service.list_library(
+        principal_id=context.user_id,
         limit=limit,
         query=request.query.get("q"),
         sort=request.query.get("sort"),
@@ -364,7 +370,9 @@ async def handle_library_asset(request: web.Request) -> web.Response:
     asset_id = _asset_id(request)
     if isinstance(asset_id, web.Response):
         return asset_id
-    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    bundle = await runtime.service.get_library_asset(
+        asset_id=asset_id, principal_id=context.user_id
+    )
     if bundle is None:
         return _error(404, "media asset not found")
     asset, variants = bundle
@@ -381,7 +389,9 @@ async def handle_library_variants(request: web.Request) -> web.Response:
     asset_id = _asset_id(request)
     if isinstance(asset_id, web.Response):
         return asset_id
-    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    bundle = await runtime.service.get_library_asset(
+        asset_id=asset_id, principal_id=context.user_id
+    )
     if bundle is None:
         return _error(404, "media asset not found")
     _, variants = bundle
@@ -411,9 +421,9 @@ async def handle_library_variant_request(request: web.Request) -> web.Response:
         variant, created = await runtime.service.request_variant(
             requester_id=context.user_id, asset_id=asset_id, preset_key=preset_key
         )
-    except LookupError:
+    except (LookupError, AssetNotFoundError):
         return _error(404, "media asset not found")
-    except ValueError as exc:
+    except (ValueError, InvalidPresetError, VariantPendingError) as exc:
         return _error(409, str(exc))
     if variant is None:
         return _error(500, "media variant could not be reserved")
@@ -433,7 +443,9 @@ async def handle_library_stream(request: web.Request, *, download: bool) -> web.
     asset_id = _asset_id(request)
     if isinstance(asset_id, web.Response):
         return asset_id
-    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    bundle = await runtime.service.get_library_asset(
+        asset_id=asset_id, principal_id=context.user_id
+    )
     if bundle is None:
         return _error(404, "media asset not found")
     _, variants = bundle
@@ -474,7 +486,9 @@ async def handle_library_thumbnail(request: web.Request) -> web.Response:
     asset_id = _asset_id(request)
     if isinstance(asset_id, web.Response):
         return asset_id
-    bundle = await runtime.service.get_library_asset(asset_id=asset_id)
+    bundle = await runtime.service.get_library_asset(
+        asset_id=asset_id, principal_id=context.user_id
+    )
     if bundle is None or not bundle[0].thumbnail_path:
         return _error(404, "media thumbnail not found")
     resolved = resolve_contained_file(
@@ -505,7 +519,9 @@ async def handle_library_delete(request: web.Request) -> web.Response:
     asset_id = _asset_id(request)
     if isinstance(asset_id, web.Response):
         return asset_id
-    asset, variants = await runtime.service.delete_library_asset(asset_id=asset_id)
+    asset, variants = await runtime.service.delete_library_asset(
+        asset_id=asset_id, principal_id=context.user_id
+    )
     if asset is None:
         return _error(404, "media asset not found")
     return web.json_response({"deleted": True, "asset_id": str(asset.id), "variant_count": len(variants)})
@@ -524,7 +540,9 @@ async def handle_library_variant_delete(request: web.Request) -> web.Response:
     variant_id = _variant_id(request)
     if isinstance(variant_id, web.Response):
         return variant_id
-    variant = await runtime.service.delete_library_variant(variant_id=variant_id)
+    variant = await runtime.service.delete_library_variant(
+        variant_id=variant_id, principal_id=context.user_id
+    )
     if variant is None:
         return _error(404, "media variant not found")
     return web.json_response({"deleted": True, "variant_id": str(variant.id)})

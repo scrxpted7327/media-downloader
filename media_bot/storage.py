@@ -2471,7 +2471,9 @@ async def reconcile_interrupted_work(db_path: Path) -> tuple[int, int]:
         jobs = await db.execute(
             "UPDATE jobs SET status = 'failed', error_message = ?, "
             "updated_at = datetime('now') "
-            "WHERE status IN ('pending', 'queued', 'downloading')",
+            "WHERE status IN ('pending', 'queued', 'downloading') "
+            "AND owner_kind != 'watchmywallet' "
+            "AND (output_metadata IS NULL OR instr(output_metadata, 'acquisition_job_id') = 0)",
             (message,),
         )
         edits = await db.execute(
@@ -2507,6 +2509,21 @@ async def _media_library_reference_paths(db: aiosqlite.Connection) -> set[Path]:
         "UNION ALL SELECT file_path FROM media_variants WHERE file_path IS NOT NULL"
     ) as cursor:
         rows = await cursor.fetchall()
+    return {_canonical_path(row[0]) for row in rows if row[0]}
+
+
+async def _acquisition_reference_paths(db: aiosqlite.Connection) -> set[Path]:
+    """Keep shared acquisition outputs alive while requester rows are deleted."""
+    try:
+        async with db.execute(
+            "SELECT output_path FROM acquisition_claims "
+            "WHERE output_path IS NOT NULL"
+        ) as cursor:
+            rows = await cursor.fetchall()
+    except aiosqlite.OperationalError:
+        # Older databases may not have initialized the additive acquisition
+        # adapter yet; cleanup remains compatible with those databases.
+        return set()
     return {_canonical_path(row[0]) for row in rows if row[0]}
 
 
@@ -2600,6 +2617,7 @@ async def cleanup_edit_artifacts(
             return CleanupResult()
         preserved = await _pool_reference_paths(db)
         preserved.update(await _media_library_reference_paths(db))
+        preserved.update(await _acquisition_reference_paths(db))
 
     if preserve_output:
         for column in ("file_path", "subtitles_path"):
@@ -2644,6 +2662,7 @@ async def delete_edit_job_with_artifacts(
             artifacts = _edit_artifact_paths(row, storage_dir)
             preserved = await _pool_reference_paths(db)
             preserved.update(await _media_library_reference_paths(db))
+            preserved.update(await _acquisition_reference_paths(db))
             await db.execute(
                 "UPDATE pool_items SET edit_job_id = NULL WHERE edit_job_id = ?",
                 (edit_id,),
@@ -2735,6 +2754,7 @@ async def delete_job_with_artifacts(
             edit_ids = [edit["id"] for edit in edits]
             preserved = await _pool_reference_paths(db)
             preserved.update(await _media_library_reference_paths(db))
+            preserved.update(await _acquisition_reference_paths(db))
             await db.execute(
                 "UPDATE pool_items SET source_job_id = NULL WHERE source_job_id = ?",
                 (job_id,),
@@ -2806,6 +2826,7 @@ async def delete_durable_pool_item(
             )
             remaining_references = await _pool_reference_paths(db)
             remaining_references.update(await _media_library_reference_paths(db))
+            remaining_references.update(await _acquisition_reference_paths(db))
             await db.commit()
         except Exception:
             await db.rollback()

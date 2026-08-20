@@ -19,7 +19,7 @@ browser.
 ## Storage and migration
 
 Migration 9 adds `media_assets` and `media_variants`. Library files live below
-`<MEDIA_BOT_STORAGE_DIR>/library/<asset_id>/`; private job retention does not
+`<MEDIA_BOT_STORAGE_DIR>/library/assets/<asset_id>/`; private job retention does not
 remove them. `source_key` is unique and uses a native extractor/platform ID
 when yt-dlp provides one, otherwise a normalized canonical URL. Variants use
 `UNIQUE(asset_id, preset_key)` so concurrent requests collapse to one row.

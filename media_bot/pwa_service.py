@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -18,8 +19,18 @@ from .downloader import (
     download_instagram,
     download_media,
     download_tiktok_slideshow,
-    persist_download,
 )
+from .acquisition import (
+    AcquisitionLifecycle,
+    AcquisitionRequest,
+    AcquisitionState,
+    DownloadedMedia,
+    ErrorEvent,
+    ProgressEvent,
+    PromotionResult as AcquisitionPromotionResult,
+    ResultEvent,
+)
+from .acquisition_storage import AcquisitionStorage
 from .library import (
     PRESET_SPECS,
     normalized_source_details,
@@ -27,6 +38,12 @@ from .library import (
     preset_for_job,
     probe_media,
     sha256_file,
+)
+from .shared_media_library import (
+    AssetNotFoundError,
+    LibraryPrincipal,
+    SharedMediaLibrary,
+    VariantNotFoundError,
 )
 from .platforms import (
     is_instagram_url,
@@ -38,20 +55,16 @@ from .storage import (
     CleanupResult,
     JobRecord,
     create_external_job,
-    create_or_get_media_asset,
-    create_or_get_media_variant,
     delete_job_with_artifacts,
-    delete_media_asset,
-    delete_media_variant,
     get_job_for_owner,
+    get_job,
     get_media_asset,
     get_media_variant,
     list_jobs_for_owner,
-    list_media_assets,
     list_media_variants,
     media_library_storage_bytes,
+    open_database,
     update_job,
-    update_media_asset,
     update_media_variant,
 )
 from .work_queue import WorkAlreadyQueued, WorkQueue, WorkRejected
@@ -66,6 +79,192 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "deleted"})
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+class _PwaAcquisitionDownloader:
+    """Downloader adapter that persists one shared claim output."""
+
+    def __init__(self, service: "PwaMediaService") -> None:
+        self.service = service
+
+    async def download(self, identity, progress) -> DownloadedMedia:
+        context = self.service._acquisition_context.get(
+            (identity.source_key, identity.preset)
+        )
+        if context is None:
+            raise DownloadError("acquisition execution context is unavailable")
+        job, claim_id = context
+        temporary = None
+        try:
+            if is_tiktok_photo_url(job.url):
+                temporary, media = await download_tiktok_slideshow(
+                    self.service.gallerydl,
+                    job.url,
+                    self.service.max_filesize_mb,
+                    self.service.timeout_seconds,
+                    progress,
+                )
+            elif is_instagram_url(job.url):
+                temporary, media = await download_instagram(
+                    self.service.gallerydl,
+                    job.url,
+                    self.service.max_filesize_mb,
+                    self.service.timeout_seconds,
+                    progress,
+                    ytdlp=self.service.ytdlp,
+                )
+            else:
+                try:
+                    temporary, media = await download_media(
+                        self.service.ytdlp,
+                        job.url,
+                        self.service.max_filesize_mb,
+                        self.service.timeout_seconds,
+                        progress,
+                        format_name=job.requested_format or "video",
+                        quality=job.requested_quality or "best",
+                    )
+                except DownloadError:
+                    if not is_tiktok_url(job.url):
+                        raise
+                    temporary, media = await download_tiktok_slideshow(
+                        self.service.gallerydl,
+                        job.url,
+                        self.service.max_filesize_mb,
+                        self.service.timeout_seconds,
+                        progress,
+                    )
+
+            details = normalized_source_details(media.parent, job.url)
+            title = str(details.get("title") or "").strip() or None
+            source_caption = str(details.get("source_caption") or "").strip() or None
+            claim_key = hashlib.sha256(
+                f"{identity.source_key}:{identity.preset}".encode("utf-8")
+            ).hexdigest()
+            acquisition_root = self.service.storage_dir / "acquisitions"
+            acquisition_root.mkdir(parents=True, exist_ok=True)
+            destination = acquisition_root / f"{claim_key}{media.suffix.lower()}"
+            if not destination.exists():
+                await asyncio.to_thread(shutil.copy2, media, destination)
+            thumbnail = await create_thumbnail(
+                destination,
+                acquisition_root / f"{claim_key}-thumbnail.jpg",
+            )
+            metadata: dict[str, Any] = {
+                "source_details": details,
+                "claim_id": claim_id,
+                "job_id": job.id,
+                "title": title,
+                "source_caption": source_caption,
+                "owner_id": job.owner_id or job.owner_kind,
+                "thumbnail_path": str(thumbnail) if thumbnail else None,
+                "output_filename": destination.name,
+                "output_mime_type": mimetypes.guess_type(destination.name)[0]
+                or "application/octet-stream",
+            }
+            return DownloadedMedia(destination, metadata)
+        finally:
+            if temporary is not None:
+                temporary.cleanup()
+
+
+class _PwaAcquisitionPromoter:
+    def __init__(self, service: "PwaMediaService") -> None:
+        self.service = service
+
+    async def promote(self, identity, media: DownloadedMedia) -> AcquisitionPromotionResult:
+        details = media.metadata.get("source_details")
+        if not isinstance(details, dict):
+            details = {}
+        principal = self.service._library_principal(
+            str(media.metadata.get("owner_id") or "pwa-acquisition"),
+            "media.library.promote",
+        )
+        duration = details.get("duration_seconds")
+        result = await self.service.shared_library.promote(
+            principal,
+            media.path,
+            str(details.get("source_canonical_url") or identity.source_url),
+            preset_key=identity.preset,
+            source_platform=str(details.get("source_platform") or "") or None,
+            source_media_id=str(details.get("source_media_id") or "") or None,
+            title=str(details.get("title") or "") or None,
+            uploader=str(details.get("uploader") or "") or None,
+            duration_seconds=float(duration) if duration not in (None, "") else None,
+            upload_date=str(details.get("upload_date") or "") or None,
+            thumbnail_file=(
+                Path(str(media.metadata["thumbnail_path"]))
+                if media.metadata.get("thumbnail_path")
+                else None
+            ),
+            created_from_job_id=(
+                int(media.metadata["job_id"])
+                if media.metadata.get("job_id") is not None
+                else None
+            ),
+        )
+        return AcquisitionPromotionResult(
+            str(result.asset.id),
+            str(result.variant.id),
+            {"preset_key": result.variant.preset_key},
+        )
+
+
+class _PwaAcquisitionCancellation:
+    def __init__(self, service: "PwaMediaService") -> None:
+        self.service = service
+
+    async def requested(self, acquisition_job_id: str) -> bool:
+        job_id = self.service._acquisition_job_ids.get(acquisition_job_id)
+        if job_id is None:
+            return False
+        job = await get_job(self.service.db_path, job_id)
+        return bool(
+            job is None
+            or job.status == "cancelled"
+            or self.service.work.cancellation_requested(self.service._label(job_id))
+        )
+
+    async def signal(self, acquisition_job_id: str) -> None:
+        job_id = self.service._acquisition_job_ids.get(acquisition_job_id)
+        if job_id is not None:
+            await update_job(
+                self.service.db_path,
+                job_id,
+                status="cancelled",
+                phase="cancelled",
+                error_code="cancelled_by_user",
+            )
+
+
+class _PwaAcquisitionProgress:
+    def __init__(self, service: "PwaMediaService") -> None:
+        self.service = service
+
+    async def emit(self, event: ProgressEvent | ResultEvent | ErrorEvent) -> None:
+        job_id = self.service._acquisition_job_ids.get(event.job_id)
+        if job_id is None:
+            return
+        if isinstance(event, ProgressEvent):
+            status = {
+                AcquisitionState.QUEUED: "queued",
+                AcquisitionState.RUNNING: "downloading",
+                AcquisitionState.PROCESSING: "processing",
+                AcquisitionState.COMPLETED: "processing",
+                AcquisitionState.FAILED: "failed",
+                AcquisitionState.CANCELLED: "cancelled",
+            }[event.state]
+            await update_job(
+                self.service.db_path,
+                job_id,
+                status=status,
+                phase=event.phase,
+                progress_percent=(
+                    float(max(0, min(99, event.percent)))
+                    if event.percent is not None
+                    else None
+                ),
+            )
 
 
 class PwaMediaService:
@@ -98,6 +297,96 @@ class PwaMediaService:
         self.library_max_filesize_mb = library_max_filesize_mb
         self.library_min_free_space_mb = library_min_free_space_mb
         self.library_max_size_mb = library_max_size_mb
+        self.shared_library = SharedMediaLibrary(
+            self.db_path,
+            self.library_root,
+            max_bytes=(
+                library_max_size_mb * 1024 * 1024
+                if library_max_size_mb > 0
+                else None
+            ),
+            min_free_bytes=library_min_free_space_mb * 1024 * 1024,
+        )
+        self.acquisition_storage = AcquisitionStorage(self.db_path)
+        self._acquisition_init_lock = asyncio.Lock()
+        self._acquisition_initialized = False
+        self._acquisition_context: dict[tuple[str, str], tuple[JobRecord, str]] = {}
+        self._acquisition_job_ids: dict[str, int] = {}
+        self.acquisition_lifecycle = AcquisitionLifecycle(
+            persistence=self.acquisition_storage,
+            downloader=_PwaAcquisitionDownloader(self),
+            promoter=_PwaAcquisitionPromoter(self),
+            cancellation=_PwaAcquisitionCancellation(self),
+            progress=_PwaAcquisitionProgress(self),
+        )
+
+    @staticmethod
+    def _library_principal(
+        principal_id: str,
+        *capabilities: str,
+    ) -> LibraryPrincipal:
+        return LibraryPrincipal(principal_id, frozenset(capabilities))
+
+    async def _ensure_acquisition_storage(self) -> None:
+        if self._acquisition_initialized:
+            return
+        async with self._acquisition_init_lock:
+            if not self._acquisition_initialized:
+                await self.acquisition_storage.init()
+                self._acquisition_initialized = True
+
+    async def _admit_acquisition(self, job: JobRecord):
+        await self._ensure_acquisition_storage()
+        admission = await self.acquisition_lifecycle.submit(
+            AcquisitionRequest(
+                requester_id=f"{job.owner_id or job.owner_kind}:{job.id}",
+                source_url=job.url,
+                preset=preset_for_job(job.requested_format, job.requested_quality),
+            )
+        )
+        self._acquisition_job_ids[admission.job_id] = job.id
+        return admission
+
+    @staticmethod
+    def _acquisition_id(job: JobRecord) -> str | None:
+        if not job.output_metadata:
+            return None
+        try:
+            metadata = json.loads(job.output_metadata)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        value = metadata.get("acquisition_job_id") if isinstance(metadata, dict) else None
+        return str(value) if value else None
+
+    async def resume_acquisition_work(self) -> int:
+        """Reconcile and re-admit durable PWA acquisition work after startup."""
+        await self._ensure_acquisition_storage()
+        await self.acquisition_lifecycle.reconcile()
+        async with open_database(self.db_path) as db:
+            async with db.execute(
+                "SELECT id, owner_id FROM jobs "
+                "WHERE owner_kind = ? AND status IN ('queued', 'downloading', 'processing') "
+                "ORDER BY created_at, id",
+                (PWA_OWNER_KIND,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        resumed = 0
+        for row in rows:
+            if not row["owner_id"]:
+                continue
+            label = self._label(int(row["id"]))
+            if self.work.has_label(label):
+                continue
+            try:
+                self.work.submit(
+                    user_id=str(row["owner_id"]),
+                    label=label,
+                    factory=lambda job_id=int(row["id"]), owner=str(row["owner_id"]): self._process_job(job_id, owner),
+                )
+                resumed += 1
+            except WorkRejected as exc:
+                LOGGER.warning("Could not resume PWA acquisition %s: %s", row["id"], exc)
+        return resumed
 
     async def create_job(
         self,
@@ -136,18 +425,36 @@ class PwaMediaService:
         )
         assert job is not None
         try:
+            admission = await self._admit_acquisition(job)
+            output_metadata = {
+                "acquisition_job_id": admission.job_id,
+                "acquisition_claim_id": admission.claim_id,
+            }
+            job = await update_job(
+                self.db_path,
+                job.id,
+                output_metadata=json.dumps(
+                    output_metadata, sort_keys=True, separators=(",", ":")
+                ),
+            )
+            assert job is not None
             self.work.submit(
                 user_id=owner_id,
                 label=self._label(job.id),
                 factory=lambda job_id=job.id, owner=owner_id: self._process_job(job_id, owner),
             )
-        except (WorkRejected, WorkAlreadyQueued) as exc:
+        except Exception as exc:
+            LOGGER.exception("Could not admit or queue PWA job %s", job.id)
             job = await update_job(
                 self.db_path,
                 job.id,
                 status="failed",
                 phase="failed",
-                error_code="queue_rejected",
+                error_code=(
+                    "queue_rejected"
+                    if isinstance(exc, (WorkRejected, WorkAlreadyQueued))
+                    else "acquisition_admission_failed"
+                ),
                 error_message=str(exc)[:500],
                 failed_at=_now_iso(),
             )
@@ -179,6 +486,16 @@ class PwaMediaService:
             return None
         if job.status in TERMINAL_STATUSES:
             return job
+        acquisition_job_id = self._acquisition_id(job)
+        if acquisition_job_id is not None:
+            await self._ensure_acquisition_storage()
+            self._acquisition_job_ids[acquisition_job_id] = job.id
+            try:
+                await self.acquisition_lifecycle.cancel(acquisition_job_id)
+            except KeyError:
+                LOGGER.debug(
+                    "Acquisition requester %s was already removed", acquisition_job_id
+                )
         self.work.cancel(user_id=owner_id, label=self._label(job.id))
         updated = await update_job(
             self.db_path,
@@ -202,41 +519,48 @@ class PwaMediaService:
         )
 
     async def list_library(
-        self, *, limit: int = 50, query: str | None = None, sort: str | None = None
+        self,
+        *,
+        principal_id: str = "pwa-library",
+        limit: int = 50,
+        query: str | None = None,
+        sort: str | None = None,
     ) -> list[tuple[Any, list[Any]]]:
-        assets = await list_media_assets(
-            self.db_path, limit=limit, query=query, sort=sort
+        bundles = await self.shared_library.list(
+            self._library_principal(principal_id, "media.library.read"),
+            limit=limit,
+            query=query,
+            sort=sort,
         )
-        return [(asset, await list_media_variants(self.db_path, asset.id)) for asset in assets]
+        return [(bundle.asset, list(bundle.variants)) for bundle in bundles]
 
-    async def get_library_asset(self, *, asset_id: int) -> tuple[Any, list[Any]] | None:
-        asset = await get_media_asset(self.db_path, asset_id)
-        if asset is None or asset.scope != "shared" or asset.status == "deleted":
+    async def get_library_asset(
+        self, *, asset_id: int, principal_id: str = "pwa-library"
+    ) -> tuple[Any, list[Any]] | None:
+        try:
+            bundle = await self.shared_library.read(
+                self._library_principal(principal_id, "media.library.read"),
+                asset_id,
+            )
+        except AssetNotFoundError:
             return None
-        return asset, await list_media_variants(self.db_path, asset.id)
+        return bundle.asset, list(bundle.variants)
 
     async def request_variant(
         self, *, requester_id: str, asset_id: int, preset_key: str
     ) -> tuple[Any, bool]:
-        if preset_key not in PRESET_SPECS:
-            raise ValueError("unsupported media library preset")
-        asset_bundle = await self.get_library_asset(asset_id=asset_id)
-        if asset_bundle is None:
-            raise LookupError("media asset not found")
-        asset, variants = asset_bundle
-        existing = next((item for item in variants if item.preset_key == preset_key), None)
-        if existing is not None:
-            if existing.status == "ready":
-                return existing, False
-            if self.variant_work is not None and not self.variant_work.has_label(
-                self._variant_label(existing.id)
-            ):
-                self._submit_variant(existing.id, requester_id)
-            return existing, False
-        await self._check_library_capacity_async(0)
-        variant, created = await create_or_get_media_variant(
-            self.db_path, asset_id=asset.id, preset_key=preset_key
+        result = await self.shared_library.request_variant(
+            self._library_principal(
+                requester_id,
+                "media.library.read",
+                "media.library.variant_request",
+            ),
+            asset_id,
+            preset_key,
         )
+        variant, created = result.variant, result.created
+        if variant.status == "ready":
+            return variant, created
         if self.variant_work is None:
             await update_media_variant(
                 self.db_path,
@@ -310,69 +634,6 @@ class PwaMediaService:
         await asyncio.to_thread(_copy)
         return destination
 
-    async def _promote_completed_job(
-        self, job: JobRecord, details: dict[str, object]
-    ) -> tuple[str, str] | None:
-        if (
-            job.owner_kind != PWA_OWNER_KIND
-            or job.source_channel != PWA_SOURCE_CHANNEL
-            or not job.file_path
-        ):
-            return None
-        source = Path(job.file_path)
-        source_key = str(details.get("source_key") or f"url:{job.url}")
-        asset, _ = await create_or_get_media_asset(
-            self.db_path,
-            source_platform=str(details.get("source_platform") or "") or None,
-            source_media_id=str(details.get("source_media_id") or "") or None,
-            source_key=source_key,
-            source_canonical_url=str(details.get("source_canonical_url") or job.url),
-            title=str(details.get("title") or job.title or "") or None,
-            uploader=str(details.get("uploader") or "") or None,
-            duration_seconds=(
-                float(details["duration_seconds"])
-                if details.get("duration_seconds") not in (None, "")
-                else None
-            ),
-            upload_date=str(details.get("upload_date") or "") or None,
-            thumbnail_path=None,
-            created_from_job_id=job.id,
-            created_by_owner_id=job.owner_id,
-        )
-        asset_dir = self.library_root / str(asset.id)
-        if job.thumbnail_path and Path(job.thumbnail_path).is_file() and not asset.thumbnail_path:
-            thumbnail = await self._copy_library_file(
-                Path(job.thumbnail_path), asset_dir / "thumbnail.jpg"
-            )
-            await update_media_asset(self.db_path, asset.id, thumbnail_path=str(thumbnail))
-        preset_key = preset_for_job(job.requested_format, job.requested_quality)
-        variant, created = await create_or_get_media_variant(
-            self.db_path, asset_id=asset.id, preset_key=preset_key, status="processing"
-        )
-        if created or variant.status != "ready":
-            destination = asset_dir / f"{preset_key}{preset_extension(preset_key, source.suffix)}"
-            copied = await self._copy_library_file(source, destination)
-            probe = await probe_media(copied)
-            digest = await sha256_file(copied)
-            await update_media_variant(
-                self.db_path,
-                variant.id,
-                status="ready",
-                file_path=str(copied),
-                file_size=int(probe.get("file_size") or copied.stat().st_size),
-                mime_type=mimetypes.guess_type(copied.name)[0] or "application/octet-stream",
-                container=probe.get("container"),
-                video_codec=probe.get("video_codec"),
-                audio_codec=probe.get("audio_codec"),
-                width=probe.get("width"),
-                height=probe.get("height"),
-                duration_seconds=probe.get("duration_seconds"),
-                sha256=digest,
-                error_code=None,
-                error_message=None,
-            )
-        return str(asset.id), preset_key
-
     async def _process_variant(self, variant_id: int) -> None:
         variant = await get_media_variant(self.db_path, variant_id)
         if variant is None:
@@ -391,7 +652,7 @@ class PwaMediaService:
             )
             return
         await update_media_variant(self.db_path, variant_id, status="processing")
-        destination = self.library_root / str(asset.id) / (
+        destination = self.library_root / "assets" / str(asset.id) / (
             f"{variant.preset_key}{preset_extension(variant.preset_key)}"
         )
         temporary = destination.with_name(f".{destination.name}.{os.getpid()}.part")
@@ -437,40 +698,32 @@ class PwaMediaService:
             )
 
     async def delete_library_asset(
-        self, *, asset_id: int
+        self, *, asset_id: int, principal_id: str = "pwa-library-manager"
     ) -> tuple[Any | None, list[Any]]:
-        bundle = await self.get_library_asset(asset_id=asset_id)
-        if bundle is None:
+        asset = await get_media_asset(self.db_path, asset_id)
+        if asset is None or asset.status == "deleted":
             return None, []
-        asset, variants = await delete_media_asset(self.db_path, asset_id)
-        paths = [Path(item.file_path) for item in variants if item.file_path]
-        if asset is not None and asset.thumbnail_path:
-            paths.append(Path(asset.thumbnail_path))
-        for path in paths:
-            try:
-                if path.resolve(strict=False).is_relative_to(
-                    self.library_root.resolve(strict=False)
-                ):
-                    path.unlink(missing_ok=True)
-            except OSError:
-                continue
+        variants = await list_media_variants(self.db_path, asset.id)
+        await self.shared_library.delete(
+            self._library_principal(
+                principal_id, "media.library.manage"
+            ),
+            asset_id,
+        )
         return asset, variants
 
-    async def delete_library_variant(self, *, variant_id: int) -> Any | None:
-        variant = await get_media_variant(self.db_path, variant_id)
-        if variant is None:
+    async def delete_library_variant(
+        self, *, variant_id: int, principal_id: str = "pwa-library-manager"
+    ) -> Any | None:
+        try:
+            return await self.shared_library.delete_variant(
+                self._library_principal(
+                    principal_id, "media.library.manage"
+                ),
+                variant_id,
+            )
+        except (AssetNotFoundError, VariantNotFoundError):
             return None
-        deleted = await delete_media_variant(self.db_path, variant_id)
-        if variant.file_path:
-            path = Path(variant.file_path)
-            try:
-                if path.resolve(strict=False).is_relative_to(
-                    self.library_root.resolve(strict=False)
-                ):
-                    path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        return deleted
 
     async def _render_variant(
         self, source: Path, destination: Path, preset_key: str, height: int
@@ -507,135 +760,148 @@ class PwaMediaService:
     def _label(job_id: int) -> str:
         return f"pwa:download:{job_id}"
 
-    async def _report_progress(self, job_id: int, percent: int) -> None:
-        await update_job(
-            self.db_path,
-            job_id,
-            phase="downloading",
-            progress_percent=float(max(0, min(99, percent))),
-        )
-
     async def _process_job(self, job_id: int, owner_id: str) -> None:
+        """Run one PWA requester through the shared acquisition lifecycle."""
+        LOGGER.info("Starting PWA acquisition job %s for %s", job_id, owner_id)
         job = await self.get_job(owner_id=owner_id, job_id=job_id)
         if job is None or job.status == "cancelled":
             return
-        temporary = None
+        acquisition_job_id = self._acquisition_id(job)
+        claim = None
         try:
-            started = _now_iso()
+            if acquisition_job_id is None:
+                admission = await self._admit_acquisition(job)
+                acquisition_job_id = admission.job_id
+                job = await update_job(
+                    self.db_path,
+                    job.id,
+                    output_metadata=json.dumps(
+                        {
+                            "acquisition_job_id": acquisition_job_id,
+                            "acquisition_claim_id": admission.claim_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                assert job is not None
+            self._acquisition_job_ids[acquisition_job_id] = job.id
+            requester = await self.acquisition_storage.get_requester(acquisition_job_id)
+            if requester is None:
+                raise DownloadError("durable acquisition requester is missing")
+            claim = await self.acquisition_storage.get_claim(requester.claim_id)
+            if claim is None:
+                raise DownloadError("durable acquisition claim is missing")
+            self._acquisition_context[(claim.identity.source_key, claim.identity.preset)] = (
+                job,
+                claim.claim_id,
+            )
             await update_job(
                 self.db_path,
-                job_id,
-                status="downloading",
-                phase="downloading",
-                started_at=started,
+                job.id,
+                status="queued",
+                phase="queued",
                 progress_percent=0.0,
+                started_at=_now_iso(),
+                error_code=None,
+                error_message=None,
             )
-            async def progress(value: int) -> None:
-                await self._report_progress(job_id, value)
-            if is_tiktok_photo_url(job.url):
-                temporary, media = await download_tiktok_slideshow(
-                    self.gallerydl,
-                    job.url,
-                    self.max_filesize_mb,
-                    self.timeout_seconds,
-                    progress,
+            result = await self.acquisition_lifecycle.run(acquisition_job_id)
+            claim = await self.acquisition_storage.get_claim(requester.claim_id)
+            if result.state == AcquisitionState.CANCELLED:
+                await update_job(
+                    self.db_path,
+                    job.id,
+                    status="cancelled",
+                    phase="cancelled",
+                    error_code="cancelled_by_user",
                 )
-            elif is_instagram_url(job.url):
-                temporary, media = await download_instagram(
-                    self.gallerydl,
-                    job.url,
-                    self.max_filesize_mb,
-                    self.timeout_seconds,
-                    progress,
-                    ytdlp=self.ytdlp,
+                return
+            if result.state == AcquisitionState.FAILED or claim is None or claim.output is None:
+                await update_job(
+                    self.db_path,
+                    job.id,
+                    status="failed",
+                    phase="failed",
+                    error_code=result.error_code or "download_failed",
+                    error_message=result.error_message or "acquisition produced no output",
+                    failed_at=_now_iso(),
                 )
-            else:
-                try:
-                    temporary, media = await download_media(
-                        self.ytdlp,
-                        job.url,
-                        self.max_filesize_mb,
-                        self.timeout_seconds,
-                        progress,
-                        format_name=job.requested_format or "video",
-                        quality=job.requested_quality or "best",
-                    )
-                except DownloadError:
-                    if is_tiktok_url(job.url):
-                        temporary, media = await download_tiktok_slideshow(
-                            self.gallerydl,
-                            job.url,
-                            self.max_filesize_mb,
-                            self.timeout_seconds,
-                            progress,
-                        )
-                    else:
-                        raise
+                return
 
-            await update_job(self.db_path, job_id, status="processing", phase="processing")
-            details = normalized_source_details(media.parent, job.url)
+            output = claim.output
+            details = output.metadata.get("source_details")
+            if not isinstance(details, dict):
+                details = {}
+            metadata: dict[str, Any] = {}
+            if job.output_metadata:
+                try:
+                    parsed = json.loads(job.output_metadata)
+                    if isinstance(parsed, dict):
+                        metadata.update(parsed)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
             title = str(details.get("title") or "").strip() or None
             source_caption = str(details.get("source_caption") or "").strip() or None
-            persisted = await persist_download(media, job_id, self.storage_dir)
-            thumbnail = await create_thumbnail(
-                persisted,
-                self.storage_dir / f"{job_id}-thumbnail.jpg",
-            )
-            mime_type = mimetypes.guess_type(persisted.name)[0] or "application/octet-stream"
-            metadata: dict[str, Any] = {}
             if title:
                 metadata["title"] = title
             if source_caption:
                 metadata["source_caption"] = source_caption
+            if result.output is not None:
+                metadata.update(
+                    {
+                        "library_asset_id": result.output.asset_id,
+                        "library_variant_id": result.output.variant_id,
+                        "library_preset": result.output.metadata.get(
+                            "preset_key", claim.identity.preset
+                        ),
+                    }
+                )
+            else:
+                metadata["library_promotion_status"] = "pending_or_failed"
             await update_job(
                 self.db_path,
-                job_id,
-                status="processing",
-                phase="processing",
-                progress_percent=99.0,
-                file_path=str(persisted),
-                file_size=persisted.stat().st_size,
-                title=title,
-                source_caption=source_caption,
-                thumbnail_path=str(thumbnail) if thumbnail else None,
-                output_filename=persisted.name,
-                output_mime_type=mime_type,
-                output_metadata=json.dumps(metadata, sort_keys=True, separators=(",", ":")),
-            )
-            processing = await self.get_job(owner_id=owner_id, job_id=job_id)
-            if processing is not None:
-                try:
-                    promoted = await self._promote_completed_job(processing, details)
-                    if promoted is not None:
-                        metadata.update(
-                            {"library_asset_id": promoted[0], "library_preset": promoted[1]}
-                        )
-                except Exception as exc:
-                    # The private job remains a valid completed result even if
-                    # shared-library promotion is temporarily blocked by disk,
-                    # probing, or a transient SQLite failure.
-                    LOGGER.warning("Could not promote PWA job %s to library: %s", job_id, exc)
-            await update_job(
-                self.db_path,
-                job_id,
+                job.id,
                 status="completed",
                 phase="completed",
                 progress_percent=100.0,
-                output_metadata=json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                file_path=str(output.path),
+                file_size=output.path.stat().st_size,
+                title=title,
+                source_caption=source_caption,
+                thumbnail_path=output.metadata.get("thumbnail_path"),
+                output_filename=output.metadata.get("output_filename") or output.path.name,
+                output_mime_type=output.metadata.get("output_mime_type"),
+                output_metadata=json.dumps(
+                    metadata, sort_keys=True, separators=(",", ":")
+                ),
                 completed_at=_now_iso(),
                 error_code=None,
                 error_message=None,
             )
         except asyncio.CancelledError:
-            await update_job(
-                self.db_path,
-                job_id,
-                status="cancelled",
-                phase="cancelled",
-                error_code="cancelled_by_user",
-            )
+            current = await self.get_job(owner_id=owner_id, job_id=job_id)
+            explicitly_cancelled = self.work.cancellation_requested(self._label(job_id))
+            if explicitly_cancelled or (current is not None and current.status == "cancelled"):
+                await update_job(
+                    self.db_path,
+                    job_id,
+                    status="cancelled",
+                    phase="cancelled",
+                    error_code="cancelled_by_user",
+                )
+            else:
+                await update_job(
+                    self.db_path,
+                    job_id,
+                    status="queued",
+                    phase="queued",
+                    error_code=None,
+                    error_message=None,
+                )
             raise
         except Exception as exc:
+            LOGGER.exception("PWA acquisition failed for job %s", job_id)
             await update_job(
                 self.db_path,
                 job_id,
@@ -646,9 +912,12 @@ class PwaMediaService:
                 failed_at=_now_iso(),
             )
         finally:
-            if temporary is not None:
-                temporary.cleanup()
-
+            if acquisition_job_id is not None:
+                self._acquisition_job_ids.pop(acquisition_job_id, None)
+            if claim is not None:
+                self._acquisition_context.pop(
+                    (claim.identity.source_key, claim.identity.preset), None
+                )
 
 __all__ = [
     "PWA_OWNER_KIND",
