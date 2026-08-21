@@ -148,6 +148,11 @@ class PwaAcquisitionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 for owner_id, job_id in (("user-a", first.id), ("user-b", second.id))
             ]
             self.assertTrue(all(job is not None and job.status == "completed" for job in completed_jobs))
+            for job in completed_jobs:
+                assert job is not None
+                metadata = json.loads(job.output_metadata or "{}")
+                self.assertEqual(metadata["library_asset_id"], "asset-duplicate")
+                self.assertEqual(metadata["library_variant_id"], "variant-duplicate")
 
 
 if __name__ == "__main__":

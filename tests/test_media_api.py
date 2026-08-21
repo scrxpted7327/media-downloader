@@ -18,7 +18,6 @@ from media_bot.pwa_service import PwaMediaService
 from media_bot.storage import create_job, init_db, update_job
 from media_bot.work_queue import WorkQueue
 
-
 SECRET = "test-signing-secret"
 API_KEY = "test-media-api-key"
 
@@ -166,6 +165,49 @@ class MediaApiTests(unittest.IsolatedAsyncioTestCase):
             headers=_headers("user-b", "result-denied"),
         )
         self.assertEqual(denied.status, 404)
+
+    async def test_completed_job_exposes_only_library_links_from_output_metadata(self) -> None:
+        response = await self.client.post(
+            "/api/media/jobs",
+            headers=_headers("user-a", "library-link-create"),
+            json={"url": "https://www.youtube.com/watch?v=library-link"},
+        )
+        job = await response.json()
+        await update_job(
+            self.db_path,
+            int(job["job_id"]),
+            status="completed",
+            phase="completed",
+            output_metadata=json.dumps(
+                {
+                    "library_asset_id": "asset-7",
+                    "library_variant_id": "variant-8",
+                    "private_path": "/must-not-cross",
+                }
+            ),
+        )
+
+        linked = await self.client.get(
+            f"/api/media/jobs/{job['job_id']}",
+            headers=_headers("user-a", "library-link-read"),
+        )
+        payload = await linked.json()
+        self.assertEqual(payload["asset_id"], "asset-7")
+        self.assertEqual(payload["variant_id"], "variant-8")
+        self.assertNotIn("private_path", payload)
+
+        await update_job(
+            self.db_path,
+            int(job["job_id"]),
+            output_metadata="not-json",
+        )
+        malformed = await self.client.get(
+            f"/api/media/jobs/{job['job_id']}",
+            headers=_headers("user-a", "library-link-read-malformed"),
+        )
+        malformed_payload = await malformed.json()
+        self.assertIsNone(malformed_payload["asset_id"])
+        self.assertIsNone(malformed_payload["variant_id"])
 
     async def test_pwa_job_worker_persists_real_terminal_state(self) -> None:
         async def fake_download(*args, **kwargs):

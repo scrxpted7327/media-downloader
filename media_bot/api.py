@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import mimetypes
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,12 +25,12 @@ from .acting_context import (
 )
 from .download_server import resolve_contained_file
 from .library import PRESET_SPECS, asset_payload, variant_payload
+from .pwa_service import PwaMediaService
 from .shared_media_library import (
     AssetNotFoundError,
     InvalidPresetError,
     VariantPendingError,
 )
-from .pwa_service import PwaMediaService
 from .storage import claim_internal_request_id, open_database
 
 CONTEXT_HEADER = "X-WatchMyWallet-Acting-User"
@@ -64,7 +65,36 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _metadata_id(metadata: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _job_library_ids(job) -> tuple[str | None, str | None]:
+    """Expose only stable library links from the private job metadata."""
+
+    if not job.output_metadata:
+        return None, None
+    try:
+        metadata = json.loads(job.output_metadata)
+    except (TypeError, ValueError):
+        return None, None
+    if not isinstance(metadata, dict):
+        return None, None
+    return (
+        _metadata_id(metadata, "asset_id", "library_asset_id"),
+        _metadata_id(metadata, "variant_id", "library_variant_id"),
+    )
+
+
 def _job_payload(job) -> dict[str, Any]:
+    asset_id, variant_id = _job_library_ids(job)
     return {
         "job_id": str(job.id),
         "source": job.url,
@@ -83,6 +113,8 @@ def _job_payload(job) -> dict[str, Any]:
         "output_filename": job.output_filename,
         "output_mime_type": job.output_mime_type,
         "has_result": bool(job.file_path and job.status == "completed"),
+        "asset_id": asset_id,
+        "variant_id": variant_id,
         "error_code": job.error_code,
         "error": job.error_message,
         "created_at": _iso(job.created_at),
